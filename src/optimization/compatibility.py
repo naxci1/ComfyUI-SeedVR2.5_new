@@ -685,9 +685,11 @@ def _probe_bfloat16_support() -> bool:
     if not torch.cuda.is_available():
         return True
     try:
-        a = torch.randn(8, 8, dtype=torch.bfloat16, device='cuda:0')
-        _ = torch.matmul(a, a)
-        del a
+        def test_model(x):
+            return torch.nn.functional.relu(torch.matmul(x, x.transpose(1, 2)))
+        compiled = torch.compile(test_model, mode="reduce-overhead")
+        x = torch.randn(4, 32, 32, dtype=torch.bfloat16, device='cuda')
+        result = compiled(x)
         return True
     except RuntimeError as e:
         if "CUBLAS_STATUS_NOT_SUPPORTED" in str(e):
