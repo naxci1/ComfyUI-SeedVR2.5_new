@@ -50,6 +50,8 @@ MODEL_REGISTRY = {
     "seedvr2_ema_7b_sharp_fp16.safetensors": ModelInfo(size="7B", precision="fp16", variant="sharp", sha256="20a93e01ff24beaeebc5de4e4e5be924359606c356c9c51509fba245bd2d77dd"),
     
     # NVFP4 models (RTX 50 series ONLY - Blackwell architecture)
+    # Note: NVFP4 model is hosted in Nexus24/vaeGGUF repository despite the name
+    # (repository contains various quantized models, not just GGUF format)
     "seedvr2_3b_blackwell_nvfp4_extreme_full.safetensors": ModelInfo(
         repo="Nexus24/vaeGGUF",
         size="3B",

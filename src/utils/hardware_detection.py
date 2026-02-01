@@ -14,10 +14,10 @@ def check_nvfp4_support() -> bool:
     Returns True only for RTX 50 series (compute capability 9.0+)
     """
     capability = get_gpu_compute_capability()
-    compute_version = float(f"{capability[0]}.{capability[1]}")
     
     # Blackwell is compute capability 9.0+
-    return compute_version >= 9.0
+    # Use tuple comparison to avoid floating-point precision issues
+    return capability >= (9, 0)
 
 def get_gpu_info() -> Dict[str, Any]:
     """Get detailed GPU information"""

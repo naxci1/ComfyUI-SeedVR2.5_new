@@ -89,12 +89,23 @@ class NVFP4ModelLoader:
     def _load_emulated(self, state_dict):
         """Load with FP8 emulation (fallback for non-Blackwell GPUs)"""
         # Convert NVFP4 weights to FP8 for compatibility
-        # This is a simplified fallback - quality may be reduced
+        # Note: NVFP4 doesn't have a native PyTorch dtype, so model is stored
+        # in a packed format. For emulation, we attempt to convert to FP8 or FP16.
         converted_state_dict = {}
         for key, tensor in state_dict.items():
-            if tensor.dtype == torch.float8_e4m3fn:  # Already FP8
+            # Try to determine the appropriate target dtype
+            if tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                # Already in FP8 format
+                converted_state_dict[key] = tensor
+            elif tensor.dtype in (torch.float16, torch.bfloat16):
+                # Keep FP16/BF16 tensors as-is (may be scale factors or critical layers)
                 converted_state_dict[key] = tensor
             else:
-                # Convert to FP8 as fallback
-                converted_state_dict[key] = tensor.to(torch.float8_e4m3fn)
+                # For other types (likely packed NVFP4), convert to FP16
+                # FP8 conversion may fail on non-float types
+                try:
+                    converted_state_dict[key] = tensor.to(torch.float16)
+                except (RuntimeError, ValueError):
+                    # If conversion fails, keep original
+                    converted_state_dict[key] = tensor
         return converted_state_dict

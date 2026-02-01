@@ -183,14 +183,17 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
             if not check_nvfp4_support():
                 gpu_info = get_gpu_info()
                 gpu_name = gpu_info.get('name', 'Unknown') if gpu_info.get('available') else 'No CUDA GPU'
-                model_short = model[:40] if len(model) > 40 else model
+                
+                # Truncate model name and GPU name to fit in 56-char column (box is 62 chars wide with padding)
+                model_display = model[:56] if len(model) > 56 else model
+                gpu_display = gpu_name[:56] if len(gpu_name) > 56 else gpu_name
                 
                 raise RuntimeError(
                     f"╔══════════════════════════════════════════════════════════════╗\n"
                     f"║  NVFP4 Model Requires RTX 50 Series GPU                      ║\n"
                     f"╠══════════════════════════════════════════════════════════════╣\n"
-                    f"║  Selected Model: {model_short:<40} ║\n"
-                    f"║  Your GPU:       {gpu_name[:40]:<40} ║\n"
+                    f"║  Selected Model: {model_display:<56} ║\n"
+                    f"║  Your GPU:       {gpu_display:<56} ║\n"
                     f"║                                                              ║\n"
                     f"║  NVFP4 models ONLY work on:                                 ║\n"
                     f"║    • RTX 5090 (24GB)                                        ║\n"
