@@ -1,63 +1,92 @@
 """
-NVFP4 inference kernel loader and wrapper
-Provides native Blackwell acceleration for NVFP4 quantized models
+NVFP4 inference support for Blackwell GPUs
+Provides native NVFP4 dequantization and tensor handling
+
+Native NVFP4 (E2M1) 4-bit floating point format:
+- Block size: 16 values per FP8 scale
+- Two-level scaling: FP8 micro-block + FP32 tensor
+- Value range: {0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6}
+- Compression: ~4x vs FP16, ~2x vs FP8
+- Performance: 2-3x faster on Blackwell with native ops
 """
+
+# Import dequantization functions
+from .dequantize import (
+    decode_nvfp4_e2m1,
+    dequantize_nvfp4,
+    create_nvfp4_dequantize_method,
+    detect_nvfp4_format,
+    validate_nvfp4_tensors,
+    is_native_nvfp4_available,
+    NVFP4_E2M1_LUT,
+)
+
+# Import tensor wrapper
+from .tensor import (
+    NVFP4Tensor,
+    wrap_nvfp4_parameters,
+    unwrap_nvfp4_parameters,
+)
+
 import torch
 from typing import Optional
 import warnings
 
+__all__ = [
+    # Dequantization
+    'decode_nvfp4_e2m1',
+    'dequantize_nvfp4',
+    'create_nvfp4_dequantize_method',
+    'detect_nvfp4_format',
+    'validate_nvfp4_tensors',
+    'is_native_nvfp4_available',
+    'NVFP4_E2M1_LUT',
+    
+    # Tensor wrapper
+    'NVFP4Tensor',
+    'wrap_nvfp4_parameters',
+    'unwrap_nvfp4_parameters',
+    
+    # Legacy API
+    'load_nvfp4_kernels',
+    'NVFP4ModelLoader',
+]
+
 _nvfp4_kernels_loaded = False
 _nvfp4_available = False
+
 
 def load_nvfp4_kernels() -> bool:
     """
     Load NVFP4 CUDA kernels for Blackwell GPUs
     Returns True if native NVFP4 ops are available
+    
+    This checks for:
+    1. NVIDIA Model Optimizer (modelopt) with NVFP4 support
+    2. TensorRT-LLM with NVFP4 ops
+    3. Custom NVFP4 CUDA extensions
+    
+    If none available, falls back to software implementation.
     """
     global _nvfp4_kernels_loaded, _nvfp4_available
     
     if _nvfp4_kernels_loaded:
         return _nvfp4_available
     
-    from ...utils.hardware_detection import check_nvfp4_support
-    
-    if not check_nvfp4_support():
-        print("[NVFP4] Blackwell GPU not detected, NVFP4 ops disabled")
-        _nvfp4_kernels_loaded = True
-        _nvfp4_available = False
-        return False
-    
-    try:
-        # Try to load TensorRT NVFP4 ops
-        import tensorrt_llm
-        from tensorrt_llm import nvfp4
-        
-        print(f"[NVFP4] ✅ TensorRT NVFP4 kernels loaded on {torch.cuda.get_device_name()}")
-        _nvfp4_available = True
-        
-    except ImportError:
-        try:
-            # Fallback: Try custom NVFP4 ops if available
-            from torch.ops import nvfp4_ops
-            print(f"[NVFP4] ✅ Custom NVFP4 kernels loaded on {torch.cuda.get_device_name()}")
-            _nvfp4_available = True
-            
-        except (ImportError, AttributeError):
-            warnings.warn(
-                "[NVFP4] ⚠️ Blackwell GPU detected but NVFP4 kernels not found.\n"
-                "For optimal performance, install TensorRT-LLM:\n"
-                "  pip install tensorrt-llm>=0.14.0\n"
-                "Falling back to FP8 emulation (slower)."
-            )
-            _nvfp4_available = False
-    
+    # Check using dequantize module
+    _nvfp4_available = is_native_nvfp4_available()
     _nvfp4_kernels_loaded = True
+    
     return _nvfp4_available
 
 
 class NVFP4ModelLoader:
     """
     Loader for NVFP4 quantized models with automatic backend selection
+    
+    Supports two loading modes:
+    1. Native: Uses TensorRT-LLM/ModelOpt for hardware acceleration
+    2. Software: Uses pure PyTorch implementation for compatibility
     """
     
     def __init__(self, model_path: str, device: str = "cuda:0"):
@@ -70,42 +99,44 @@ class NVFP4ModelLoader:
         import safetensors.torch
         
         print(f"[NVFP4] Loading model: {self.model_path}")
+        
+        # Load safetensors file
         state_dict = safetensors.torch.load_file(self.model_path, device=self.device)
         
+        # Detect NVFP4 format
+        metadata = {}  # TODO: Extract metadata from safetensors
+        is_nvfp4 = detect_nvfp4_format(state_dict, metadata)
+        
+        if not is_nvfp4:
+            print("[NVFP4] ⚠️ Model doesn't appear to be NVFP4 format")
+            return state_dict
+        
+        print(f"[NVFP4] ✅ NVFP4 format detected")
+        
+        # Validate NVFP4 structure
+        valid, error = validate_nvfp4_tensors(state_dict)
+        if not valid:
+            warnings.warn(f"[NVFP4] ⚠️ NVFP4 validation failed: {error}")
+        
         if self.nvfp4_native:
-            print("[NVFP4] Using native NVFP4 kernels (Blackwell accelerated)")
+            print("[NVFP4] Using native NVFP4 acceleration (Blackwell)")
             return self._load_native(state_dict)
         else:
-            print("[NVFP4] Using FP8 emulation (software fallback)")
-            return self._load_emulated(state_dict)
+            print("[NVFP4] Using software NVFP4 implementation")
+            return self._load_software(state_dict)
     
     def _load_native(self, state_dict):
-        """Load with native NVFP4 ops (Blackwell)"""
-        # TODO: Implement native NVFP4 tensor creation
-        # This requires TensorRT-LLM or custom CUDA kernels
-        # For now, return state_dict as-is (model is already NVFP4 quantized)
-        return state_dict
+        """Load with native NVFP4 ops (Blackwell hardware acceleration)"""
+        # TODO: Implement native NVFP4 tensor creation with TensorRT-LLM
+        # For now, use software implementation
+        print("[NVFP4] ℹ️ Native NVFP4 ops detected but not yet integrated, using software")
+        return self._load_software(state_dict)
     
-    def _load_emulated(self, state_dict):
-        """Load with FP8 emulation (fallback for non-Blackwell GPUs)"""
-        # Convert NVFP4 weights to FP8 for compatibility
-        # Note: NVFP4 doesn't have a native PyTorch dtype, so model is stored
-        # in a packed format. For emulation, we attempt to convert to FP8 or FP16.
-        converted_state_dict = {}
-        for key, tensor in state_dict.items():
-            # Try to determine the appropriate target dtype
-            if tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-                # Already in FP8 format
-                converted_state_dict[key] = tensor
-            elif tensor.dtype in (torch.float16, torch.bfloat16):
-                # Keep FP16/BF16 tensors as-is (may be scale factors or critical layers)
-                converted_state_dict[key] = tensor
-            else:
-                # For other types (likely packed NVFP4), convert to FP16
-                # FP8 conversion may fail on non-float types
-                try:
-                    converted_state_dict[key] = tensor.to(torch.float16)
-                except (RuntimeError, ValueError):
-                    # If conversion fails, keep original
-                    converted_state_dict[key] = tensor
-        return converted_state_dict
+    def _load_software(self, state_dict):
+        """Load with software NVFP4 implementation (pure PyTorch)"""
+        # Wrap NVFP4 parameters
+        wrapped = wrap_nvfp4_parameters(state_dict, block_size=16)
+        
+        print(f"[NVFP4] ✅ Wrapped {len([k for k, v in wrapped.items() if isinstance(v, NVFP4Tensor)])} NVFP4 parameters")
+        
+        return wrapped
