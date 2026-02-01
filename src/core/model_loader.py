@@ -1515,6 +1515,42 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
                     debug.log(f"Warning: Failed to unwrap NVFP4 tensors: {e}", 
                              category=model_type_lower, level="WARNING")
         
+        # Reshape 1D checkpoint tensors to 2D and fix dtypes BEFORE loading
+        model_state = dict(model.named_parameters())
+        reshaped_count = 0
+        dtype_fixed_count = 0
+        
+        for name in list(state.keys()):
+            if name in model_state:
+                checkpoint_tensor = state[name]
+                model_param = model_state[name]
+                
+                # Fix shape mismatch: 1D checkpoint → 2D model
+                if checkpoint_tensor.shape != model_param.shape:
+                    if len(checkpoint_tensor.shape) == 1 and len(model_param.shape) == 2:
+                        expected_size = model_param.shape[0] * model_param.shape[1]
+                        if checkpoint_tensor.numel() == expected_size:
+                            # Reshape 1D to 2D
+                            state[name] = checkpoint_tensor.reshape(model_param.shape)
+                            reshaped_count += 1
+                            if reshaped_count <= 3 and debug:
+                                debug.log(f"Reshaped {name}: [{checkpoint_tensor.shape[0]}] → {list(model_param.shape)}", 
+                                         category=model_type_lower, indent_level=1)
+                
+                # Fix dtype: uint8 → float (for biases and other params)
+                checkpoint_tensor = state[name]  # Get potentially reshaped tensor
+                if checkpoint_tensor.dtype == torch.uint8:
+                    target_dtype = model_param.dtype if model_param.dtype in [torch.float16, torch.float32, torch.bfloat16] else torch.float32
+                    state[name] = checkpoint_tensor.to(target_dtype)
+                    dtype_fixed_count += 1
+                    if dtype_fixed_count <= 3 and debug:
+                        debug.log(f"Converted {name}: uint8 → {target_dtype}", 
+                                 category=model_type_lower, indent_level=1)
+        
+        if debug and (reshaped_count > 0 or dtype_fixed_count > 0):
+            debug.log(f"✅ Prepared checkpoint: {reshaped_count} reshaped, {dtype_fixed_count} dtype-fixed", 
+                     category=model_type_lower)
+        
         # Standard loading with assignment
         debug.start_timer(f"{model_type_lower}_state_apply")
         model.load_state_dict(state, strict=False, assign=True)
