@@ -801,20 +801,22 @@ def prepare_model_structure(
             checkpoint_path, model_type, debug
         )
         
-        # HARD-CODED DIMENSIONS FOR SEEDVR2 3B MODEL
+        # HARD-CODED DIMENSIONS FROM configs_3b/main.yaml + CHECKPOINT BIAS EVIDENCE
         # Auto-detection was causing incorrect heads=25600 and 47GB allocation
-        # Using standard SEEDVR2 3B dimensions instead - DO NOT AUTO-DETECT
-        debug.log(f"Using HARD-CODED dimensions for SEEDVR2 3B model", category=model_type, force=True)
+        # Bias tensors prove: vid_in.proj.bias=[1280], emb_in.proj_out.bias=[7680]=6×1280
+        debug.log(f"Using CORRECT dimensions from configs_3b/main.yaml + bias evidence", category=model_type, force=True)
         
-        model_config.vid_dim = 1152  # Standard for Seed 3B
-        model_config.txt_dim = 1152  # Matches vid_dim
-        model_config.emb_dim = 6912  # 6 * vid_dim
-        model_config.num_layers = 28  # Standard for Seed 3B
-        model_config.heads = 16  # CORRECT VALUE (not 25600!)
+        model_config.vid_dim = 1280  # Proven by vid_in.proj.bias=[1280]
+        model_config.txt_dim = 5120  # From configs_3b/main.yaml
+        model_config.emb_dim = 7680  # Proven by emb_in.proj_out.bias=[7680] = 6×1280
+        model_config.num_layers = 32  # From configs_3b/main.yaml
+        model_config.heads = 20  # From configs_3b/main.yaml (NOT 25600!)
+        model_config.head_dim = 64  # Calculated: 1280 ÷ 20 = 64
         
-        debug.log(f"vid_dim: {model_config.vid_dim} (hard-coded)", category=model_type, force=True)
-        debug.log(f"num_layers: {model_config.num_layers} (hard-coded)", category=model_type, force=True)
-        debug.log(f"heads: {model_config.heads} (hard-coded, NOT 25600!)", category=model_type, force=True)
+        debug.log(f"vid_dim: {model_config.vid_dim} (proven by bias=[1280])", category=model_type, force=True)
+        debug.log(f"num_layers: {model_config.num_layers} (from config)", category=model_type, force=True)
+        debug.log(f"heads: {model_config.heads} (from config, NOT 25600!)", category=model_type, force=True)
+        debug.log(f"emb_dim: {model_config.emb_dim} (proven by bias=[7680]=6×1280)", category=model_type, force=True)
         
         # OLD AUTO-DETECTION CODE - DISABLED TO PREVENT heads=25600 ERROR
         # Update config with detected parameters
