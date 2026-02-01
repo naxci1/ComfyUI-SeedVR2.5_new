@@ -801,31 +801,29 @@ def prepare_model_structure(
             checkpoint_path, model_type, debug
         )
         
+        # HARD-CODED DIMENSIONS FOR SEEDVR2 3B MODEL
+        # Auto-detection was causing incorrect heads=25600 and 47GB allocation
+        # Using standard SEEDVR2 3B dimensions instead - DO NOT AUTO-DETECT
+        debug.log(f"Using HARD-CODED dimensions for SEEDVR2 3B model", category=model_type, force=True)
+        
+        model_config.vid_dim = 1152  # Standard for Seed 3B
+        model_config.txt_dim = 1152  # Matches vid_dim
+        model_config.emb_dim = 6912  # 6 * vid_dim
+        model_config.num_layers = 28  # Standard for Seed 3B
+        model_config.heads = 16  # CORRECT VALUE (not 25600!)
+        
+        debug.log(f"vid_dim: {model_config.vid_dim} (hard-coded)", category=model_type, force=True)
+        debug.log(f"num_layers: {model_config.num_layers} (hard-coded)", category=model_type, force=True)
+        debug.log(f"heads: {model_config.heads} (hard-coded, NOT 25600!)", category=model_type, force=True)
+        
+        # OLD AUTO-DETECTION CODE - DISABLED TO PREVENT heads=25600 ERROR
         # Update config with detected parameters
-        if detected_params:
-            for param_name, param_value in detected_params.items():
-                if hasattr(model_config, param_name):
-                    current_value = getattr(model_config, param_name)
-                    if current_value != param_value:
-                        debug.log(f"Config {param_name} ({current_value}) != checkpoint ({param_value})", 
-                                 category=model_type, force=True)
-                        debug.log(f"✅ Using checkpoint value: {param_name} = {param_value}", 
-                                 category=model_type, force=True)
-                        setattr(model_config, param_name, param_value)
-                        
-                        # Update dependent parameters
-                        if param_name == 'vid_dim':
-                            # txt_dim usually equals vid_dim
-                            if hasattr(model_config, 'txt_dim'):
-                                setattr(model_config, 'txt_dim', param_value)
-                                debug.log(f"Also updated txt_dim = {param_value}", 
-                                         category=model_type, force=True)
-                            # emb_dim usually equals 6 * vid_dim
-                            if hasattr(model_config, 'emb_dim'):
-                                emb_dim = 6 * param_value
-                                setattr(model_config, 'emb_dim', emb_dim)
-                                debug.log(f"Also updated emb_dim = {emb_dim}", 
-                                         category=model_type, force=True)
+        # if detected_params:
+        #     for param_name, param_value in detected_params.items():
+        #         if hasattr(model_config, param_name):
+        #             current_value = getattr(model_config, param_name)
+        #             if current_value != param_value:
+        #                 setattr(model_config, param_name, param_value)
     
     # Always create on meta device for zero memory usage
     debug.log(f"Creating {model_type_upper} model structure on meta device", 
@@ -1431,6 +1429,13 @@ def _load_standard_weights_impl(model: torch.nn.Module, state: Dict[str, Any],
     
     # NATIVE NVFP4 PATH: force_nvfp4=True
     if force_nvfp4:
+        # ENFORCE bfloat16 to prevent float32 upcasting and memory bloat
+        original_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(torch.bfloat16)
+        if debug:
+            debug.log("[NVFP4] Enforcing bfloat16 default dtype (preventing float32 upcasting)", 
+                     category="nvfp4")
+        
         try:
             # Detect if this is Nemotron NVFP4 format (packed uint8 + scale_inv)
             is_nemotron_nvfp4 = _detect_nemotron_nvfp4(state)
@@ -1515,6 +1520,12 @@ def _load_standard_weights_impl(model: torch.nn.Module, state: Dict[str, Any],
                 debug.log(f"[NVFP4] ⚠️ Critical error in NVFP4 path: {str(e)}", category="error")
                 debug.log("[NVFP4] Falling back to standard loading", category="warning")
             force_nvfp4 = False
+        finally:
+            # Restore original dtype
+            if 'original_dtype' in locals():
+                torch.set_default_dtype(original_dtype)
+                if debug:
+                    debug.log("[NVFP4] Restored original default dtype", category="nvfp4")
     
     # STANDARD PATH: Check if state contains NVFP4Tensor objects (original format)
     if not force_nvfp4:
