@@ -807,7 +807,7 @@ def prepare_model_structure(
         debug.log(f"Using CORRECT dimensions from configs_3b/main.yaml + bias evidence", category=model_type, force=True)
         
         model_config.vid_dim = 1280  # Proven by vid_in.proj.bias=[1280]
-        model_config.txt_dim = 5120  # From configs_3b/main.yaml
+        model_config.txt_dim = 1280  # MUST equal vid_dim for AdaSingle assertion (emb_dim = 6×dim)
         model_config.emb_dim = 7680  # Proven by emb_in.proj_out.bias=[7680] = 6×1280
         model_config.num_layers = 32  # From configs_3b/main.yaml
         model_config.heads = 20  # From configs_3b/main.yaml (NOT 25600!)
@@ -818,7 +818,7 @@ def prepare_model_structure(
         debug.log(f"heads: {model_config.heads} (from config, NOT 25600!)", category=model_type, force=True)
         debug.log(f"emb_dim: {model_config.emb_dim} (proven by bias=[7680]=6×1280)", category=model_type, force=True)
         
-        # CRITICAL VALIDATION: Ensure emb_dim = 6 × vid_dim for AdaSingle assertion
+        # CRITICAL VALIDATION: Ensure emb_dim = 6 × vid_dim AND txt_dim = vid_dim for AdaSingle
         expected_emb_dim = 6 * model_config.vid_dim
         if model_config.emb_dim != expected_emb_dim:
             raise ValueError(
@@ -828,7 +828,17 @@ def prepare_model_structure(
                 f"Expected emb_dim: {expected_emb_dim} (6 × {model_config.vid_dim})\n"
                 f"This relationship is required by AdaSingle modulation in modulation.py"
             )
+        
+        if model_config.txt_dim != model_config.vid_dim:
+            raise ValueError(
+                f"CRITICAL: txt_dim must equal vid_dim for AdaSingle!\n"
+                f"vid_dim: {model_config.vid_dim}\n"
+                f"txt_dim: {model_config.txt_dim}\n"
+                f"Both must be equal to satisfy emb_dim = 6 × dim assertion in modulation.py"
+            )
+        
         debug.log(f"✅ Validation passed: emb_dim ({model_config.emb_dim}) = 6 × vid_dim ({model_config.vid_dim})", category=model_type, force=True)
+        debug.log(f"✅ Validation passed: txt_dim ({model_config.txt_dim}) = vid_dim ({model_config.vid_dim})", category=model_type, force=True)
         
         # OLD AUTO-DETECTION CODE - DISABLED TO PREVENT heads=25600 ERROR
         # Update config with detected parameters
