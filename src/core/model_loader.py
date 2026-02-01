@@ -143,15 +143,42 @@ def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch
         # CRITICAL: Detect GGUF data masquerading as safetensors
         # GGUF Q4_K_M files have characteristic shape pattern: [..., 16]
         # If found, the file is GGUF with wrong extension
-        # SKIP this check if force_nvfp4 is enabled (user explicitly wants NVFP4 mode)
         if not force_nvfp4:
             _detect_gguf_in_safetensors(state, checkpoint_path, debug)
-        elif debug:
-            debug.log("⚠️ force_nvfp4 enabled - bypassing GGUF detection", 
-                     category="info", indent_level=1)
         
         # Check for NVFP4 format and wrap if detected
         state = _detect_and_wrap_nvfp4(state, checkpoint_path, debug, force_nvfp4)
+        
+        # If force_nvfp4 is enabled but no NVFP4 data found, check if it's actually GGUF
+        if force_nvfp4 and not any(k.endswith('.nvfp4_data') for k in state.keys()):
+            # Check if this is actually a GGUF file
+            shapes_ending_16 = sum(
+                1 for tensor in list(state.values())[:10]
+                if isinstance(tensor, torch.Tensor) and len(tensor.shape) >= 2 and tensor.shape[-1] == 16
+            )
+            
+            if shapes_ending_16 >= 5:
+                # This is GGUF data, not NVFP4!
+                if debug:
+                    debug.log("⚠️ force_nvfp4 enabled but file contains GGUF data (not NVFP4)", 
+                             category="warning", indent_level=1)
+                    debug.log("   Loading as GGUF instead to prevent meta device errors", 
+                             category="info", indent_level=1)
+                
+                # Reload as GGUF
+                validate_gguf_availability(f"load {os.path.basename(checkpoint_path)}", debug)
+                state = _load_gguf_state(
+                    checkpoint_path=checkpoint_path, 
+                    device=device, 
+                    debug=debug, 
+                    handle_prefix="model.diffusion_model."
+                )
+            else:
+                if debug:
+                    debug.log("⚠️ force_nvfp4 enabled but no NVFP4 format detected", 
+                             category="warning", indent_level=1)
+                    debug.log("   File may be standard FP16/FP8 - loading as-is", 
+                             category="info", indent_level=1)
         
     elif checkpoint_path.endswith('.gguf'):
         validate_gguf_availability(f"load {os.path.basename(checkpoint_path)}", debug)
