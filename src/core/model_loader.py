@@ -818,6 +818,18 @@ def prepare_model_structure(
         debug.log(f"heads: {model_config.heads} (from config, NOT 25600!)", category=model_type, force=True)
         debug.log(f"emb_dim: {model_config.emb_dim} (proven by bias=[7680]=6×1280)", category=model_type, force=True)
         
+        # CRITICAL VALIDATION: Ensure emb_dim = 6 × vid_dim for AdaSingle assertion
+        expected_emb_dim = 6 * model_config.vid_dim
+        if model_config.emb_dim != expected_emb_dim:
+            raise ValueError(
+                f"CRITICAL: emb_dim must equal 6 × vid_dim for AdaSingle!\n"
+                f"vid_dim: {model_config.vid_dim}\n"
+                f"emb_dim: {model_config.emb_dim}\n"
+                f"Expected emb_dim: {expected_emb_dim} (6 × {model_config.vid_dim})\n"
+                f"This relationship is required by AdaSingle modulation in modulation.py"
+            )
+        debug.log(f"✅ Validation passed: emb_dim ({model_config.emb_dim}) = 6 × vid_dim ({model_config.vid_dim})", category=model_type, force=True)
+        
         # OLD AUTO-DETECTION CODE - DISABLED TO PREVENT heads=25600 ERROR
         # Update config with detected parameters
         # if detected_params:
