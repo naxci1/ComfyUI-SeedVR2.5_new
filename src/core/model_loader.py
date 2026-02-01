@@ -649,6 +649,118 @@ class GGUFTensor(torch.Tensor):
         return super().__torch_function__(func, types, args, kwargs)
 
 
+def _detect_model_parameters_from_checkpoint(
+    checkpoint_path: str,
+    model_type: str,
+    debug: 'Debug'
+) -> Dict[str, Any]:
+    """
+    Detect model parameters from checkpoint before creating model.
+    Prevents architecture mismatch by reading actual checkpoint dimensions.
+    
+    Args:
+        checkpoint_path: Path to checkpoint file
+        model_type: "dit" or "vae"
+        debug: Debug instance for logging
+        
+    Returns:
+        Dict with detected parameters: vid_dim, num_layers, etc.
+    """
+    detected_params = {}
+    
+    if not SAFETENSORS_AVAILABLE or not checkpoint_path.endswith('.safetensors'):
+        debug.log(f"Cannot detect parameters: SafeTensors not available or not .safetensors file", 
+                 category=model_type, force=True)
+        return detected_params
+    
+    try:
+        debug.log(f"Detecting model parameters from checkpoint...", 
+                 category=model_type, force=True)
+        
+        from safetensors import safe_open
+        
+        with safe_open(checkpoint_path, framework='pt') as f:
+            keys = list(f.keys())
+            
+            # Detect vid_dim (hidden_size) from various possible keys
+            vid_dim_candidates = [
+                'vid_in.proj.weight',  # Standard key
+                'txt_in.weight',        # Alternative
+                'emb_in.proj_in.weight' # Another alternative
+            ]
+            
+            for key in vid_dim_candidates:
+                if key in keys:
+                    tensor = f.get_tensor(key)
+                    shape = tensor.shape
+                    
+                    # Handle both packed (NVFP4) and unpacked tensors
+                    # For NVFP4, shape[0] might be half of actual hidden_dim
+                    vid_dim = shape[0]
+                    
+                    # Check if this might be NVFP4 packed (has _scale_inv)
+                    scale_key = f"{key}_scale_inv"
+                    if scale_key in keys:
+                        # This is NVFP4 packed, vid_dim is half
+                        # But we detected the packed size, which is what we need
+                        debug.log(f"Detected NVFP4 packed format", category=model_type, force=True)
+                    
+                    detected_params['vid_dim'] = vid_dim
+                    debug.log(f"Detected vid_dim from {key}: {vid_dim} (shape: {shape})", 
+                             category=model_type, force=True)
+                    break
+            
+            # Detect num_layers (depth) by counting blocks
+            block_keys = [k for k in keys if k.startswith('blocks.')]
+            if block_keys:
+                # Extract block indices
+                block_indices = set()
+                for k in block_keys:
+                    parts = k.split('.')
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        block_indices.add(int(parts[1]))
+                
+                if block_indices:
+                    num_layers = max(block_indices) + 1
+                    detected_params['num_layers'] = num_layers
+                    debug.log(f"Detected num_layers: {num_layers}", 
+                             category=model_type, force=True)
+            
+            # Detect heads from attention tensors
+            for key in ['blocks.0.attn.proj_qkv.vid.weight', 'blocks.0.attn.proj_qkv.txt.weight']:
+                if key in keys:
+                    tensor = f.get_tensor(key)
+                    shape = tensor.shape
+                    # proj_qkv has shape [3 * heads * head_dim, hidden_dim]
+                    # or for multi-head: [heads * 3 * head_dim, hidden_dim]
+                    if 'vid_dim' in detected_params:
+                        qkv_dim = shape[0]
+                        vid_dim = detected_params['vid_dim']
+                        # qkv_dim = 3 * heads * head_dim
+                        # For head_dim=128 (common): heads = qkv_dim / (3 * 128)
+                        if qkv_dim % (3 * 128) == 0:
+                            heads = qkv_dim // (3 * 128)
+                            detected_params['heads'] = heads
+                            debug.log(f"Detected heads from {key}: {heads}", 
+                                     category=model_type, force=True)
+                    break
+        
+        if detected_params:
+            debug.log(f"Successfully detected parameters: {detected_params}", 
+                     category=model_type, force=True)
+        else:
+            debug.log(f"No parameters detected from checkpoint", 
+                     category=model_type, force=True)
+                     
+    except Exception as e:
+        debug.log(f"Error detecting parameters: {e}", 
+                 category=model_type, level="WARNING", force=True)
+        import traceback
+        traceback.print_exc()
+    
+    return detected_params
+
+
 def prepare_model_structure(
     runner: VideoDiffusionInfer,
     model_type: str,
@@ -680,6 +792,38 @@ def prepare_model_structure(
     is_dit = (model_type == "dit")
     model_type_upper = "DiT" if is_dit else "VAE"
     model_config = config.dit.model if is_dit else config.vae.model
+    
+    # Detect model parameters from checkpoint BEFORE creating model
+    if is_dit and os.path.exists(checkpoint_path):
+        detected_params = _detect_model_parameters_from_checkpoint(
+            checkpoint_path, model_type, debug
+        )
+        
+        # Update config with detected parameters
+        if detected_params:
+            for param_name, param_value in detected_params.items():
+                if hasattr(model_config, param_name):
+                    current_value = getattr(model_config, param_name)
+                    if current_value != param_value:
+                        debug.log(f"Config {param_name} ({current_value}) != checkpoint ({param_value})", 
+                                 category=model_type, force=True)
+                        debug.log(f"✅ Using checkpoint value: {param_name} = {param_value}", 
+                                 category=model_type, force=True)
+                        setattr(model_config, param_name, param_value)
+                        
+                        # Update dependent parameters
+                        if param_name == 'vid_dim':
+                            # txt_dim usually equals vid_dim
+                            if hasattr(model_config, 'txt_dim'):
+                                setattr(model_config, 'txt_dim', param_value)
+                                debug.log(f"Also updated txt_dim = {param_value}", 
+                                         category=model_type, force=True)
+                            # emb_dim usually equals 6 * vid_dim
+                            if hasattr(model_config, 'emb_dim'):
+                                emb_dim = 6 * param_value
+                                setattr(model_config, 'emb_dim', emb_dim)
+                                debug.log(f"Also updated emb_dim = {emb_dim}", 
+                                         category=model_type, force=True)
     
     # Always create on meta device for zero memory usage
     debug.log(f"Creating {model_type_upper} model structure on meta device", 
