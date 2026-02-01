@@ -82,7 +82,7 @@ script_directory = get_script_directory()
 
 
 def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch.device("cpu"),
-                              debug: Optional['Debug'] = None) -> Dict[str, torch.Tensor]:
+                              debug: Optional['Debug'] = None, force_nvfp4: bool = False) -> Dict[str, torch.Tensor]:
     """
     Load model state dict from checkpoint with support for multiple formats.
     
@@ -93,6 +93,7 @@ def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch
         checkpoint_path: Path to checkpoint file
         device: Target device for tensor placement (torch.device object, defaults to CPU)
         debug: Optional Debug instance for logging
+        force_nvfp4: If True, bypasses GGUF detection and treats file as NVFP4 safetensors
         
     Returns:
         dict: State dictionary loaded with appropriate format handler
@@ -100,6 +101,7 @@ def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch
     Notes:
         - SafeTensors files use optimized loading with direct device placement
         - PyTorch files use memory-mapped loading to reduce RAM usage
+        - force_nvfp4 mode skips automatic GGUF detection in .safetensors files
     """
     device_str = str(device)
     
@@ -141,7 +143,12 @@ def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch
         # CRITICAL: Detect GGUF data masquerading as safetensors
         # GGUF Q4_K_M files have characteristic shape pattern: [..., 16]
         # If found, the file is GGUF with wrong extension
-        _detect_gguf_in_safetensors(state, checkpoint_path, debug)
+        # SKIP this check if force_nvfp4 is enabled (user explicitly wants NVFP4 mode)
+        if not force_nvfp4:
+            _detect_gguf_in_safetensors(state, checkpoint_path, debug)
+        elif debug:
+            debug.log("⚠️ force_nvfp4 enabled - bypassing GGUF detection", 
+                     category="info", indent_level=1)
     elif checkpoint_path.endswith('.gguf'):
         validate_gguf_availability(f"load {os.path.basename(checkpoint_path)}", debug)
         state = _load_gguf_state(
@@ -517,7 +524,8 @@ def prepare_model_structure(
     checkpoint_path: str,
     config: OmegaConf,
     debug: 'Debug',
-    block_swap_config: Optional[Dict[str, Any]] = None
+    block_swap_config: Optional[Dict[str, Any]] = None,
+    force_nvfp4: bool = False
 ) -> VideoDiffusionInfer:
     """
     Prepare model structure on meta device without loading weights.
@@ -530,6 +538,7 @@ def prepare_model_structure(
         config: Model configuration
         debug: Debug instance for logging (required)
         block_swap_config: BlockSwap config (stored for DiT, optional)
+        force_nvfp4: Force NVFP4 loading mode (bypasses GGUF detection)
         
     Returns:
         runner: Updated runner with model structure on meta device
@@ -556,6 +565,7 @@ def prepare_model_structure(
         runner.dit = model
         runner._dit_checkpoint = checkpoint_path
         runner._dit_block_swap_config = block_swap_config
+        runner._dit_force_nvfp4 = force_nvfp4
     else:
         runner.vae = model  
         runner._vae_checkpoint = checkpoint_path
@@ -588,11 +598,13 @@ def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: torc
         checkpoint_path = runner._dit_checkpoint
         block_swap_config = runner._dit_block_swap_config
         override_dtype = getattr(runner, '_dit_dtype_override', None)
+        force_nvfp4 = getattr(runner, '_dit_force_nvfp4', False)
     else:
         model = runner.vae
         checkpoint_path = runner._vae_checkpoint
         block_swap_config = None
         override_dtype = getattr(runner, '_vae_dtype_override', None)
+        force_nvfp4 = False  # VAE doesn't support force_nvfp4
     
     # Check if already materialized
     if model is None:
@@ -632,11 +644,12 @@ def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: torc
     debug.end_timer(f"{model_type}_materialize", f"{model_type_upper} materialized")
     
     # Clean up checkpoint paths (no longer needed after weights are loaded)
-    # Note: Config attributes (_dit_block_swap_config, _dit_compile_args) are preserved
+    # Note: Config attributes (_dit_block_swap_config, _dit_compile_args, _dit_force_nvfp4) are preserved
     # for configuration change detection on subsequent runs
     if is_dit:
         runner._dit_checkpoint = None
         runner._dit_dtype_override = None
+        # Note: _dit_force_nvfp4 is preserved for potential config change detection
     else:
         runner._vae_checkpoint = None
         runner._vae_dtype_override = None
@@ -644,7 +657,8 @@ def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: torc
 
 def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_device: torch.device, 
                         used_meta: bool, model_type: str, cpu_reason: str, 
-                        debug: Optional['Debug'] = None, override_dtype: Optional[torch.dtype] = None) -> torch.nn.Module:
+                        debug: Optional['Debug'] = None, override_dtype: Optional[torch.dtype] = None,
+                        force_nvfp4: bool = False) -> torch.nn.Module:
     """
     Load model weights from checkpoint file with optimized GGUF support.
     
@@ -660,6 +674,7 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
         cpu_reason: Reason string if using CPU
         debug: Debug instance
         override_dtype: Optional dtype override for weights
+        force_nvfp4: Force NVFP4 loading mode (bypasses GGUF detection)
         
     Returns:
         Model with loaded weights
@@ -674,7 +689,7 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
     
     # Load state dict from file
     debug.start_timer(f"{model_type_lower}_weights_load")
-    state = load_quantized_state_dict(checkpoint_path, target_device, debug)
+    state = load_quantized_state_dict(checkpoint_path, target_device, debug, force_nvfp4)
     debug.end_timer(f"{model_type_lower}_weights_load", f"{model_type} weights loaded from file")
     
     # Apply dtype conversion if requested

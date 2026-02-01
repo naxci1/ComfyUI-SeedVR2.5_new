@@ -143,6 +143,27 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
                         "Provides 20-40% speedup with compatible PyTorch 2.0+ and Triton installation."
                     )
                 ),
+                io.Boolean.Input("force_nvfp4",
+                    default=False,
+                    optional=True,
+                    tooltip=(
+                        "⚠️ EXPERIMENTAL: Force NVFP4 loading mode\n"
+                        "\n"
+                        "When enabled (true):\n"
+                        "• Bypasses automatic GGUF format detection\n"
+                        "• Loads file as standard safetensors (native NVFP4 mode)\n"
+                        "• Treats model as NVFP4 format regardless of actual content\n"
+                        "• Use this if you have a true NVFP4 model or want to override detection\n"
+                        "\n"
+                        "When disabled (false, default):\n"
+                        "• Automatic format detection active\n"
+                        "• GGUF files with .safetensors extension are detected and rejected\n"
+                        "• Recommended for most users\n"
+                        "\n"
+                        "⚠️ WARNING: Enabling this with GGUF files will cause shape mismatch errors.\n"
+                        "Only enable if you have a genuine NVFP4 safetensors file."
+                    )
+                ),
             ],
             outputs=[
                 io.Custom("SEEDVR2_DIT").Output(
@@ -155,7 +176,8 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
     def execute(cls, model: str, device: str, offload_device: str = "none",
                      cache_model: bool = False, blocks_to_swap: int = 0, 
                      swap_io_components: bool = False, attention_mode: str = "sdpa",
-                     torch_compile_args: Dict[str, Any] = None) -> io.NodeOutput:
+                     torch_compile_args: Dict[str, Any] = None,
+                     force_nvfp4: bool = False) -> io.NodeOutput:
         """
         Create DiT model configuration for SeedVR2 main node
         
@@ -168,6 +190,7 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
             swap_io_components: Whether to offload I/O components (requires offload_device != device)
             attention_mode: Attention computation backend ('sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3')
             torch_compile_args: Optional torch.compile configuration from settings node
+            force_nvfp4: Force NVFP4 loading mode (bypasses GGUF detection)
             
         Returns:
             NodeOutput containing configuration dictionary for SeedVR2 main node
@@ -226,6 +249,7 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
             "swap_io_components": swap_io_components,
             "attention_mode": attention_mode,
             "torch_compile_args": torch_compile_args,
+            "force_nvfp4": force_nvfp4,
             "node_id": get_executing_context().node_id,
         }
         
