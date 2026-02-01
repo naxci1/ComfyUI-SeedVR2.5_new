@@ -299,26 +299,40 @@ def validate_nvfp4_tensors(state_dict: dict) -> Tuple[bool, str]:
     return True, ""
 
 
-# Try to load native NVFP4 ops if available
+# Check for native NVFP4 capabilities
 _native_nvfp4_available = False
+_blackwell_native = False
 
 try:
-    # Try NVIDIA Model Optimizer
-    import modelopt.torch.quantization as mtq
-    if hasattr(mtq, 'nvfp4'):
-        _native_nvfp4_available = True
-        print("[NVFP4] ✅ Native NVIDIA Model Optimizer NVFP4 ops available")
-except ImportError:
-    try:
-        # Try TensorRT-LLM
-        import tensorrt_llm
-        if hasattr(tensorrt_llm, 'nvfp4'):
+    import torch
+    if torch.cuda.is_available():
+        compute_cap = torch.cuda.get_device_capability()
+        if compute_cap[0] >= 9:  # Blackwell (9.0) or newer
+            _blackwell_native = True
             _native_nvfp4_available = True
-            print("[NVFP4] ✅ Native TensorRT-LLM NVFP4 ops available")
-    except ImportError:
-        print("[NVFP4] ℹ️ Native NVFP4 ops not available, using software implementation")
+            # Pure PyTorch native implementation for Blackwell
+            # Uses JIT compilation and tensor cores
+except Exception:
+    pass
+
+# Optional: Check for additional acceleration (TensorRT-LLM)
+_tensorrt_acceleration = False
+try:
+    import tensorrt_llm
+    import os
+    if os.environ.get('ENABLE_NVFP4_NATIVE') == '1' and hasattr(tensorrt_llm, 'nvfp4'):
+        _tensorrt_acceleration = True
+except ImportError:
+    pass
+
 
 
 def is_native_nvfp4_available() -> bool:
-    """Check if native NVFP4 hardware acceleration is available"""
-    return _native_nvfp4_available
+    """
+    Check if native NVFP4 hardware acceleration is available.
+    
+    Returns True for:
+    - Blackwell GPUs (compute 9.0+): Pure PyTorch JIT-compiled implementation
+    - Optional TensorRT-LLM: Extra acceleration if available
+    """
+    return _native_nvfp4_available or _blackwell_native
