@@ -683,32 +683,34 @@ def _detect_model_parameters_from_checkpoint(
             keys = list(f.keys())
             
             # Detect vid_dim (hidden_size) from various possible keys
-            vid_dim_candidates = [
-                'vid_in.proj.weight',  # Standard key
-                'txt_in.weight',        # Alternative
-                'emb_in.proj_in.weight' # Another alternative
+            # CRITICAL: Use BIAS tensors - they show TRUE dimension
+            bias_candidates = [
+                'vid_in.proj.bias',
+                'txt_in.bias', 
+                'emb_in.proj_in.bias'
             ]
             
-            for key in vid_dim_candidates:
-                if key in keys:
-                    tensor = f.get_tensor(key)
-                    shape = tensor.shape
-                    
-                    # Handle both packed (NVFP4) and unpacked tensors
-                    # For NVFP4, shape[0] might be half of actual hidden_dim
-                    vid_dim = shape[0]
-                    
-                    # Check if this might be NVFP4 packed (has _scale_inv)
-                    scale_key = f"{key}_scale_inv"
-                    if scale_key in keys:
-                        # This is NVFP4 packed, vid_dim is half
-                        # But we detected the packed size, which is what we need
-                        debug.log(f"Detected NVFP4 packed format", category=model_type, force=True)
-                    
+            vid_dim = None
+            for bias_key in bias_candidates:
+                if bias_key in keys:
+                    bias = f.get_tensor(bias_key)
+                    vid_dim = bias.shape[0]
                     detected_params['vid_dim'] = vid_dim
-                    debug.log(f"Detected vid_dim from {key}: {vid_dim} (shape: {shape})", 
+                    debug.log(f"Detected vid_dim from {bias_key}: {vid_dim}", 
                              category=model_type, force=True)
                     break
+            
+            if vid_dim is None:
+                # Fallback to weight if no bias
+                for key in ['vid_in.proj.weight', 'txt_in.weight']:
+                    if key in keys:
+                        tensor = f.get_tensor(key)
+                        if len(tensor.shape) == 2:
+                            vid_dim = tensor.shape[0]
+                            detected_params['vid_dim'] = vid_dim
+                            debug.log(f"Detected vid_dim from {key}: {vid_dim}", 
+                                     category=model_type, force=True)
+                            break
             
             # Detect num_layers (depth) by counting blocks
             block_keys = [k for k in keys if k.startswith('blocks.')]
