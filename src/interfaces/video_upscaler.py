@@ -377,6 +377,9 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
         dit_torch_compile_args = dit.get("torch_compile_args")
         vae_torch_compile_args = vae.get("torch_compile_args")
         
+        # Force NVFP4 mode (experimental)
+        force_nvfp4 = dit.get("force_nvfp4", False)
+        
         # Print header
         debug.print_header()
 
@@ -433,7 +436,8 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                 tile_debug=tile_debug,
                 attention_mode=attention_mode,
                 torch_compile_args_dit=dit_torch_compile_args,
-                torch_compile_args_vae=vae_torch_compile_args
+                torch_compile_args_vae=vae_torch_compile_args,
+                force_nvfp4=force_nvfp4
             )
 
             # Store cache context in ctx for use in generation phases
