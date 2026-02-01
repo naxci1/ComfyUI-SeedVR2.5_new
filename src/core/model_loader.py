@@ -137,6 +137,11 @@ def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch
             else:
                 # Re-raise if it's a different error (file corruption, etc.)
                 raise
+        
+        # CRITICAL: Detect GGUF data masquerading as safetensors
+        # GGUF Q4_K_M files have characteristic shape pattern: [..., 16]
+        # If found, the file is GGUF with wrong extension
+        _detect_gguf_in_safetensors(state, checkpoint_path, debug)
     elif checkpoint_path.endswith('.gguf'):
         validate_gguf_availability(f"load {os.path.basename(checkpoint_path)}", debug)
         state = _load_gguf_state(
@@ -151,6 +156,95 @@ def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch
         raise ValueError(f"Unsupported checkpoint format. Expected .safetensors or .pth, got: {checkpoint_path}")
     
     return state
+
+
+def _detect_gguf_in_safetensors(state_dict: Dict[str, torch.Tensor], checkpoint_path: str,
+                                debug: Optional['Debug'] = None) -> None:
+    """
+    Detect if a safetensors file actually contains GGUF quantized data.
+    
+    GGUF Q4_K_M models have a characteristic shape pattern where tensors end with dimension 16.
+    If we find this pattern in a .safetensors file, it's actually GGUF data with the wrong extension.
+    
+    Args:
+        state_dict: Loaded state dictionary
+        checkpoint_path: Path to the file
+        debug: Debug instance for logging
+        
+    Raises:
+        ValueError: If GGUF data is detected in safetensors file
+    """
+    # Check first 10 tensors for GGUF pattern
+    shapes_ending_16 = 0
+    total_checked = 0
+    sample_shapes = []
+    
+    for key, tensor in list(state_dict.items())[:10]:
+        total_checked += 1
+        shape = tensor.shape
+        sample_shapes.append(f"{key}: {list(shape)}")
+        
+        # GGUF Q4_K_M tensors have shape [..., 16]
+        if len(shape) >= 2 and shape[-1] == 16:
+            shapes_ending_16 += 1
+    
+    # If more than half the tensors end in 16, it's likely GGUF
+    if shapes_ending_16 >= 5:
+        filename = os.path.basename(checkpoint_path)
+        base_name = os.path.splitext(filename)[0]
+        
+        error_msg = (
+            f"\n"
+            f"╔══════════════════════════════════════════════════════════════════════╗\n"
+            f"║  GGUF FILE WITH WRONG EXTENSION DETECTED                             ║\n"
+            f"╠══════════════════════════════════════════════════════════════════════╣\n"
+            f"║  File: {filename[:62]:<62} ║\n"
+            f"║                                                                      ║\n"
+            f"║  This file contains GGUF quantized data but has .safetensors         ║\n"
+            f"║  extension. This causes shape mismatch errors during loading.        ║\n"
+            f"║                                                                      ║\n"
+            f"║  Evidence:                                                           ║\n"
+            f"║    • {shapes_ending_16}/{total_checked} tensors have shape [..., 16] (GGUF Q4_K_M pattern) ║\n"
+            f"║    • Example shapes:                                                 ║\n"
+        )
+        
+        for shape_info in sample_shapes[:3]:
+            if len(shape_info) > 64:
+                shape_info = shape_info[:61] + "..."
+            error_msg += f"║      {shape_info:<66} ║\n"
+        
+        error_msg += (
+            f"║                                                                      ║\n"
+            f"║  SOLUTION 1: Rename the file (Recommended)                          ║\n"
+            f"║    Rename to: {base_name}.gguf                                       \n"
+            f"║    Location: models/dit/                                             ║\n"
+            f"║                                                                      ║\n"
+            f"║  SOLUTION 2: Use proven alternative models                          ║\n"
+            f"║    • seedvr2_ema_3b-Q4_K_M.gguf (GGUF, any GPU)                     ║\n"
+            f"║      From: https://huggingface.co/cmeka/SeedVR2-GGUF                ║\n"
+            f"║                                                                      ║\n"
+            f"║    • seedvr2_ema_3b_fp8_e4m3fn.safetensors (FP8, RTX 40/50)         ║\n"
+            f"║      Already available in default models                            ║\n"
+            f"║                                                                      ║\n"
+            f"║    • seedvr2_ema_3b_fp16.safetensors (FP16, any GPU)                ║\n"
+            f"║      Already available in default models                            ║\n"
+            f"║                                                                      ║\n"
+            f"║  TECHNICAL NOTE:                                                    ║\n"
+            f"║    GGUF files use block quantization with specific shape patterns.  ║\n"
+            f"║    They must have .gguf extension to be loaded correctly.           ║\n"
+            f"║    True NVFP4 format doesn't exist yet in PyTorch.                  ║\n"
+            f"╚══════════════════════════════════════════════════════════════════════╝\n"
+        )
+        
+        if debug:
+            debug.log(error_msg, level="ERROR", category="dit", force=True)
+        
+        raise ValueError(
+            f"GGUF data detected in .safetensors file: {filename}\n"
+            f"Rename to {base_name}.gguf or use alternative models.\n"
+            f"See error message above for details."
+        )
+
 
 
 def _load_gguf_state(checkpoint_path: str, device: torch.device, debug: Optional['Debug'] = None,
