@@ -598,6 +598,9 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
     # Initialize meta buffers if needed
     if used_meta:
         initialize_meta_buffers(model, target_device, debug)
+        
+        # Validate that no tensors remain on meta device
+        _validate_no_meta_tensors(model, model_type, debug)
     
     return model
 
@@ -807,8 +810,13 @@ def initialize_meta_buffers_impl(model: torch.nn.Module, target_device: torch.de
                 module = model
             
             # Create a zero tensor of the same shape on target device
+            # Use torch.zeros() instead of zeros_like() to avoid meta device issues
             # This is safe for all non-persistent buffers (caches, dummy tensors, etc.)
-            initialized_buffer = torch.zeros_like(buffer, device=target_device)
+            initialized_buffer = torch.zeros(
+                buffer.shape, 
+                dtype=buffer.dtype if buffer.dtype != torch.float16 else torch.float32,
+                device=target_device
+            )
             module.register_buffer(buffer_name, initialized_buffer, persistent=False)
             initialized_count += 1
     
@@ -962,4 +970,45 @@ def _create_dequantize_method(tensor: torch.Tensor, debug: Optional['Debug'] = N
                 debug.log(f"Warning: Could not dequantize tensor: {e}", level="WARNING", category="dit", force=True)
             return tensor.to(device or tensor.device, dtype)
     
+
+def _validate_no_meta_tensors(model: torch.nn.Module, model_type: str, debug: Optional['Debug'] = None) -> None:
+    """
+    Validate that no parameters or buffers remain on meta device after materialization.
+    
+    Args:
+        model: Model to validate
+        model_type: Model type for error messages
+        debug: Debug instance for logging
+        
+    Raises:
+        RuntimeError: If any tensors are still on meta device
+    """
+    meta_params = []
+    meta_buffers = []
+    
+    # Check parameters
+    for name, param in model.named_parameters():
+        if param is not None and param.device.type == 'meta':
+            meta_params.append(name)
+    
+    # Check buffers
+    for name, buffer in model.named_buffers():
+        if buffer is not None and buffer.device.type == 'meta':
+            meta_buffers.append(name)
+    
+    if meta_params or meta_buffers:
+        error_msg = f"{model_type} model has tensors still on meta device after materialization:\n"
+        if meta_params:
+            error_msg += f"  Parameters on meta device ({len(meta_params)}): {meta_params[:5]}\n"
+        if meta_buffers:
+            error_msg += f"  Buffers on meta device ({len(meta_buffers)}): {meta_buffers[:5]}\n"
+        error_msg += "\nThis indicates an incomplete materialization. Please report this issue."
+        
+        if debug:
+            debug.log(error_msg, level="ERROR", category="model", force=True)
+        
+        raise RuntimeError(error_msg)
+    
+    if debug:
+        debug.log(f"{model_type} materialization validated - no meta tensors found", category="success")
     return dequantize
