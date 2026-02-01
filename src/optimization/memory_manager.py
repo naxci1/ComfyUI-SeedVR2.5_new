@@ -917,7 +917,8 @@ def _standard_model_movement(model: torch.nn.Module, current_device: torch.devic
     except StopIteration:
         pass  # No parameters
     
-    if has_meta:
+    # EXACT meta device check as specified
+    if hasattr(model, 'device') and str(model.device) == 'meta':
         # Use to_empty() for meta device to allocate memory without copying
         if debug:
             debug.log(f"Model on meta device, using to_empty() to allocate on {target_device_str}", category="general")
