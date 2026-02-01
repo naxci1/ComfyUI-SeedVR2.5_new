@@ -29,6 +29,7 @@ class ModelInfo:
     size: str = "3B" # '3B', '7B', etc.
     variant: Optional[str] = None # 'sharp', etc.
     sha256: Optional[str] = None # Cached hash
+    min_compute_capability: Optional[float] = None # Minimum compute capability required
 
 # Model registry with metadata
 MODEL_REGISTRY = {
@@ -48,6 +49,17 @@ MODEL_REGISTRY = {
     "seedvr2_ema_7b_sharp_fp8_e4m3fn_mixed_block35_fp16.safetensors": ModelInfo(repo="AInVFX/SeedVR2_comfyUI", size="7B", precision="fp8_e4m3fn_mixed_block35_fp16", variant="sharp", sha256="0d2c5b8be0fda94351149c5115da26aef4f4932a7a2a928c6f184dda9186e0be"),
     "seedvr2_ema_7b_sharp_fp16.safetensors": ModelInfo(size="7B", precision="fp16", variant="sharp", sha256="20a93e01ff24beaeebc5de4e4e5be924359606c356c9c51509fba245bd2d77dd"),
     
+    # NVFP4 models (RTX 50 series ONLY - Blackwell architecture)
+    "seedvr2_3b_blackwell_nvfp4_extreme_full.safetensors": ModelInfo(
+        repo="Nexus24/vaeGGUF",
+        size="3B",
+        precision="NVFP4",
+        variant="extreme_full",
+        sha256=None,  # Auto-calculate on download
+        min_compute_capability=9.0,  # Blackwell only
+        category="dit"
+    ),
+    
     # VAE models
     "ema_vae_fp16.safetensors": ModelInfo(category="vae", precision="fp16", sha256="20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1"),
 }
@@ -66,6 +78,8 @@ def get_model_repo(model_name: str) -> str:
 
 def get_available_dit_models() -> List[str]:
     """Get all available DiT models including those discovered on disk"""
+    from .hardware_detection import check_nvfp4_support
+    
     model_list = get_default_models("dit")
     
     try:
@@ -82,6 +96,13 @@ def get_available_dit_models() -> List[str]:
         model_list.extend(sorted(discovered_models))
     except:
         pass
+    
+    # Filter out NVFP4 models if hardware doesn't support it
+    if not check_nvfp4_support():
+        model_list = [
+            m for m in model_list 
+            if not ("nvfp4" in m.lower() or "blackwell" in m.lower())
+        ]
     
     return model_list
 

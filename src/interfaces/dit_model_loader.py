@@ -29,6 +29,29 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
         devices = get_device_list()
         dit_models = get_available_dit_models()
         
+        # Import hardware detection for NVFP4 support
+        from ..utils.hardware_detection import check_nvfp4_support, get_gpu_info
+        has_nvfp4 = check_nvfp4_support()
+        
+        # Enhanced tooltip with NVFP4 info
+        model_tooltip = (
+            "DiT (Diffusion Transformer) model for video upscaling.\n"
+            "Models automatically download on first use.\n"
+            "Additional models can be added to the ComfyUI models folder."
+        )
+        
+        if has_nvfp4:
+            gpu_info = get_gpu_info()
+            model_tooltip += (
+                f"\n\n✅ NVFP4 SUPPORT DETECTED!\n"
+                f"GPU: {gpu_info['name']}\n"
+                f"NVFP4 models provide 2-2.5x speedup on RTX 50 series"
+            )
+        else:
+            model_tooltip += (
+                "\n\nℹ️ NVFP4 models require RTX 50 series GPU (5070 Ti/5080/5090)"
+            )
+        
         return io.Schema(
             node_id="SeedVR2LoadDiTModel",
             display_name="SeedVR2 (Down)Load DiT Model",
@@ -43,11 +66,7 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
                 io.Combo.Input("model",
                     options=dit_models,
                     default=DEFAULT_DIT,
-                    tooltip=(
-                        "DiT (Diffusion Transformer) model for video upscaling.\n"
-                        "Models automatically download on first use.\n"
-                        "Additional models can be added to the ComfyUI models folder."
-                    )
+                    tooltip=model_tooltip
                 ),
                 io.Combo.Input("device",
                     options=devices,
@@ -155,7 +174,37 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
             
         Raises:
             ValueError: If cache_model is enabled but offload_device is not set
+            RuntimeError: If NVFP4 model is selected on non-Blackwell GPU
         """
+        # Validate NVFP4 model compatibility
+        if "nvfp4" in model.lower() or "blackwell" in model.lower():
+            from ..utils.hardware_detection import check_nvfp4_support, get_gpu_info
+            
+            if not check_nvfp4_support():
+                gpu_info = get_gpu_info()
+                gpu_name = gpu_info.get('name', 'Unknown') if gpu_info.get('available') else 'No CUDA GPU'
+                model_short = model[:40] if len(model) > 40 else model
+                
+                raise RuntimeError(
+                    f"╔══════════════════════════════════════════════════════════════╗\n"
+                    f"║  NVFP4 Model Requires RTX 50 Series GPU                      ║\n"
+                    f"╠══════════════════════════════════════════════════════════════╣\n"
+                    f"║  Selected Model: {model_short:<40} ║\n"
+                    f"║  Your GPU:       {gpu_name[:40]:<40} ║\n"
+                    f"║                                                              ║\n"
+                    f"║  NVFP4 models ONLY work on:                                 ║\n"
+                    f"║    • RTX 5090 (24GB)                                        ║\n"
+                    f"║    • RTX 5080 (16GB)                                        ║\n"
+                    f"║    • RTX 5070 Ti (16GB)                                     ║\n"
+                    f"║    • RTX 5070 (12GB)                                        ║\n"
+                    f"║                                                              ║\n"
+                    f"║  Recommended alternatives:                                  ║\n"
+                    f"║    • seedvr2_ema_3b_fp16.safetensors (best quality)        ║\n"
+                    f"║    • seedvr2_ema_3b_fp8_e4m3fn.safetensors (balanced)      ║\n"
+                    f"║    • seedvr2_ema_3b-Q8_0.gguf (low VRAM)                   ║\n"
+                    f"╚══════════════════════════════════════════════════════════════╝"
+                )
+        
         # Validate cache_model configuration
         if cache_model and offload_device == "none":
             raise ValueError(
