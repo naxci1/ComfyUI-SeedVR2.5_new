@@ -1067,16 +1067,23 @@ def initialize_meta_buffers_impl(model: torch.nn.Module, target_device: torch.de
     return initialized_count
 
 
-def _recursive_setattr(obj, attr, value):
+def _safe_setattr(obj, attr, value):
     """
-    Set nested attribute using dot notation.
+    Safely set nested attribute using dot notation with error handling.
     
-    Example: _recursive_setattr(model, "blocks.0.attn.proj_qkv.vid.weight", new_param)
+    Example: _safe_setattr(model, "blocks.0.attn.proj_qkv.vid.weight", new_param)
+    
+    Returns:
+        True if successful, False otherwise
     """
-    parts = attr.split('.')
-    for part in parts[:-1]:
-        obj = getattr(obj, part)
-    setattr(obj, parts[-1], value)
+    try:
+        parts = attr.split('.')
+        for part in parts[:-1]:
+            obj = getattr(obj, part)
+        setattr(obj, parts[-1], value)
+        return True
+    except Exception as e:
+        return False
 
 
 def _detect_nemotron_nvfp4(state_dict: Dict[str, torch.Tensor]) -> bool:
@@ -1111,11 +1118,11 @@ def _detect_nemotron_nvfp4(state_dict: Dict[str, torch.Tensor]) -> bool:
 def _patch_model_for_nemotron_nvfp4(model: torch.nn.Module, 
                                     state_dict: Dict[str, torch.Tensor],
                                     device: torch.device,
-                                    debug: Optional['Debug'] = None) -> List[str]:
+                                    debug: Optional['Debug'] = None) -> Tuple[bool, List[str]]:
     """
-    Dynamically patch model architecture to match packed NVFP4 shapes.
+    Safely patch model architecture to match packed NVFP4 shapes.
     
-    This function performs two critical operations:
+    This function performs two critical operations with comprehensive error handling:
     
     Phase 1: Patch weight parameters to match uint8 packed shapes
       - For each parameter where checkpoint shape != model shape
@@ -1133,62 +1140,93 @@ def _patch_model_for_nemotron_nvfp4(model: torch.nn.Module,
         debug: Debug instance for logging
         
     Returns:
-        List of patched parameter names with shape info
+        Tuple of (success: bool, patched_params: List[str])
     """
     patched_params = []
+    errors = []
     
-    # Get current model state for comparison
-    model_state = dict(model.named_parameters())
-    
-    # Phase 1: Patch weight parameters to match packed shapes
-    for name in list(model_state.keys()):
-        if name in state_dict:
-            checkpoint_tensor = state_dict[name]
-            model_param = model_state[name]
-            
-            # Check if shapes don't match (packed vs unpacked)
-            if checkpoint_tensor.shape != model_param.shape:
-                # Create new parameter with packed shape and uint8 dtype
-                new_param = torch.nn.Parameter(
-                    torch.empty(checkpoint_tensor.shape, 
-                               dtype=torch.uint8, 
-                               device=device),
-                    requires_grad=False
-                )
-                
-                # Replace the parameter using recursive setattr
-                _recursive_setattr(model, name, new_param)
-                
-                # Log the patching
-                patched_params.append(
-                    f"{name} [{list(model_param.shape)}→{list(checkpoint_tensor.shape)}]"
-                )
-    
-    # Phase 2: Register _scale_inv parameters for Blackwell MX scaling
-    for key in state_dict.keys():
-        if key.endswith('_scale_inv'):
-            # Extract parent parameter name (remove _scale_inv suffix)
-            parent_name = key.replace('_scale_inv', '')
-            
-            # Only register if parent weight exists in model
-            if parent_name in model_state or any(p.startswith(parent_name) for p in model_state.keys()):
-                scale_tensor = state_dict[key]
-                
-                # Create FP8 parameter for scale_inv
-                scale_param = torch.nn.Parameter(
-                    torch.empty(scale_tensor.shape,
-                               dtype=torch.float8_e4m3fn,
-                               device=device),
-                    requires_grad=False
-                )
-                
-                # Register the scale_inv parameter
-                _recursive_setattr(model, key, scale_param)
-                
-                # Log the registration
-                patched_params.append(f"{key} [NEW FP8 scale]")
-    
-    return patched_params
+    try:
+        # Phase 1: Patch weight parameters to match packed shapes
+        # Use simple iteration over named_parameters
+        for name, param in model.named_parameters():
+            try:
+                if name in state_dict:
+                    checkpoint_tensor = state_dict[name]
+                    
+                    # Check if shapes don't match (packed vs unpacked)
+                    if checkpoint_tensor.shape != param.shape:
+                        # Create new parameter with packed shape and uint8 dtype
+                        new_param = torch.nn.Parameter(
+                            torch.empty(checkpoint_tensor.shape, 
+                                       dtype=torch.uint8, 
+                                       device=device),
+                            requires_grad=False
+                        )
+                        
+                        # Replace the parameter using safe setattr
+                        if _safe_setattr(model, name, new_param):
+                            patched_params.append(
+                                f"{name} [{list(param.shape)}→{list(checkpoint_tensor.shape)}]"
+                            )
+                        else:
+                            errors.append(f"Failed to patch {name}")
+            except Exception as e:
+                errors.append(f"Error patching {name}: {str(e)}")
+                continue
+        
+        # Phase 2: Register _scale_inv parameters for Blackwell MX scaling
+        for key in state_dict.keys():
+            try:
+                if key.endswith('_scale_inv'):
+                    # Extract parent parameter name (remove _scale_inv suffix)
+                    parent_name = key.replace('_scale_inv', '')
+                    
+                    # Check if parent weight exists in model
+                    param_names = [n for n, _ in model.named_parameters()]
+                    if parent_name in param_names or any(p.startswith(parent_name) for p in param_names):
+                        scale_tensor = state_dict[key]
+                        
+                        # Create FP8 parameter for scale_inv
+                        # Use safe dtype check
+                        try:
+                            scale_dtype = torch.float8_e4m3fn
+                        except AttributeError:
+                            # Fallback if float8_e4m3fn not available
+                            scale_dtype = torch.float32
+                            if debug:
+                                debug.log(f"[NVFP4] Warning: float8_e4m3fn not available, using float32 for scales")
+                        
+                        scale_param = torch.nn.Parameter(
+                            torch.empty(scale_tensor.shape,
+                                       dtype=scale_dtype,
+                                       device=device),
+                            requires_grad=False
+                        )
+                        
+                        # Register the scale_inv parameter
+                        if _safe_setattr(model, key, scale_param):
+                            patched_params.append(f"{key} [NEW FP8 scale]")
+                        else:
+                            errors.append(f"Failed to register {key}")
+            except Exception as e:
+                errors.append(f"Error registering scale {key}: {str(e)}")
+                continue
+        
+        # Report any errors
+        if errors and debug:
+            debug.log(f"[NVFP4] Encountered {len(errors)} errors during patching:", category="warning")
+            for error in errors[:3]:  # Show first 3
+                debug.log(f"[NVFP4]   {error}", category="warning")
+        
+        # Return success if we patched anything
+        success = len(patched_params) > 0 and len(errors) == 0
+        return success, patched_params
+        
+    except Exception as e:
+        # Catch-all for unexpected errors
+        if debug:
+            debug.log(f"[NVFP4] Critical error during patching: {str(e)}", category="error")
+        return False, []
 
 
 def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor], 
@@ -1217,69 +1255,126 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
         Model with weights loaded
     """
     
-    # Detect if this is Nemotron NVFP4 format (packed uint8 + scale_inv)
-    is_nemotron_nvfp4 = _detect_nemotron_nvfp4(state)
-    
-    # NATIVE NVFP4 PATH: force_nvfp4=True + Nemotron format
-    if force_nvfp4 and is_nemotron_nvfp4:
-        if debug:
-            debug.log("[NVFP4] ✅ Detected Nemotron NVFP4 format (packed uint8 + scale_inv)", 
-                     category="nvfp4")
-            debug.log("[NVFP4] force_nvfp4=True: Activating Native Blackwell execution path", 
-                     category="nvfp4")
-            debug.log("[NVFP4] Patching model architecture for packed NVFP4...", 
-                     category="nvfp4")
-        
-        # Get target device
-        target_device = next(model.parameters()).device if not used_meta else torch.device('cuda')
-        
-        # Dynamically patch model to match packed shapes
-        patched = _patch_model_for_nemotron_nvfp4(model, state, target_device, debug)
-        
-        if patched and debug:
-            debug.log(f"[NVFP4] ✅ Patched {len(patched)} parameters for packed NVFP4:", 
-                     category="nvfp4")
-            # Show first 5 patched parameters
-            for param_info in patched[:5]:
-                debug.log(f"[NVFP4]   {param_info}", category="nvfp4")
-            if len(patched) > 5:
-                debug.log(f"[NVFP4]   ... and {len(patched) - 5} more", category="nvfp4")
-        
-        # Load with strict=False to allow new scale_inv parameters
-        if debug:
-            debug.log("[NVFP4] Loading state_dict with strict=False (allows scale_inv parameters)", 
-                     category="nvfp4")
-        
-        debug.start_timer(f"{model_type_lower}_state_apply")
-        missing, unexpected = model.load_state_dict(state, strict=False)
-        debug.end_timer(f"{model_type_lower}_state_apply", f"{model_type} weights loaded")
-        
-        if debug:
-            # Log loading results
-            if missing:
-                debug.log(f"[NVFP4] Missing keys (expected for patched model): {len(missing)}", 
-                         category="nvfp4")
-            if unexpected:
-                unexpected_shown = unexpected[:3]
-                debug.log(f"[NVFP4] Unexpected keys: {unexpected_shown}", category="nvfp4")
-                if len(unexpected) > 3:
-                    debug.log(f"[NVFP4]   ... and {len(unexpected) - 3} more", category="nvfp4")
+    # NATIVE NVFP4 PATH: force_nvfp4=True
+    if force_nvfp4:
+        try:
+            # Detect if this is Nemotron NVFP4 format (packed uint8 + scale_inv)
+            is_nemotron_nvfp4 = _detect_nemotron_nvfp4(state)
             
-            debug.log("[NVFP4] ✅ Native NVFP4 model loaded successfully", category="success")
-            debug.log("[NVFP4] Ready for hardware-native execution on Blackwell GPU", category="nvfp4")
-            debug.log("[NVFP4] Weights remain as uint8 (no dequantization)", category="nvfp4")
-        
-        return model
-    
-    # FALLBACK: force_nvfp4=True but not Nemotron format
-    elif force_nvfp4 and not is_nemotron_nvfp4:
-        if debug:
-            debug.log("[NVFP4] ⚠️ force_nvfp4=True but file is not Nemotron NVFP4 format", 
-                     category="warning")
-            debug.log("[NVFP4] Falling back to standard loading", category="nvfp4")
+            if is_nemotron_nvfp4:
+                if debug:
+                    debug.log("[NVFP4] ✅ Detected Nemotron NVFP4 format (packed uint8 + scale_inv)", 
+                             category="nvfp4")
+                    debug.log("[NVFP4] force_nvfp4=True: Activating Native Blackwell execution path", 
+                             category="nvfp4")
+                    debug.log("[NVFP4] Patching model architecture for packed NVFP4...", 
+                             category="nvfp4")
+                
+                # Get target device safely
+                try:
+                    target_device = next(model.parameters()).device if not used_meta else torch.device('cuda')
+                except Exception:
+                    target_device = torch.device('cuda')  # Safe fallback
+                
+                # Dynamically patch model to match packed shapes (with error handling)
+                success, patched = _patch_model_for_nemotron_nvfp4(model, state, target_device, debug)
+                
+                if success and patched and debug:
+                    debug.log(f"[NVFP4] ✅ Patched {len(patched)} parameters for packed NVFP4:", 
+                             category="nvfp4")
+                    # Show first 5 patched parameters
+                    for param_info in patched[:5]:
+                        debug.log(f"[NVFP4]   {param_info}", category="nvfp4")
+                    if len(patched) > 5:
+                        debug.log(f"[NVFP4]   ... and {len(patched) - 5} more", category="nvfp4")
+                elif not success:
+                    if debug:
+                        debug.log("[NVFP4] ⚠️ Patching failed, falling back to standard loading", 
+                                 category="warning")
+                    # Fall through to standard path
+                    force_nvfp4 = False
+                
+                # Only proceed with NVFP4 loading if patching succeeded
+                if success and patched:
+                    # Load with strict=False to allow new scale_inv parameters
+                    if debug:
+                        debug.log("[NVFP4] Loading state_dict with strict=False (allows scale_inv parameters)", 
+                                 category="nvfp4")
+                    
+                    try:
+                        debug.start_timer(f"{model_type_lower}_state_apply")
+                        missing, unexpected = model.load_state_dict(state, strict=False)
+                        debug.end_timer(f"{model_type_lower}_state_apply", f"{model_type} weights loaded")
+                        
+                        if debug:
+                            # Log loading results
+                            if missing:
+                                debug.log(f"[NVFP4] Missing keys: {len(missing)}", category="nvfp4")
+                            if unexpected:
+                                unexpected_shown = unexpected[:3]
+                                debug.log(f"[NVFP4] Unexpected keys: {unexpected_shown}", category="nvfp4")
+                                if len(unexpected) > 3:
+                                    debug.log(f"[NVFP4]   ... and {len(unexpected) - 3} more", category="nvfp4")
+                            
+                            debug.log("[NVFP4] ✅ Native NVFP4 model loaded successfully", category="success")
+                            debug.log("[NVFP4] Ready for hardware-native execution on Blackwell GPU", category="nvfp4")
+                            debug.log("[NVFP4] Weights remain as uint8 (no dequantization)", category="nvfp4")
+                        
+                        return model
+                    except Exception as e:
+                        if debug:
+                            debug.log(f"[NVFP4] ⚠️ Error during load_state_dict: {str(e)}", category="error")
+                            debug.log("[NVFP4] Falling back to standard loading", category="warning")
+                        # Fall through to standard path
+                        force_nvfp4 = False
+            else:
+                # Not Nemotron format
+                if debug:
+                    debug.log("[NVFP4] ⚠️ force_nvfp4=True but file is not Nemotron NVFP4 format", 
+                             category="warning")
+                    debug.log("[NVFP4] Falling back to standard loading", category="nvfp4")
+                force_nvfp4 = False
+                
+        except Exception as e:
+            # Catch-all for any errors in NVFP4 path
+            if debug:
+                debug.log(f"[NVFP4] ⚠️ Critical error in NVFP4 path: {str(e)}", category="error")
+                debug.log("[NVFP4] Falling back to standard loading", category="warning")
+            force_nvfp4 = False
     
     # STANDARD PATH: Check if state contains NVFP4Tensor objects (original format)
-    has_nvfp4 = any(
+    if not force_nvfp4:
+        has_nvfp4 = any(
+            hasattr(v, '__class__') and v.__class__.__name__ == 'NVFP4Tensor'
+            for v in state.values()
+        )
+        
+        if has_nvfp4:
+            # Unwrap NVFP4 tensors to target device/dtype
+            try:
+                from ..models.nvfp4 import unwrap_nvfp4_parameters
+                
+                target_device = next(model.parameters()).device if not used_meta else torch.device('cuda')
+                target_dtype = next(model.parameters()).dtype if not used_meta else torch.float32
+                
+                if debug:
+                    debug.log(f"Dequantizing NVFP4 tensors to {target_dtype} on {target_device}", 
+                             category=model_type_lower, indent_level=1)
+                
+                debug.start_timer(f"{model_type_lower}_nvfp4_dequant")
+                state = unwrap_nvfp4_parameters(state, target_device, target_dtype)
+                debug.end_timer(f"{model_type_lower}_nvfp4_dequant", "NVFP4 dequantization completed")
+            except Exception as e:
+                if debug:
+                    debug.log(f"Warning: Failed to unwrap NVFP4 tensors: {e}", 
+                             category=model_type_lower, level="WARNING")
+        
+        # Standard loading with assignment
+        debug.start_timer(f"{model_type_lower}_state_apply")
+        model.load_state_dict(state, strict=False, assign=True)
+        debug.end_timer(f"{model_type_lower}_state_apply", f"{model_type} weights loaded")
+    
+    return model
         hasattr(v, '__class__') and v.__class__.__name__ == 'NVFP4Tensor'
         for v in state.values()
     )
