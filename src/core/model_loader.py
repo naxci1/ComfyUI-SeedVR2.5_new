@@ -970,6 +970,8 @@ def _create_dequantize_method(tensor: torch.Tensor, debug: Optional['Debug'] = N
                 debug.log(f"Warning: Could not dequantize tensor: {e}", level="WARNING", category="dit", force=True)
             return tensor.to(device or tensor.device, dtype)
     
+    return dequantize
+
 
 def _validate_no_meta_tensors(model: torch.nn.Module, model_type: str, debug: Optional['Debug'] = None) -> None:
     """
@@ -1011,4 +1013,3 @@ def _validate_no_meta_tensors(model: torch.nn.Module, model_type: str, debug: Op
     
     if debug:
         debug.log(f"{model_type} materialization validated - no meta tensors found", category="success")
-    return dequantize
