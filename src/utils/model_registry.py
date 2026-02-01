@@ -49,9 +49,23 @@ MODEL_REGISTRY = {
     "seedvr2_ema_7b_sharp_fp8_e4m3fn_mixed_block35_fp16.safetensors": ModelInfo(repo="AInVFX/SeedVR2_comfyUI", size="7B", precision="fp8_e4m3fn_mixed_block35_fp16", variant="sharp", sha256="0d2c5b8be0fda94351149c5115da26aef4f4932a7a2a928c6f184dda9186e0be"),
     "seedvr2_ema_7b_sharp_fp16.safetensors": ModelInfo(size="7B", precision="fp16", variant="sharp", sha256="20a93e01ff24beaeebc5de4e4e5be924359606c356c9c51509fba245bd2d77dd"),
     
+    # EXPERIMENTAL: Blackwell-optimized models (format uncertain)
+    # NOTE: Model name suggests NVFP4 but likely FP8 or other format
+    # Verify format before use - check dtype and shapes after download
+    # May work as standard FP8 on RTX 40/50 series GPUs
+    "seedvr2_nvfp4_blackwell.safetensors": ModelInfo(
+        repo="Nexus24/vaeGGUF",
+        size="3B",
+        precision="FP8_OR_NVFP4",  # Uncertain - likely FP8
+        variant="blackwell_optimized",
+        sha256=None,  # Auto-calculate on download
+        min_compute_capability=8.9,  # Ada Lovelace/Hopper/Blackwell
+        category="dit"
+    ),
+    
     # NVFP4 models (RTX 50 series ONLY - Blackwell architecture)
-    # NOTE: NVFP4 model support is currently placeholder/future work
-    # The model file does not exist yet on HuggingFace
+    # NOTE: True NVFP4 model support is currently placeholder/future work
+    # The following model file does not exist yet on HuggingFace
     # Commented out until actual NVFP4 model is available
     # "seedvr2_3b_blackwell_nvfp4_extreme_full.safetensors": ModelInfo(
     #     repo="Nexus24/vaeGGUF",
