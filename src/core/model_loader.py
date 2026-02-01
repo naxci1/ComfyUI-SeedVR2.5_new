@@ -1593,6 +1593,25 @@ def _load_standard_weights_impl(model: torch.nn.Module, state: Dict[str, Any],
         debug.start_timer(f"{model_type_lower}_state_apply")
         model.load_state_dict(state, strict=False, assign=True)
         debug.end_timer(f"{model_type_lower}_state_apply", f"{model_type} weights loaded")
+        
+        # Verify no meta tensors remain after loading
+        if used_meta:
+            meta_tensors = []
+            for name, param in model.named_parameters():
+                if param.device.type == 'meta':
+                    meta_tensors.append(name)
+            
+            if meta_tensors:
+                if debug:
+                    debug.log(f"⚠️ Found {len(meta_tensors)} parameters still on meta device after loading",
+                             category="warning", indent_level=1)
+                    debug.log(f"Force-moving remaining meta tensors to {target_device}",
+                             category="general", indent_level=1)
+                # Force move any remaining meta tensors
+                model = model.to(target_device)
+            elif debug:
+                debug.log(f"✅ {model_type} materialization validated - no meta tensors found",
+                         category="success", indent_level=1)
     
     return model
 
