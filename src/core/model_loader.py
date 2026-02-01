@@ -51,7 +51,7 @@ This module is used by model_configuration for weight loading during materializa
 import os
 import torch
 from omegaconf import OmegaConf
-from typing import Dict, Any, Optional, Tuple, Union, Callable
+from typing import Dict, Any, Optional, Tuple, Union, Callable, List
 
 # Import SafeTensors with fallback
 try:
