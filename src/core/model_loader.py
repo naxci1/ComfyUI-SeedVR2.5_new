@@ -980,7 +980,7 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
     if checkpoint_path.endswith('.gguf'):
         model = _load_gguf_weights(model, state, used_meta, model_type_lower, debug)
     else:
-        model = _load_standard_weights(model, state, used_meta, model_type, model_type_lower, debug, force_nvfp4)
+        model = _load_standard_weights(model, state, used_meta, model_type, model_type_lower, debug, force_nvfp4, target_device)
     
     # Clean up state dict
     del state
@@ -1377,7 +1377,8 @@ def _patch_model_for_nemotron_nvfp4(model: torch.nn.Module,
 
 def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor], 
                           used_meta: bool, model_type: str, model_type_lower: str,
-                          debug: Optional['Debug'] = None, force_nvfp4: bool = False) -> torch.nn.Module:
+                          debug: Optional['Debug'] = None, force_nvfp4: bool = False,
+                          target_device: Optional[torch.device] = None) -> torch.nn.Module:
     """
     Load standard (non-GGUF) weights into model, with Native NVFP4 support.
     
@@ -1396,6 +1397,7 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
         model_type_lower: Lowercase model type for logging
         debug: Debug instance
         force_nvfp4: Whether to force Native NVFP4 execution path
+        target_device: Target device for model (needed for meta device transfer)
     
     Returns:
         Model with weights loaded
@@ -1550,6 +1552,16 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
         if debug and (reshaped_count > 0 or dtype_fixed_count > 0):
             debug.log(f"✅ Prepared checkpoint: {reshaped_count} reshaped, {dtype_fixed_count} dtype-fixed", 
                      category=model_type_lower)
+        
+        # If model is on meta device, move to target device using to_empty()
+        if used_meta:
+            param_device = next(model.parameters()).device
+            if param_device.type == 'meta':
+                if debug:
+                    debug.log(f"Moving model from meta device to {target_device} using to_empty()", 
+                             category=model_type_lower, indent_level=1)
+                # Use to_empty() for meta device to allocate memory without copying
+                model = model.to_empty(device=target_device)
         
         # Standard loading with assignment
         debug.start_timer(f"{model_type_lower}_state_apply")
