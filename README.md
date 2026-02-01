@@ -307,49 +307,40 @@ We're actively working on improvements and new features. To stay informed:
 ### Model Support
 - **Multiple Model Variants**: 3B and 7B parameter models with different precision options
 - **FP16, FP8, and GGUF Quantization**: Choose between full precision (FP16), mixed precision (FP8), or heavily quantized GGUF models for different VRAM requirements
-- **🚀 NVFP4 Support (RTX 50 Series)**: Native 4-bit floating point quantization for NVIDIA Blackwell architecture GPUs (RTX 5070/5070 Ti/5080/5090) provides 2-2.5x speedup over FP8 with 60-70% less VRAM than FP16
+- **🚀 NVFP4 Support (Future)**: Infrastructure ready for NVIDIA Blackwell NVFP4 quantization (awaiting model files)
 - **Automatic Model Downloads**: Models are automatically downloaded from HuggingFace on first use
 
-### 🚀 NVFP4 Support (RTX 50 Series)
+### 🚀 NVFP4 Support (RTX 50 Series) - Future Work
+
+> **Note**: NVFP4 support is currently in development. The infrastructure is in place, but actual NVFP4 model files are not yet available.
 
 #### What is NVFP4?
 NVFP4 (4-bit floating point) is NVIDIA's advanced quantization format for Blackwell architecture GPUs, providing:
-- **2-2.5x faster inference** than FP8
-- **60-70% less VRAM** than FP16 (6GB vs 16GB on RTX 5070 Ti)
-- **3-4x larger batch sizes** for better temporal consistency
-- **<1% quality loss** compared to FP16 with proper quantization
+- **2-2.5x faster inference** than FP8 (projected)
+- **60-70% less VRAM** than FP16 (projected)
+- **3-4x larger batch sizes** for better temporal consistency (projected)
+- **<1% quality loss** compared to FP16 with proper quantization (projected)
 
 #### Supported GPUs
 - RTX 5090 (24GB)
 - RTX 5080 (16GB)
-- RTX 5070 Ti (16GB) ← **Recommended for optimal price/performance**
+- RTX 5070 Ti (16GB)
 - RTX 5070 (12GB)
 
-**Note**: NVFP4 models require Blackwell architecture (compute capability 9.0+). They will be automatically hidden from the model list on non-Blackwell GPUs.
+**Note**: NVFP4 models require Blackwell architecture (compute capability 9.0+). When available, they will be automatically hidden from the model list on non-Blackwell GPUs.
 
-#### Available Models
-- `seedvr2_3b_blackwell_nvfp4_extreme_full.safetensors` (3B params, NVFP4)
-  - Source: [Nexus24/vaeGGUF](https://huggingface.co/Nexus24/vaeGGUF/blob/main/seedvr2_3b_blackwell_nvfp4_extreme_full.safetensors)
+#### Status
+- ✅ Hardware detection implemented
+- ✅ Model loading infrastructure ready
+- ✅ Automatic filtering for non-Blackwell GPUs
+- ⏳ **Actual NVFP4 model files not yet available**
+- ⏳ Awaiting NVFP4 quantized model release
 
-#### Installation & Usage
-1. **Hardware Check**: Ensure you have an RTX 50 series GPU
-2. **Optional TensorRT** (for best performance):
-   ```bash
-   pip install tensorrt-llm>=0.14.0
-   ```
-3. **Select NVFP4 model** in the DiT Model Loader node - the model will appear in the list only if your GPU supports NVFP4
-
-#### Performance Comparison (RTX 5070 Ti)
-| Model | VRAM Usage | Batch Size | Speed | Quality |
-|-------|------------|------------|-------|---------|
-| FP16  | 16GB       | 5 frames   | 1x    | 100%    |
-| FP8   | 10GB       | 10 frames  | 1.4x  | 97%     |
-| **NVFP4** | **6GB** | **15-20 frames** | **2.2x** | **98%** |
-
-#### Fallback Behavior
-- **Without TensorRT**: Falls back to FP8 emulation (slower but still functional)
-- **Non-Blackwell GPU**: Clear error message with alternative model recommendations
-- **Hardware Detection**: Automatic detection displays NVFP4 support status on startup
+#### Alternative: Use GGUF Quantization
+For efficient 4-bit quantization on any GPU, use GGUF Q4_K_M models:
+- `seedvr2_ema_3b-Q4_K_M.gguf` - Works on any CUDA GPU
+- Similar memory savings to NVFP4
+- Available now from [cmeka/SeedVR2-GGUF](https://huggingface.co/cmeka/SeedVR2-GGUF)
 
 ### Memory Optimization
 - **BlockSwap Technology**: Dynamically swap transformer blocks between GPU and CPU memory to run large models on limited VRAM
