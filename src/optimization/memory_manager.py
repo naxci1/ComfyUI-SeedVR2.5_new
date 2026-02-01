@@ -923,8 +923,8 @@ def _standard_model_movement(model: torch.nn.Module, current_device: torch.devic
             debug.log(f"Model on meta device, using to_empty() to allocate on {target_device_str}", category="general")
         model = model.to_empty(device=target_device)
     else:
-        # Normal transfer
-        model.to(target_device)
+        # Normal transfer - MUST capture return value
+        model = model.to(target_device)
     
     model.zero_grad(set_to_none=True)
     

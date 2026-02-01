@@ -1403,6 +1403,32 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
         Model with weights loaded
     """
     
+    # Set default dtype to bfloat16 to save memory on Blackwell GPUs
+    if force_nvfp4 and torch.cuda.is_available():
+        original_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(torch.bfloat16)
+        if debug:
+            debug.log("Set default dtype to bfloat16 for memory optimization", 
+                     category=model_type_lower, indent_level=1)
+    else:
+        original_dtype = None
+    
+    try:
+        return _load_standard_weights_impl(model, state, used_meta, model_type, 
+                                          model_type_lower, debug, force_nvfp4, 
+                                          target_device)
+    finally:
+        # Restore original dtype
+        if original_dtype is not None:
+            torch.set_default_dtype(original_dtype)
+
+
+def _load_standard_weights_impl(model: torch.nn.Module, state: Dict[str, Any], 
+                           used_meta: bool, model_type: str, model_type_lower: str,
+                           debug: Optional['Debug'] = None, force_nvfp4: bool = False,
+                           target_device: Optional[torch.device] = None) -> torch.nn.Module:
+    """Internal implementation of _load_standard_weights."""
+    
     # NATIVE NVFP4 PATH: force_nvfp4=True
     if force_nvfp4:
         try:
