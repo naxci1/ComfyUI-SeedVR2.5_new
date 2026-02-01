@@ -149,6 +149,10 @@ def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch
         elif debug:
             debug.log("⚠️ force_nvfp4 enabled - bypassing GGUF detection", 
                      category="info", indent_level=1)
+        
+        # Check for NVFP4 format and wrap if detected
+        state = _detect_and_wrap_nvfp4(state, checkpoint_path, debug, force_nvfp4)
+        
     elif checkpoint_path.endswith('.gguf'):
         validate_gguf_availability(f"load {os.path.basename(checkpoint_path)}", debug)
         state = _load_gguf_state(
@@ -255,6 +259,106 @@ def _detect_gguf_in_safetensors(state_dict: Dict[str, torch.Tensor], checkpoint_
             f"Rename to {base_name}.gguf or use alternative models.\n"
             f"See error message above for details."
         )
+
+
+def _detect_and_wrap_nvfp4(state_dict: Dict[str, torch.Tensor], checkpoint_path: str,
+                           debug: Optional['Debug'] = None, force_nvfp4: bool = False) -> Dict[str, torch.Tensor]:
+    """
+    Detect if a safetensors file contains NVFP4 quantized data and wrap it appropriately.
+    
+    NVFP4 models use E2M1 4-bit floating point with two-level scaling:
+    - Micro-block: 16 values per FP8 scale
+    - Tensor-level: Global FP32 scale
+    
+    Expected keys in state_dict:
+    - 'layer.weight.nvfp4_data' → uint8 packed NVFP4 values
+    - 'layer.weight.fp8_scales' → FP8 micro-block scales
+    - 'layer.weight.fp32_scale' → FP32 tensor scale
+    - 'layer.weight.shape' → Original shape (optional)
+    
+    Args:
+        state_dict: Loaded state dictionary
+        checkpoint_path: Path to the file
+        debug: Debug instance for logging
+        force_nvfp4: If True, forces NVFP4 detection even without proper keys
+        
+    Returns:
+        State dict with NVFP4Tensor wrappers if NVFP4 format detected,
+        otherwise returns original state dict
+    """
+    # Import NVFP4 modules
+    try:
+        from ..models.nvfp4 import (
+            detect_nvfp4_format,
+            wrap_nvfp4_parameters,
+            validate_nvfp4_tensors,
+            is_native_nvfp4_available,
+        )
+    except ImportError:
+        if debug:
+            debug.log("⚠️ NVFP4 modules not available, skipping NVFP4 detection", 
+                     category="warning", indent_level=1)
+        return state_dict
+    
+    # Try to get metadata (safetensors files may have metadata)
+    metadata = {}
+    
+    # Detect NVFP4 format
+    is_nvfp4 = detect_nvfp4_format(state_dict, metadata)
+    
+    if force_nvfp4 and not is_nvfp4 and debug:
+        debug.log("⚠️ force_nvfp4 enabled but NVFP4 format not detected", 
+                 category="warning", indent_level=1)
+    
+    if not is_nvfp4:
+        return state_dict  # Not NVFP4, return as-is
+    
+    # NVFP4 format detected!
+    filename = os.path.basename(checkpoint_path)
+    
+    if debug:
+        debug.log(f"✅ NVFP4 format detected in {filename}", 
+                 category="info", indent_level=1)
+        
+        # Check for native acceleration
+        native_available = is_native_nvfp4_available()
+        if native_available:
+            debug.log("✅ Native NVFP4 acceleration available (TensorRT/ModelOpt)", 
+                     category="info", indent_level=2)
+        else:
+            debug.log("ℹ️ Using software NVFP4 implementation (pure PyTorch)", 
+                     category="info", indent_level=2)
+    
+    # Validate NVFP4 structure
+    valid, error = validate_nvfp4_tensors(state_dict)
+    if not valid:
+        error_msg = f"NVFP4 validation failed for {filename}: {error}"
+        if debug:
+            debug.log(f"⚠️ {error_msg}", category="warning", indent_level=1)
+        # Continue anyway - might still work
+    
+    # Wrap NVFP4 parameters
+    try:
+        wrapped_state = wrap_nvfp4_parameters(state_dict, block_size=16)
+        
+        # Count wrapped parameters
+        nvfp4_count = sum(1 for v in wrapped_state.values() 
+                         if hasattr(v, '__class__') and v.__class__.__name__ == 'NVFP4Tensor')
+        
+        if debug and nvfp4_count > 0:
+            debug.log(f"✅ Wrapped {nvfp4_count} NVFP4 parameters", 
+                     category="info", indent_level=2)
+            debug.log("ℹ️ Tensors will dequantize on demand (lazy evaluation)", 
+                     category="info", indent_level=2)
+        
+        return wrapped_state
+        
+    except Exception as e:
+        error_msg = f"Failed to wrap NVFP4 parameters: {str(e)}"
+        if debug:
+            debug.log(f"❌ {error_msg}", category="error", indent_level=1)
+        # Return original state dict as fallback
+        return state_dict
 
 
 
@@ -939,7 +1043,35 @@ def initialize_meta_buffers_impl(model: torch.nn.Module, target_device: torch.de
 def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor], 
                           used_meta: bool, model_type: str, model_type_lower: str,
                           debug: Optional['Debug'] = None) -> torch.nn.Module:
-    """Load standard (non-GGUF) weights into model."""
+    """Load standard (non-GGUF) weights into model, handling NVFP4 if present."""
+    
+    # Check if state contains NVFP4Tensor objects
+    has_nvfp4 = any(
+        hasattr(v, '__class__') and v.__class__.__name__ == 'NVFP4Tensor'
+        for v in state.values()
+    )
+    
+    if has_nvfp4:
+        # Unwrap NVFP4 tensors to target device/dtype
+        try:
+            from ..models.nvfp4 import unwrap_nvfp4_parameters
+            
+            target_device = next(model.parameters()).device if not used_meta else torch.device('cuda')
+            target_dtype = next(model.parameters()).dtype if not used_meta else torch.float32
+            
+            if debug:
+                debug.log(f"Dequantizing NVFP4 tensors to {target_dtype} on {target_device}", 
+                         category=model_type_lower, indent_level=1)
+            
+            debug.start_timer(f"{model_type_lower}_nvfp4_dequant")
+            state = unwrap_nvfp4_parameters(state, target_device, target_dtype)
+            debug.end_timer(f"{model_type_lower}_nvfp4_dequant", "NVFP4 dequantization")
+            
+        except ImportError:
+            if debug:
+                debug.log("⚠️ NVFP4 unwrap failed, attempting standard loading", 
+                         category="warning", indent_level=1)
+    
     debug.start_timer(f"{model_type_lower}_state_apply")
     model.load_state_dict(state, strict=False, assign=True)
     
