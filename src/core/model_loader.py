@@ -1375,44 +1375,6 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
         debug.end_timer(f"{model_type_lower}_state_apply", f"{model_type} weights loaded")
     
     return model
-        hasattr(v, '__class__') and v.__class__.__name__ == 'NVFP4Tensor'
-        for v in state.values()
-    )
-    
-    if has_nvfp4:
-        # Unwrap NVFP4 tensors to target device/dtype
-        try:
-            from ..models.nvfp4 import unwrap_nvfp4_parameters
-            
-            target_device = next(model.parameters()).device if not used_meta else torch.device('cuda')
-            target_dtype = next(model.parameters()).dtype if not used_meta else torch.float32
-            
-            if debug:
-                debug.log(f"Dequantizing NVFP4 tensors to {target_dtype} on {target_device}", 
-                         category=model_type_lower, indent_level=1)
-            
-            debug.start_timer(f"{model_type_lower}_nvfp4_dequant")
-            state = unwrap_nvfp4_parameters(state, target_device, target_dtype)
-            debug.end_timer(f"{model_type_lower}_nvfp4_dequant", "NVFP4 dequantization")
-            
-        except ImportError:
-            if debug:
-                debug.log("⚠️ NVFP4 unwrap failed, attempting standard loading", 
-                         category="warning", indent_level=1)
-    
-    # Standard loading
-    debug.start_timer(f"{model_type_lower}_state_apply")
-    model.load_state_dict(state, strict=False, assign=True)
-    
-    action = "materialized" if used_meta else "applied"
-    debug.end_timer(f"{model_type_lower}_state_apply", f"{model_type} weights {action}")
-    
-    if used_meta:
-        debug.log(f"{model_type} materialized directly from meta with loaded weights", category=model_type_lower)
-    else:
-        debug.log(f"{model_type} weights applied", category=model_type_lower)
-    
-    return model
 
 
 def _load_gguf_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor], 
