@@ -1,0 +1,39 @@
+name: NVFP4 smoke test (self-hosted)
+
+# This workflow is intended to run on a self-hosted runner that has:
+# - CUDA 13.1, appropriate NVIDIA driver
+# - TensorRT installed (if you plan to build/run engines)
+# - PyTorch 2.9.1+cu130 installed in the runner's Python environment or in a venv the job prepares
+#
+# Usage: Trigger workflow_dispatch from Actions UI once runner is online.
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: [self-hosted, nvfp4-runner]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Create helper venv
+        run: |
+          python -m venv ./venv
+          . ./venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt || pip install pyjwt requests torch
+
+      - name: Run Smoke Test
+        run: |
+          . ./venv/bin/activate
+          python tests/smoke_nvfp4.py --engine engines/nvfp4.plan --use-cuda
+        env:
+          # If needed, provide secrets here
+          # APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+          # APP_ID: ${{ secrets.APP_ID }}
+          # INSTALLATION_ID: ${{ secrets.INSTALLATION_ID }}
