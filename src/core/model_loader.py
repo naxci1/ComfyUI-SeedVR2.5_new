@@ -801,62 +801,64 @@ def prepare_model_structure(
             checkpoint_path, model_type, debug
         )
         
-        # HARD-CODED DIMENSIONS FROM configs_3b/main.yaml + CHECKPOINT BIAS EVIDENCE
-        # Auto-detection was causing incorrect heads=25600 and 47GB allocation
-        # Bias tensors prove: vid_in.proj.bias=[1280], emb_in.proj_out.bias=[7680]=6×1280
-        debug.log(f"Using CORRECT dimensions from configs_3b/main.yaml + bias evidence", category=model_type, force=True)
+        # DYNAMIC DETECTION: Detect 3B vs 7B from checkpoint
+        # NVFP4 3B: Hardcode specific values
+        # Standard models: Use detected values
         
-        model_config.vid_dim = 1280  # PROVEN by vid_in.proj.bias=[1280] in checkpoint
-        model_config.txt_dim = 1280  # Matched to vid_dim
-        model_config.emb_dim = 7680  # 6 × 1280 (From checkpoint bias=[7680])
-        model_config.num_layers = 32  # From configs_3b/main.yaml
-        model_config.heads = 20  # From configs_3b/main.yaml
-        model_config.head_dim = 64  # CRITICAL: 20 × 64 = 1280
-        model_config.mlp_hidden_dim = 6912  # PROVEN: 8,847,360 / 1280 = 6912 (SwiGLU MLP)
+        is_nvfp4_3b = force_nvfp4 and "nvfp4" in str(checkpoint_path).lower()
         
-        debug.log(f"vid_dim: {model_config.vid_dim} (bias=[1280])", category=model_type, force=True)
-        debug.log(f"txt_dim: {model_config.txt_dim} (matched to vid_dim)", category=model_type, force=True)
-        debug.log(f"emb_dim: {model_config.emb_dim} (6×1280, from checkpoint bias=[7680])", category=model_type, force=True)
-        debug.log(f"heads: {model_config.heads}, head_dim: {model_config.head_dim}", category=model_type, force=True)
-        debug.log(f"mlp_hidden_dim: {model_config.mlp_hidden_dim} (calculated: 8,847,360/1280=6912)", category=model_type, force=True)
-        
-        # VALIDATION: For NVFP4 3B, emb_dim = 6 × vid_dim
-        expected_emb_dim = 6 * model_config.vid_dim
-        if model_config.emb_dim != expected_emb_dim:
-            debug.log(
-                f"WARNING: emb_dim ({model_config.emb_dim}) != 6 × vid_dim ({expected_emb_dim})\n"
-                f"This may cause size mismatches during model loading.",
-                category="warning", force=True
-            )
+        if is_nvfp4_3b:
+            # NVFP4 3B MODEL: Hardcoded dimensions
+            debug.log(f"Detected NVFP4 3B model - using hardcoded dimensions", category=model_type, force=True)
+            model_config.vid_dim = 1280
+            model_config.txt_dim = 1280
+            model_config.emb_dim = 7680  # 6 × 1280
+            model_config.num_layers = 32
+            model_config.heads = 20
+            model_config.head_dim = 64
+            model_config.mlp_hidden_dim = 6912
+            debug.log(f"NVFP4 3B: vid_dim={model_config.vid_dim}, emb_dim={model_config.emb_dim}, mlp_hidden_dim={model_config.mlp_hidden_dim}", 
+                     category=model_type, force=True)
         else:
-            debug.log(f"✅ Validation passed: emb_dim ({model_config.emb_dim}) = 6 × vid_dim ({model_config.vid_dim})", category=model_type, force=True)
-        
-        # Validate txt_dim matches vid_dim
-        if model_config.txt_dim == model_config.vid_dim:
-            debug.log(f"✅ Validation passed: txt_dim ({model_config.txt_dim}) = vid_dim ({model_config.vid_dim})", category=model_type, force=True)
-        else:
-            debug.log(f"WARNING: txt_dim ({model_config.txt_dim}) != vid_dim ({model_config.vid_dim})", category="warning", force=True)
-        
-        # OLD AUTO-DETECTION CODE - DISABLED TO PREVENT heads=25600 ERROR
-        # Update config with detected parameters
-        # if detected_params:
-        #     for param_name, param_value in detected_params.items():
-        #         if hasattr(model_config, param_name):
-        #             current_value = getattr(model_config, param_name)
-        #             if current_value != param_value:
-        #                 setattr(model_config, param_name, param_value)
+            # STANDARD MODELS (GGUF/FP16): Use detection
+            debug.log(f"Standard model - using dynamic detection", category=model_type, force=True)
+            
+            if detected_params:
+                # Use detected vid_dim to determine 3B vs 7B
+                detected_vid_dim = detected_params.get('vid_dim', 1280)
+                debug.log(f"Detected vid_dim: {detected_vid_dim}", category=model_type, force=True)
+                
+                # Apply detected parameters
+                for param_name, param_value in detected_params.items():
+                    if hasattr(model_config, param_name):
+                        setattr(model_config, param_name, param_value)
+                        debug.log(f"Set {param_name} = {param_value}", category=model_type, force=True)
+                
+                # Determine model size
+                if detected_vid_dim == 2560:
+                    debug.log(f"Detected 7B model (vid_dim=2560)", category=model_type, force=True)
+                elif detected_vid_dim == 1280:
+                    debug.log(f"Detected 3B model (vid_dim=1280)", category=model_type, force=True)
+            else:
+                # Fallback to config defaults
+                debug.log(f"No detection - using config defaults", category=model_type, force=True)
     
     # Always create on meta device for zero memory usage
     debug.log(f"Creating {model_type_upper} model structure on meta device", 
              category=model_type, force=True)
     debug.start_timer(f"{model_type}_structure")
     
-    # CONDITIONAL IMPORT: Use dit_nvfp4 for NVFP4 models, dit_3b for standard models
-    if is_dit and force_nvfp4:
+    # CONDITIONAL IMPORT: Use dit_nvfp4 ONLY for NVFP4 models
+    if is_dit and force_nvfp4 and "nvfp4" in str(checkpoint_path).lower():
         # Modify config path to use dit_nvfp4 instead of dit_3b
-        if hasattr(model_config, '__object__') and model_config.__object__.path == "dit_3b.nadit":
-            model_config.__object__.path = "dit_nvfp4.nadit"
-            debug.log("Using dit_nvfp4 model for NVFP4 checkpoint", category=model_type, force=True)
+        if hasattr(model_config, '__object__'):
+            original_path = model_config.__object__.path
+            if "dit_3b" in original_path or "dit_7b" in original_path:
+                model_config.__object__.path = "dit_nvfp4.nadit"
+                debug.log(f"Switched from {original_path} to dit_nvfp4.nadit for NVFP4 checkpoint", category=model_type, force=True)
+    elif is_dit:
+        # Ensure we're using standard models for non-NVFP4
+        debug.log(f"Using standard model architecture (dit_3b or dit_7b)", category=model_type, force=True)
     
     with torch.device("meta"):
         model = create_object(model_config)
