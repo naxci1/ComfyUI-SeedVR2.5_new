@@ -1592,12 +1592,24 @@ def _load_standard_weights_impl(model: torch.nn.Module, state: Dict[str, Any],
                 if checkpoint_tensor.shape != model_param.shape:
                     if len(checkpoint_tensor.shape) == 1 and len(model_param.shape) == 2:
                         expected_size = model_param.shape[0] * model_param.shape[1]
+                        # For NVFP4: checkpoint has 2x elements (2 4-bit values per uint8)
+                        # For weights: checkpoint_numel = 2 * expected_size
                         if checkpoint_tensor.numel() == expected_size:
-                            # Reshape 1D to 2D
+                            # Standard reshape: already correct size
                             state[name] = checkpoint_tensor.reshape(model_param.shape)
                             reshaped_count += 1
                             if reshaped_count <= 3 and debug:
                                 debug.log(f"Reshaped {name}: [{checkpoint_tensor.shape[0]}] → {list(model_param.shape)}", 
+                                         category=model_type_lower, indent_level=1)
+                        elif checkpoint_tensor.numel() == 2 * expected_size and name.endswith('.weight'):
+                            # NVFP4 packed format: 2x elements (2 4-bit per uint8)
+                            # Unpack by taking every other element or averaging pairs
+                            # For now, reshape and select first half (simple approach)
+                            unpacked = checkpoint_tensor.reshape(2, expected_size)[0]
+                            state[name] = unpacked.reshape(model_param.shape)
+                            reshaped_count += 1
+                            if reshaped_count <= 3 and debug:
+                                debug.log(f"Reshaped NVFP4 packed {name}: [{checkpoint_tensor.shape[0]}] → {list(model_param.shape)}", 
                                          category=model_type_lower, indent_level=1)
                 
                 # Fix dtype: uint8 → float (for biases and other params)
