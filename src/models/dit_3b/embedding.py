@@ -32,9 +32,8 @@ class TimeEmbedding(nn.Module):
         super().__init__()
         # SURGICAL FIX FOR NVFP4: Checkpoint emb_in.proj_out.bias has [7680]
         # NOT [15360] - this proves emb_dim=7680 (6×1280) not 15360
-        # HARDCODE output_dim to 7680 for SEED-V2 3B NVFP4
-        if hidden_dim == 1280 and output_dim != 7680:
-            output_dim = 7680  # FORCED for NVFP4 checkpoint compatibility (6×1280)
+        # No hardcoding - use output_dim from config
+        # For NVFP4: output_dim=15360 (12×1280) from model_loader
         self.sinusoidal_dim = sinusoidal_dim
         self.proj_in = nn.Linear(sinusoidal_dim, hidden_dim)
         self.proj_hid = nn.Linear(hidden_dim, hidden_dim)
