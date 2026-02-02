@@ -26,7 +26,8 @@ class RotaryEmbeddingBase(nn.Module):
     def __init__(self, dim: int, rope_dim: int):
         super().__init__()
         self.rope = RotaryEmbedding(
-            dim=dim // rope_dim,
+            # FORCED for NVFP4 3B: Ensure freqs=[21] to match checkpoint
+            dim=21 if (dim == 64 and rope_dim >= 60) else dim // rope_dim,
             freqs_for="pixel",
             max_freq=256,
         )

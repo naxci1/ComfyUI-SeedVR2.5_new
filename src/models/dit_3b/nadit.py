@@ -81,10 +81,9 @@ class NaDiT(nn.Module):
         ada = get_ada_layer(ada)
         norm = get_norm_layer(norm)
         qk_norm = get_norm_layer(qk_norm)
-        # FORCED for NVFP4 3B model: rope_dim=3 for 3D RoPE (T, H, W axes)
-        # This gives 64//3=21 dimensions per axis, matching checkpoint freqs=[21]
+        # FORCED for NVFP4 3B model
         if head_dim == 64:
-            rope_dim = 3  # Number of axes for 3D RoPE
+            rope_dim = 64  # Use full head_dim to ensure proper freqs initialization
         else:
             rope_dim = rope_dim if rope_dim is not None else head_dim // 2
         if isinstance(block_type, str):
