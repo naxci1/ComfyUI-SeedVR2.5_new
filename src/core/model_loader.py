@@ -806,17 +806,17 @@ def prepare_model_structure(
         # Bias tensors prove: vid_in.proj.bias=[1280], emb_in.proj_out.bias=[7680]=6×1280
         debug.log(f"Using CORRECT dimensions from configs_3b/main.yaml + bias evidence", category=model_type, force=True)
         
-        model_config.vid_dim = 2560  # From size mismatch: 3,276,800 ÷ 1280 = 2560
-        model_config.txt_dim = 2560  # MUST equal vid_dim for AdaSingle assertion (emb_dim = 6×dim)
-        model_config.emb_dim = 15360  # 6 × 2560 (proven by 19,660,800 ÷ 1280 = 15360)
+        model_config.vid_dim = 1280  # PROVEN by vid_in.proj.bias=[1280] in checkpoint
+        model_config.txt_dim = 1280  # MUST equal vid_dim for AdaSingle assertion (emb_dim = 6×dim)
+        model_config.emb_dim = 7680  # 6 × 1280 (PROVEN by emb_in.proj_out.bias=[7680] in checkpoint)
         model_config.num_layers = 32  # From configs_3b/main.yaml
         model_config.heads = 20  # From configs_3b/main.yaml (NOT 25600!)
-        model_config.head_dim = 128  # 2560 ÷ 20 = 128
+        model_config.head_dim = 64  # 1280 ÷ 20 = 64 (PROVEN by norm_q.weight=[64] in checkpoint)
         
-        debug.log(f"vid_dim: {model_config.vid_dim} (from size mismatch: 3,276,800÷1280=2560)", category=model_type, force=True)
+        debug.log(f"vid_dim: {model_config.vid_dim} (PROVEN by bias=[1280] in checkpoint)", category=model_type, force=True)
         debug.log(f"num_layers: {model_config.num_layers} (from config)", category=model_type, force=True)
         debug.log(f"heads: {model_config.heads} (from config, NOT 25600!)", category=model_type, force=True)
-        debug.log(f"emb_dim: {model_config.emb_dim} (6×2560, proven by 19,660,800÷1280=15360)", category=model_type, force=True)
+        debug.log(f"emb_dim: {model_config.emb_dim} (6×1280, PROVEN by bias=[7680] in checkpoint)", category=model_type, force=True)
         
         # CRITICAL VALIDATION: Ensure emb_dim = 6 × vid_dim AND txt_dim = vid_dim for AdaSingle
         expected_emb_dim = 6 * model_config.vid_dim
