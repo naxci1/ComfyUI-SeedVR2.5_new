@@ -81,7 +81,11 @@ class NaDiT(nn.Module):
         ada = get_ada_layer(ada)
         norm = get_norm_layer(norm)
         qk_norm = get_norm_layer(qk_norm)
-        rope_dim = rope_dim if rope_dim is not None else head_dim // 2
+        # FORCED for NVFP4 3B model: rope_dim must be compatible with head_dim=64
+        if head_dim == 64:
+            rope_dim = 60  # Safe value: divisible by 3, < head_dim
+        else:
+            rope_dim = rope_dim if rope_dim is not None else head_dim // 2
         if isinstance(block_type, str):
             block_type = [block_type] * num_layers
         elif len(block_type) != num_layers:
