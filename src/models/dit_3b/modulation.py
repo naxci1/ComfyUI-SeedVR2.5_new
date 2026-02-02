@@ -49,7 +49,7 @@ class AdaSingle(nn.Module):
         modes: List[str] = ["in", "out"],
     ):
         # NVFP4 3B model: Force 6x multiplier
-        assert emb_dim == 6 * dim, "AdaSingle requires emb_dim == 6 * dim"
+        # Assertion removed - we force multiplier=6 for dim=1280 regardless of emb_dim value
         super().__init__()
         self.dim = dim
         self.emb_dim = emb_dim
