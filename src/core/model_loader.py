@@ -1458,11 +1458,21 @@ def _load_standard_weights_impl(model: torch.nn.Module, state: Dict[str, Any],
     """Internal implementation of _load_standard_weights."""
     
     # ============================================================================
-    # SYSTEM_OVERRIDE: NVFP4 AUTO-SCALING - ALWAYS RUNS FIRST
+    # STRICT VAE BYPASS - Phase 1 (VAE) uses ORIGINAL logic, NO SCALING
+    # Only DiT (Phase 2) should get NVFP4 scaling
+    # ============================================================================
+    if "vae" in model_type_lower or "vae" in str(getattr(model, "file_name", "")).lower():
+        if debug:
+            debug.log("[SYSTEM_OVERRIDE] Bypassing NVFP4 scaling for VAE - using original logic", category="info")
+        model.load_state_dict(state, strict=False)
+        return model
+    
+    # ============================================================================
+    # SYSTEM_OVERRIDE: NVFP4 AUTO-SCALING - DiT (Phase 2) ONLY
     # This MUST execute BEFORE anything else to fix black screen
     # ============================================================================
     if debug:
-        debug.log("[SYSTEM_OVERRIDE] 🚀 FORCING NVFP4 SCALING...", category="nvfp4")
+        debug.log("[SYSTEM_OVERRIDE] 🚀 FORCING NVFP4 SCALING FOR DiT...", category="nvfp4")
     
     scales_applied = 0
     weight_keys = [k for k in state.keys() if k.endswith('.weight')]
@@ -1472,7 +1482,8 @@ def _load_standard_weights_impl(model: torch.nn.Module, state: Dict[str, Any],
         debug.log(f"!!! [DEBUG] DIT KEYS (first 50): {list(state.keys())[:50]}", category="nvfp4")
     
     # Check multiple scale patterns (different NVFP4 formats use different conventions)
-    scale_patterns = ['_scale', '.scale', '.weight_scale', '.scale_inv']
+    # User's logs show '_scale_inv' (underscore), so that's first priority
+    scale_patterns = ['_scale_inv', '_scale', '.scale', '.weight_scale', '.scale_inv']
     
     for key in weight_keys:
         scale_found = False
