@@ -48,12 +48,16 @@ class AdaSingle(nn.Module):
         layers: List[str],
         modes: List[str] = ["in", "out"],
     ):
-        # Support both 6x (standard) and 12x (NVFP4) multipliers
-        assert emb_dim in [6 * dim, 12 * dim], "AdaSingle requires emb_dim == 6*dim or 12*dim (NVFP4)"
+        # NVFP4 3B model: Force 6x multiplier
+        assert emb_dim == 6 * dim, "AdaSingle requires emb_dim == 6 * dim"
         super().__init__()
         self.dim = dim
         self.emb_dim = emb_dim
-        self.multiplier = emb_dim // dim  # Will be 6 or 12
+        # FORCED for NVFP4: Always use 6x multiplier
+        if dim == 1280:
+            self.multiplier = 6  # FORCED for NVFP4 3B
+        else:
+            self.multiplier = emb_dim // dim
         self.layers = layers
         for l in layers:
             if "in" in modes:
@@ -75,10 +79,11 @@ class AdaSingle(nn.Module):
         hid_len: Optional[torch.LongTensor] = None,  # b
     ) -> torch.FloatTensor:
         idx = self.layers.index(layer)
-        # Support both 6x and 12x multipliers
-        # For 6x: g=3 (shift, scale, gate)
-        # For 12x: g=6 (doubled for NVFP4 packing)
-        g = self.multiplier // 2  # 3 for 6x, 6 for 12x
+        # FORCED for NVFP4: Always use g=3 (shift, scale, gate)
+        if self.dim == 1280:
+            g = 3  # FORCED for NVFP4 3B: 7680 / (2 * 3) = 1280
+        else:
+            g = self.multiplier // 2
         emb = rearrange(emb, "b (d l g) -> b d l g", l=len(self.layers), g=g)[..., idx, :]
         emb = expand_dims(emb, 1, hid.ndim + 1)
 
@@ -91,13 +96,8 @@ class AdaSingle(nn.Module):
                 ),
             )
 
-        # For 6x: unbind into 3 (shift, scale, gate)
-        # For 12x: unbind into 6, take first 3 (shift, scale, gate)
-        if g == 3:
-            shiftA, scaleA, gateA = emb.unbind(-1)
-        else:  # g == 6 for NVFP4
-            # Take first 3 chunks for shift, scale, gate (NVFP4 packing)
-            shiftA, scaleA, gateA = emb[..., 0], emb[..., 1], emb[..., 2]
+        # For NVFP4 3B: Always unbind into 3 (shift, scale, gate)
+        shiftA, scaleA, gateA = emb.unbind(-1)
         shiftB, scaleB, gateB = (
             getattr(self, f"{layer}_shift", None),
             getattr(self, f"{layer}_scale", None),
