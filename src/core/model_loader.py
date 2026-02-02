@@ -1467,9 +1467,28 @@ def _load_standard_weights_impl(model: torch.nn.Module, state: Dict[str, Any],
     scales_applied = 0
     weight_keys = [k for k in state.keys() if k.endswith('.weight')]
     
+    # DEBUG: Show first 50 DiT keys to understand scale naming
+    if debug:
+        debug.log(f"!!! [DEBUG] DIT KEYS (first 50): {list(state.keys())[:50]}", category="nvfp4")
+    
+    # Check multiple scale patterns (different NVFP4 formats use different conventions)
+    scale_patterns = ['_scale', '.scale', '.weight_scale', '.scale_inv']
+    
     for key in weight_keys:
-        scale_key = key + '_scale'
-        if scale_key in state:
+        scale_found = False
+        scale_key = None
+        scale_pattern_used = None
+        
+        # Try each pattern until we find a match
+        for pattern in scale_patterns:
+            test_key = key.replace('.weight', pattern)
+            if test_key in state:
+                scale_key = test_key
+                scale_pattern_used = pattern
+                scale_found = True
+                break
+        
+        if scale_found and scale_key:
             try:
                 weight = state[key]
                 scale = state[scale_key]
@@ -1492,10 +1511,10 @@ def _load_standard_weights_impl(model: torch.nn.Module, state: Dict[str, Any],
     
     if scales_applied > 0:
         if debug:
-            debug.log(f"[SYSTEM_OVERRIDE] ✅ Applied scaling to {scales_applied} weight tensors", category="success")
+            debug.log(f"[SYSTEM_OVERRIDE] ✅ Applied scaling to {scales_applied} weight tensors (pattern: {scale_pattern_used})", category="success")
     else:
         if debug:
-            debug.log("[SYSTEM_OVERRIDE] ℹ️ No _scale suffixes found in checkpoint", category="info")
+            debug.log(f"[SYSTEM_OVERRIDE] ℹ️ No scale keys found (checked patterns: {scale_patterns})", category="info")
     
     # ============================================================================
     # END SYSTEM_OVERRIDE
