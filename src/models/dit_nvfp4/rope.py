@@ -25,9 +25,10 @@ from ...common.cache import Cache
 class RotaryEmbeddingBase(nn.Module):
     def __init__(self, dim: int, rope_dim: int):
         super().__init__()
-        # HARDCODED NVFP4: Always use dim=21 for dim=64 and rope_dim>=60
+        # HARDCODED NVFP4: ALWAYS use dim=21 to match checkpoint freqs size
+        # The NVFP4 3B checkpoint has freqs of Size([21]), not calculated
         self.rope = RotaryEmbedding(
-            dim=21 if (dim == 64 and rope_dim >= 60) else dim // rope_dim,
+            dim=21,  # HARDCODED: checkpoint has Size([21]) freqs
             freqs_for="pixel",
             max_freq=256,
         )
