@@ -1,0 +1,5 @@
+# Minimal helper requirements (not full project deps)
+pyjwt
+requests
+torch
+# Add tensorrt if available in pip/whl for your platform, or install via vendor package

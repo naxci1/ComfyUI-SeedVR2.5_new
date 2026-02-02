@@ -307,7 +307,40 @@ We're actively working on improvements and new features. To stay informed:
 ### Model Support
 - **Multiple Model Variants**: 3B and 7B parameter models with different precision options
 - **FP16, FP8, and GGUF Quantization**: Choose between full precision (FP16), mixed precision (FP8), or heavily quantized GGUF models for different VRAM requirements
+- **🚀 NVFP4 Support (Future)**: Infrastructure ready for NVIDIA Blackwell NVFP4 quantization (awaiting model files)
 - **Automatic Model Downloads**: Models are automatically downloaded from HuggingFace on first use
+
+### 🚀 NVFP4 Support (RTX 50 Series) - Future Work
+
+> **Note**: NVFP4 support is currently in development. The infrastructure is in place, but actual NVFP4 model files are not yet available.
+
+#### What is NVFP4?
+NVFP4 (4-bit floating point) is NVIDIA's advanced quantization format for Blackwell architecture GPUs, providing:
+- **2-2.5x faster inference** than FP8 (projected)
+- **60-70% less VRAM** than FP16 (projected)
+- **3-4x larger batch sizes** for better temporal consistency (projected)
+- **<1% quality loss** compared to FP16 with proper quantization (projected)
+
+#### Supported GPUs
+- RTX 5090 (24GB)
+- RTX 5080 (16GB)
+- RTX 5070 Ti (16GB)
+- RTX 5070 (12GB)
+
+**Note**: NVFP4 models require Blackwell architecture (compute capability 9.0+). When available, they will be automatically hidden from the model list on non-Blackwell GPUs.
+
+#### Status
+- ✅ Hardware detection implemented
+- ✅ Model loading infrastructure ready
+- ✅ Automatic filtering for non-Blackwell GPUs
+- ⏳ **Actual NVFP4 model files not yet available**
+- ⏳ Awaiting NVFP4 quantized model release
+
+#### Alternative: Use GGUF Quantization
+For efficient 4-bit quantization on any GPU, use GGUF Q4_K_M models:
+- `seedvr2_ema_3b-Q4_K_M.gguf` - Works on any CUDA GPU
+- Similar memory savings to NVFP4
+- Available now from [cmeka/SeedVR2-GGUF](https://huggingface.co/cmeka/SeedVR2-GGUF)
 
 ### Memory Optimization
 - **BlockSwap Technology**: Dynamically swap transformer blocks between GPU and CPU memory to run large models on limited VRAM

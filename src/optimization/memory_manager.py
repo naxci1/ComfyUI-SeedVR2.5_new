@@ -907,8 +907,26 @@ def _standard_model_movement(model: torch.nn.Module, current_device: torch.devic
     if debug:
         debug.start_timer(timer_name)
     
-    # Move model and clear gradients
-    model.to(target_device)
+    # Move model - handle meta device properly
+    # Check if model has meta tensors
+    has_meta = False
+    try:
+        first_param = next(model.parameters())
+        if first_param.device.type == 'meta':
+            has_meta = True
+    except StopIteration:
+        pass  # No parameters
+    
+    # EXACT meta device check as specified
+    if hasattr(model, 'device') and str(model.device) == 'meta':
+        # Use to_empty() for meta device to allocate memory without copying
+        if debug:
+            debug.log(f"Model on meta device, using to_empty() to allocate on {target_device_str}", category="general")
+        model = model.to_empty(device=target_device)
+    else:
+        # Normal transfer - MUST capture return value
+        model = model.to(target_device)
+    
     model.zero_grad(set_to_none=True)
     
     # Clear VAE memory buffers when moving to CPU
