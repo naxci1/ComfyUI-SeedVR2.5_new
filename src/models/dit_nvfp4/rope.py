@@ -110,6 +110,9 @@ class NaMMRotaryEmbedding3d(MMRotaryEmbeddingBase):
             txt_freqs = txt_freqs.to(target_device)
         vid_q = rearrange(vid_q, "L h d -> h L d")
         vid_k = rearrange(vid_k, "L h d -> h L d")
+        # NVFP4 FIX: Clamp freqs to tensor dimensions (head_dim=64)
+        # Checkpoint has 21 freqs → 126 dims for 3D RoPE, but head_dim=64
+        vid_freqs = vid_freqs[..., :vid_q.shape[-1]]
         vid_q = apply_rotary_emb(vid_freqs, vid_q.float()).to(vid_q.dtype)
         vid_k = apply_rotary_emb(vid_freqs, vid_k.float()).to(vid_k.dtype)
         vid_q = rearrange(vid_q, "h L d -> L h d")
@@ -117,6 +120,8 @@ class NaMMRotaryEmbedding3d(MMRotaryEmbeddingBase):
 
         txt_q = rearrange(txt_q, "L h d -> h L d")
         txt_k = rearrange(txt_k, "L h d -> h L d")
+        # NVFP4 FIX: Clamp freqs to tensor dimensions (head_dim=64)
+        txt_freqs = txt_freqs[..., :txt_q.shape[-1]]
         txt_q = apply_rotary_emb(txt_freqs, txt_q.float()).to(txt_q.dtype)
         txt_k = apply_rotary_emb(txt_freqs, txt_k.float()).to(txt_k.dtype)
         txt_q = rearrange(txt_q, "h L d -> L h d")
