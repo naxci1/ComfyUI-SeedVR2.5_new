@@ -28,12 +28,14 @@ class TimeEmbedding(nn.Module):
         sinusoidal_dim: int,
         hidden_dim: int,
         output_dim: int,
+        force_nvfp4: bool = False,  # NEW: Accept force_nvfp4 parameter
     ):
         super().__init__()
-        # FORCED for NVFP4 3B: Checkpoint emb_in.proj_out.bias has [7680]
-        # This proves emb_dim=7680 (6×1280) NOT 15360
-        if hidden_dim == 1280:
+        # CONDITIONAL FIX FOR NVFP4: Only apply when force_nvfp4=True
+        # Checkpoint emb_in.proj_out.bias has [7680]: proves emb_dim=7680 (6×1280)
+        if force_nvfp4 and hidden_dim == 1280 and output_dim != 7680:
             output_dim = 7680  # FORCED for NVFP4 3B model
+        # else: Keep original output_dim for non-NVFP4 models (GGUF, FP16, etc.)
         self.sinusoidal_dim = sinusoidal_dim
         self.proj_in = nn.Linear(sinusoidal_dim, hidden_dim)
         self.proj_hid = nn.Linear(hidden_dim, hidden_dim)

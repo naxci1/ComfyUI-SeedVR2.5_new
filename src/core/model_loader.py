@@ -851,6 +851,10 @@ def prepare_model_structure(
              category=model_type, force=True)
     debug.start_timer(f"{model_type}_structure")
     
+    # Add force_nvfp4 to model config for conditional NVFP4 fixes
+    if is_dit and hasattr(model_config, '_config'):
+        model_config._config['force_nvfp4'] = force_nvfp4
+    
     with torch.device("meta"):
         model = create_object(model_config)
     

@@ -76,15 +76,19 @@ class NaDiT(nn.Module):
         txt_proj_type: Optional[str] = "linear",
         vid_out_norm: Optional[str] = None,
         attention_mode: str = 'sdpa',
+        force_nvfp4: bool = False,  # NEW: Accept force_nvfp4 parameter
         **kwargs,
     ):
         ada = get_ada_layer(ada)
         norm = get_norm_layer(norm)
         qk_norm = get_norm_layer(qk_norm)
-        # FORCED for NVFP4 3B model
-        if head_dim == 64:
-            rope_dim = 64  # Use full head_dim to ensure proper freqs initialization
+        # Store force_nvfp4 for conditional NVFP4 fixes
+        self.force_nvfp4 = force_nvfp4
+        # CONDITIONAL for NVFP4 3B model: Only apply when force_nvfp4 is enabled
+        if force_nvfp4 and head_dim == 64:
+            rope_dim = 64  # Use full head_dim for NVFP4 to ensure proper freqs initialization
         else:
+            # Standard calculation for non-NVFP4 models (GGUF, FP16, etc.)
             rope_dim = rope_dim if rope_dim is not None else head_dim // 2
         if isinstance(block_type, str):
             block_type = [block_type] * num_layers
@@ -124,6 +128,7 @@ class NaDiT(nn.Module):
             sinusoidal_dim=256,
             hidden_dim=max(vid_dim, txt_dim),
             output_dim=emb_dim,
+            force_nvfp4=force_nvfp4,  # Pass force_nvfp4 to TimeEmbedding
         )
 
         if window is None or isinstance(window[0], int):
@@ -162,6 +167,7 @@ class NaDiT(nn.Module):
                     rope_dim=rope_dim,
                     is_last_layer=(i == num_layers - 1),
                     attention_mode=attention_mode,
+                    force_nvfp4=force_nvfp4,  # Pass force_nvfp4 to blocks
                     **kwargs,
                 )
                 for i in range(num_layers)

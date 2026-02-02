@@ -49,14 +49,15 @@ class SwiGLUMLP(nn.Module):
         dim: int,
         expand_ratio: int,
         multiple_of: int = 256,
+        force_nvfp4: bool = False,  # NEW: Accept force_nvfp4 parameter
     ):
         super().__init__()
-        # SURGICAL FIX FOR NVFP4: Checkpoint has 8,847,360 params
-        # 8,847,360 / 1280 = 6912
-        # HARDCODE hidden_dim to 6912 for SEED-V2 3B NVFP4
-        if dim == 1280:
+        # CONDITIONAL FIX FOR NVFP4: Only apply when force_nvfp4=True
+        # Checkpoint has 8,847,360 params: 8,847,360 / 1280 = 6912
+        if force_nvfp4 and dim == 1280:
             hidden_dim = 6912  # FORCED for NVFP4 checkpoint compatibility
         else:
+            # Standard calculation for non-NVFP4 models (GGUF, FP16, etc.)
             hidden_dim = int(2 * dim * expand_ratio / 3)
             hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
         self.proj_in_gate = nn.Linear(dim, hidden_dim, bias=False)

@@ -48,6 +48,7 @@ class NaMMSRTransformerBlock(nn.Module):
         rope_dim: int,
         is_last_layer: bool,
         attention_mode: str = 'sdpa',
+        force_nvfp4: bool = False,  # NEW: Accept force_nvfp4 parameter
         **kwargs,
     ):
         super().__init__()
@@ -76,7 +77,8 @@ class NaMMSRTransformerBlock(nn.Module):
             dim=dim,
             expand_ratio=expand_ratio,
             shared_weights=shared_weights,
-            vid_only=is_last_layer
+            vid_only=is_last_layer,
+            force_nvfp4=force_nvfp4,  # Pass force_nvfp4 to MLP
         )
         self.ada = MMModule(ada, dim=dim, emb_dim=emb_dim, layers=["attn", "mlp"], shared_weights=shared_weights, vid_only=is_last_layer)
         self.is_last_layer = is_last_layer
