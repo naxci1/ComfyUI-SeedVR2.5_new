@@ -48,10 +48,12 @@ class AdaSingle(nn.Module):
         layers: List[str],
         modes: List[str] = ["in", "out"],
     ):
-        assert emb_dim == 6 * dim, "AdaSingle requires emb_dim == 6 * dim"
+        # Support both 6x (standard) and 12x (NVFP4) multipliers
+        assert emb_dim in [6 * dim, 12 * dim], "AdaSingle requires emb_dim == 6*dim or 12*dim (NVFP4)"
         super().__init__()
         self.dim = dim
         self.emb_dim = emb_dim
+        self.multiplier = emb_dim // dim  # Will be 6 or 12
         self.layers = layers
         for l in layers:
             if "in" in modes:
@@ -73,7 +75,11 @@ class AdaSingle(nn.Module):
         hid_len: Optional[torch.LongTensor] = None,  # b
     ) -> torch.FloatTensor:
         idx = self.layers.index(layer)
-        emb = rearrange(emb, "b (d l g) -> b d l g", l=len(self.layers), g=3)[..., idx, :]
+        # Support both 6x and 12x multipliers
+        # For 6x: g=3 (shift, scale, gate)
+        # For 12x: g=6 (doubled for NVFP4 packing)
+        g = self.multiplier // 2  # 3 for 6x, 6 for 12x
+        emb = rearrange(emb, "b (d l g) -> b d l g", l=len(self.layers), g=g)[..., idx, :]
         emb = expand_dims(emb, 1, hid.ndim + 1)
 
         if hid_len is not None:
@@ -85,7 +91,13 @@ class AdaSingle(nn.Module):
                 ),
             )
 
-        shiftA, scaleA, gateA = emb.unbind(-1)
+        # For 6x: unbind into 3 (shift, scale, gate)
+        # For 12x: unbind into 6, take first 3 (shift, scale, gate)
+        if g == 3:
+            shiftA, scaleA, gateA = emb.unbind(-1)
+        else:  # g == 6 for NVFP4
+            # Take first 3 chunks for shift, scale, gate (NVFP4 packing)
+            shiftA, scaleA, gateA = emb[..., 0], emb[..., 1], emb[..., 2]
         shiftB, scaleB, gateB = (
             getattr(self, f"{layer}_shift", None),
             getattr(self, f"{layer}_scale", None),
