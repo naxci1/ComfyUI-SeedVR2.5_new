@@ -1457,6 +1457,50 @@ def _load_standard_weights_impl(model: torch.nn.Module, state: Dict[str, Any],
                            target_device: Optional[torch.device] = None) -> torch.nn.Module:
     """Internal implementation of _load_standard_weights."""
     
+    # ============================================================================
+    # SYSTEM_OVERRIDE: NVFP4 AUTO-SCALING - ALWAYS RUNS FIRST
+    # This MUST execute BEFORE anything else to fix black screen
+    # ============================================================================
+    if debug:
+        debug.log("[SYSTEM_OVERRIDE] 🚀 FORCING NVFP4 SCALING...", category="nvfp4")
+    
+    scales_applied = 0
+    weight_keys = [k for k in state.keys() if k.endswith('.weight')]
+    
+    for key in weight_keys:
+        scale_key = key + '_scale'
+        if scale_key in state:
+            try:
+                weight = state[key]
+                scale = state[scale_key]
+                
+                # Move to GPU if available for faster computation
+                if torch.cuda.is_available():
+                    weight = weight.to("cuda")
+                    scale = scale.to("cuda")
+                
+                # CRITICAL: Apply scale multiplication (fixes black screen)
+                # Formula: final_weight = quantized_uint8.float() * scale
+                scaled_weight = weight.float() * scale
+                
+                # Store back in original dtype
+                state[key] = scaled_weight.to(weight.dtype)
+                scales_applied += 1
+            except Exception as e:
+                if debug:
+                    debug.log(f"[SYSTEM_OVERRIDE] ⚠️ Failed to apply scale to {key}: {e}", category="warning")
+    
+    if scales_applied > 0:
+        if debug:
+            debug.log(f"[SYSTEM_OVERRIDE] ✅ Applied scaling to {scales_applied} weight tensors", category="success")
+    else:
+        if debug:
+            debug.log("[SYSTEM_OVERRIDE] ℹ️ No _scale suffixes found in checkpoint", category="info")
+    
+    # ============================================================================
+    # END SYSTEM_OVERRIDE
+    # ============================================================================
+    
     # NATIVE NVFP4 PATH: force_nvfp4=True
     if force_nvfp4:
         # ENFORCE bfloat16 to prevent float32 upcasting and memory bloat
@@ -1467,39 +1511,6 @@ def _load_standard_weights_impl(model: torch.nn.Module, state: Dict[str, Any],
                      category="nvfp4")
         
         try:
-            # CRITICAL: NVFP4 AUTO-SCALING - Apply weight scales IMMEDIATELY
-            # This MUST run BEFORE any other processing to fix black screen
-            debug.log("[NVFP4] ⚡ Checking for weight scales...", category="nvfp4")
-            scales_applied = 0
-            weight_keys = [k for k in state.keys() if k.endswith('.weight')]
-            
-            for key in weight_keys:
-                scale_key = key + '_scale'
-                if scale_key in state:
-                    try:
-                        weight = state[key]
-                        scale = state[scale_key]
-                        
-                        # Move to GPU if available for faster computation
-                        if torch.cuda.is_available():
-                            weight = weight.to("cuda")
-                            scale = scale.to("cuda")
-                        
-                        # CRITICAL: Apply scale multiplication (fixes black screen)
-                        # Formula: final_weight = quantized_uint8.float() * scale
-                        scaled_weight = weight.float() * scale
-                        
-                        # Store back in original dtype
-                        state[key] = scaled_weight.to(weight.dtype)
-                        scales_applied += 1
-                    except Exception as e:
-                        debug.log(f"[NVFP4] ⚠️ Failed to apply scale to {key}: {e}", category="warning")
-            
-            if scales_applied > 0:
-                debug.log(f"[NVFP4] ✅ Applied scaling to {scales_applied} weight tensors", category="success")
-            else:
-                debug.log("[NVFP4] ℹ️ No _scale suffixes found in checkpoint", category="nvfp4")
-            
             # Detect if this is Nemotron NVFP4 format (packed uint8 + scale_inv)
             is_nemotron_nvfp4 = _detect_nemotron_nvfp4(state)
             
