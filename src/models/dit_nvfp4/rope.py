@@ -112,6 +112,7 @@ class NaMMRotaryEmbedding3d(MMRotaryEmbeddingBase):
         vid_k = rearrange(vid_k, "L h d -> h L d")
         # NVFP4 FIX: Clamp freqs to tensor dimensions (head_dim=64)
         # Checkpoint has 21 freqs → 126 dims for 3D RoPE, but head_dim=64
+        # VERIFIED FINAL PUSH - This clamping prevents dimension overflow
         vid_freqs = vid_freqs[..., :vid_q.shape[-1]]
         vid_q = apply_rotary_emb(vid_freqs, vid_q.float()).to(vid_q.dtype)
         vid_k = apply_rotary_emb(vid_freqs, vid_k.float()).to(vid_k.dtype)
