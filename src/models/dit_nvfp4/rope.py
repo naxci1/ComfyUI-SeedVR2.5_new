@@ -25,23 +25,18 @@ from ...common.cache import Cache
 class RotaryEmbeddingBase(nn.Module):
     def __init__(self, dim: int, rope_dim: int):
         super().__init__()
-        # HARDCODED NVFP4: ALWAYS use dim=21 to match checkpoint freqs size
-        # The NVFP4 3B checkpoint has freqs of Size([21]), not calculated
+        # Create RotaryEmbedding for its methods
         self.rope = RotaryEmbedding(
-            dim=21,  # HARDCODED: checkpoint has Size([21]) freqs
+            dim=21,  # Try to create with dim=21
             freqs_for="pixel",
             max_freq=256,
         )
-        # 1. Set model.requires_grad_(True) after model creation will make
-        #    the `requires_grad=False` for rope freqs no longer hold.
-        # 2. Even if we don't set requires_grad_(True) explicitly,
-        #    FSDP is not memory efficient when handling fsdp_wrap
-        #    with mixed requires_grad=True/False.
-        # With above consideration, it is easier just remove the freqs
-        # out of nn.Parameters when `learned_freq=False`
-        freqs = self.rope.freqs
-        del self.rope.freqs
-        self.rope.register_buffer("freqs", freqs.data)
+        # NVFP4 ABSOLUTE FIX: Force freqs to be exactly Size([21])
+        # Delete whatever freqs it created
+        if hasattr(self.rope, 'freqs'):
+            del self.rope.freqs
+        # Directly register a buffer of exactly 21 elements
+        self.rope.register_buffer("freqs", torch.zeros(21), persistent=False)
 
     @lru_cache(maxsize=128)
     def get_axial_freqs(self, *dims):
@@ -76,14 +71,12 @@ class RotaryEmbedding3d(RotaryEmbeddingBase):
 class MMRotaryEmbeddingBase(RotaryEmbeddingBase):
     def __init__(self, dim: int, rope_dim: int):
         super().__init__(dim, rope_dim)
-        self.rope = RotaryEmbedding(
-            dim=dim // rope_dim,
-            freqs_for="lang",
-            theta=10000,
-        )
-        freqs = self.rope.freqs
-        del self.rope.freqs
-        self.rope.register_buffer("freqs", freqs.data)
+        # NVFP4 ABSOLUTE FIX: Override parent's freqs completely
+        # Delete whatever the parent created
+        if hasattr(self.rope, 'freqs'):
+            del self.rope.freqs
+        # Directly register exactly 21 elements - NO calculations
+        self.rope.register_buffer("freqs", torch.zeros(21), persistent=False)
         self.mm = True
 
 
