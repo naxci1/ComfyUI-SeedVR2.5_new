@@ -812,6 +812,7 @@ def prepare_model_structure(
         model_config.num_layers = 32  # From configs_3b/main.yaml
         model_config.heads = 20  # From configs_3b/main.yaml (NOT 25600!)
         model_config.head_dim = 64  # 1280 ÷ 20 = 64 (PROVEN by norm_q.weight=[64] in checkpoint)
+        model_config.mlp_hidden_dim = 6912  # PROVEN by mlp weights: 8,847,360 / 1280 = 6912
         
         debug.log(f"vid_dim: {model_config.vid_dim} (PROVEN by bias=[1280] in checkpoint)", category=model_type, force=True)
         debug.log(f"num_layers: {model_config.num_layers} (from config)", category=model_type, force=True)
