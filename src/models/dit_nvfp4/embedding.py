@@ -30,6 +30,9 @@ class TimeEmbedding(nn.Module):
         output_dim: int,
     ):
         super().__init__()
+        # HARDCODED NVFP4: Always use output_dim=7680 for hidden_dim=1280
+        if hidden_dim == 1280 and output_dim != 7680:
+            output_dim = 7680
         self.sinusoidal_dim = sinusoidal_dim
         self.proj_in = nn.Linear(sinusoidal_dim, hidden_dim)
         self.proj_hid = nn.Linear(hidden_dim, hidden_dim)

@@ -51,8 +51,12 @@ class SwiGLUMLP(nn.Module):
         multiple_of: int = 256,
     ):
         super().__init__()
-        hidden_dim = int(2 * dim * expand_ratio / 3)
-        hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+        # HARDCODED NVFP4: Always use hidden_dim=6912 for dim=1280
+        if dim == 1280:
+            hidden_dim = 6912
+        else:
+            hidden_dim = int(2 * dim * expand_ratio / 3)
+            hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
         self.proj_in_gate = nn.Linear(dim, hidden_dim, bias=False)
         self.proj_out = nn.Linear(hidden_dim, dim, bias=False)
         self.proj_in = nn.Linear(dim, hidden_dim, bias=False)

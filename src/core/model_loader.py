@@ -851,9 +851,12 @@ def prepare_model_structure(
              category=model_type, force=True)
     debug.start_timer(f"{model_type}_structure")
     
-    # Add force_nvfp4 to model config for conditional NVFP4 fixes
-    if is_dit and hasattr(model_config, '_config'):
-        model_config._config['force_nvfp4'] = force_nvfp4
+    # CONDITIONAL IMPORT: Use dit_nvfp4 for NVFP4 models, dit_3b for standard models
+    if is_dit and force_nvfp4:
+        # Modify config path to use dit_nvfp4 instead of dit_3b
+        if hasattr(model_config, '__object__') and model_config.__object__.path == "dit_3b.nadit":
+            model_config.__object__.path = "dit_nvfp4.nadit"
+            debug.log("Using dit_nvfp4 model for NVFP4 checkpoint", category=model_type, force=True)
     
     with torch.device("meta"):
         model = create_object(model_config)
