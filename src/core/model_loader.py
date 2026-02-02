@@ -1510,6 +1510,38 @@ def _load_standard_weights_impl(model: torch.nn.Module, state: Dict[str, Any],
                         debug.log("[NVFP4] Loading state_dict with strict=False (allows scale_inv parameters)", 
                                  category="nvfp4")
                     
+                    # NVFP4 AUTO-SCALING: Apply weight scales before loading
+                    debug.log("[NVFP4] Checking for weight scales...", category="nvfp4")
+                    scales_applied = 0
+                    weight_keys = [k for k in state.keys() if k.endswith('.weight')]
+                    
+                    for key in weight_keys:
+                        scale_key = key + '_scale'
+                        if scale_key in state:
+                            try:
+                                weight = state[key]
+                                scale = state[scale_key]
+                                
+                                # Move to GPU if available for faster computation
+                                if torch.cuda.is_available():
+                                    weight = weight.to("cuda")
+                                    scale = scale.to("cuda")
+                                
+                                # CRITICAL: Apply scale multiplication (fixes black screen)
+                                # Formula: final_weight = quantized_uint8.float() * scale
+                                scaled_weight = weight.float() * scale
+                                
+                                # Store back in original dtype and device
+                                state[key] = scaled_weight.to(weight.dtype)
+                                scales_applied += 1
+                            except Exception as e:
+                                debug.log(f"[NVFP4] Warning: Failed to apply scale to {key}: {e}", category="warning")
+                    
+                    if scales_applied > 0:
+                        debug.log(f"[NVFP4] ✅ Applied scaling to {scales_applied} weight tensors", category="success")
+                    else:
+                        debug.log("[NVFP4] No weight scales found in checkpoint", category="nvfp4")
+                    
                     try:
                         debug.start_timer(f"{model_type_lower}_state_apply")
                         missing, unexpected = model.load_state_dict(state, strict=False)
