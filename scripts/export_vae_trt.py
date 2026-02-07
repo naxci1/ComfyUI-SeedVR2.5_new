@@ -172,6 +172,12 @@ def export_to_onnx(
     """
     Export VAE decoder to ONNX format with static input shape.
     
+    The model is exported in FP32 to avoid scalar type ambiguity errors
+    (SymbolicValueError: Cannot determine scalar type) that occur when
+    GroupNorm receives FP16 tensors after einops.rearrange/reshape ops
+    during JIT tracing. TensorRT handles FP16/FP8 conversion at engine
+    build time via its precision flags.
+    
     Args:
         vae_model: Full VAE model (VideoAutoencoderKLWrapper)
         onnx_path: Output path for the ONNX file
@@ -184,16 +190,14 @@ def export_to_onnx(
     logger.info(f"Creating decoder wrapper for ONNX export...")
     decoder = VAEDecoderWrapper(vae_model).to(device).eval()
     
-    # Force all parameters and biases to FP16 to prevent type mismatch errors
-    # during F.conv3d in the Causal Conv3D layers (causal_inflation_lib.py)
-    decoder = _force_half_precision(decoder)
+    # Export in FP32 to avoid "Cannot determine scalar type" errors.
+    # FP16 causes type ambiguity in the JIT tracer around GroupNorm layers
+    # that receive tensors from einops.rearrange/reshape operations.
+    # TensorRT handles FP16/FP8 precision at engine build time.
+    decoder = decoder.float()
     
-    # Disable CuDNN entirely during export. Setting only cudnn.benchmark=False
-    # is insufficient - PyTorch still routes through aten.cudnn_convolution
-    # when cudnn.enabled=True, causing:
-    #   DispatchError: No ONNX function found for aten.cudnn_convolution
-    # With cudnn.enabled=False, convolutions use standard ATen ops that the
-    # ONNX exporter handles natively.
+    # Disable CuDNN entirely during export to prevent aten.cudnn_convolution
+    # ops that the ONNX exporter cannot decompose.
     prev_cudnn_enabled = torch.backends.cudnn.enabled
     prev_benchmark = torch.backends.cudnn.benchmark
     prev_deterministic = torch.backends.cudnn.deterministic
@@ -201,18 +205,16 @@ def export_to_onnx(
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
     
-    dummy_input = torch.randn(*latent_shape, device=device, dtype=torch.float16)
+    dummy_input = torch.randn(*latent_shape, device=device, dtype=torch.float32)
     
     logger.info(f"Exporting to ONNX: {onnx_path}")
     logger.info(f"  Input shape: {latent_shape}")
+    logger.info(f"  Precision: FP32 (TRT handles FP16/FP8 conversion)")
     logger.info(f"  Expected output: [{latent_shape[0]}, 3, {latent_shape[2] * 8}, {latent_shape[3] * 8}]")
     
     try:
-        # Use JIT tracing to capture a clean graph before ONNX export.
-        # This bypasses the Dynamo-based exporter which fails on the model's
-        # 3D causal convolutions with complex padding/slicing logic.
         with torch.inference_mode():
-            logger.info("  JIT tracing decoder...")
+            logger.info("  JIT tracing decoder in FP32...")
             traced_model = torch.jit.trace(decoder, dummy_input, check_trace=False)
             
             logger.info("  Exporting traced model to ONNX...")
@@ -222,15 +224,12 @@ def export_to_onnx(
                 onnx_path,
                 input_names=["latent"],
                 output_names=["decoded"],
-                # Opset 16 for maximum compatibility with TensorRT 10.x on Blackwell
                 opset_version=16,
                 export_params=True,
                 do_constant_folding=True,
-                # Standard ONNX ops (no ATen fallback needed since CuDNN is disabled)
+                keep_initializers_as_inputs=False,
+                training=torch.onnx.TrainingMode.EVAL,
                 operator_export_type=torch.onnx.OperatorExportTypes.ONNX,
-                # Force legacy exporter. PyTorch 2.5+ defaults to the Dynamo-based
-                # exporter which raises "Exporting a ScriptModule is not supported"
-                # when given a JIT-traced model.
                 dynamo=False,
             )
     finally:
