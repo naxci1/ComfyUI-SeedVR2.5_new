@@ -154,6 +154,18 @@ try:
 except (ImportError, AttributeError, OSError):
     pass
 
+# 3b. SageAttention 2 INT8 QK kernel (Blackwell FP8/INT8 microscaling)
+# This kernel uses INT8 quantization for QK matmul and FP16 for PV accumulation,
+# providing ~2× throughput vs FP16-only on GPUs with INT8 Tensor Core support.
+sageattn_qk_int8_pv_fp16_cuda = None
+SAGE_ATTN_2_INT8_AVAILABLE = False
+try:
+    from sageattention import sageattn_qk_int8_pv_fp16_cuda as _sa2_int8
+    sageattn_qk_int8_pv_fp16_cuda = _sa2_int8
+    SAGE_ATTN_2_INT8_AVAILABLE = True
+except (ImportError, AttributeError, OSError):
+    pass
+
 # 4. SageAttention 3 / Blackwell (RTX 50xx only, batched attention)
 sageattn_blackwell = None
 SAGE_ATTN_3_AVAILABLE = False
@@ -446,6 +458,84 @@ def call_sage_attn_2_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, m
 
 
 @torch._dynamo.disable
+def call_sage_attn_2_int8_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs):
+    """
+    Wrapper for SageAttention 2 INT8 QK kernel with FP16 PV accumulation.
+    
+    Uses sageattn_qk_int8_pv_fp16_cuda for ~2× throughput vs FP16-only on GPUs
+    with INT8 Tensor Core support (Ampere+, Blackwell). This kernel quantizes
+    QK matmul to INT8 while keeping PV accumulation in FP16 for numerical stability.
+    
+    Falls back to standard SA2 varlen if INT8 kernel is not available.
+    
+    This function is excluded from torch.compile because:
+    1. SageAttention is a C++ extension that can't be compiled
+    2. It requires Python int scalars for max_seqlen parameters
+    
+    Args:
+        q: Query tensor (total_seq, heads, head_dim)
+        k: Key tensor (total_seq, heads, head_dim)
+        v: Value tensor (total_seq, heads, head_dim)
+        cu_seqlens_q: Cumulative sequence lengths for queries
+        cu_seqlens_k: Cumulative sequence lengths for keys
+        max_seqlen_q: Maximum query sequence length (can be tensor or int)
+        max_seqlen_k: Maximum key sequence length (can be tensor or int)
+        **kwargs: Additional arguments (causal supported)
+        
+    Returns:
+        Attention output tensor (total_seq, heads, head_dim)
+    """
+    if not SAGE_ATTN_2_INT8_AVAILABLE:
+        # Fall back to standard SA2
+        return call_sage_attn_2_varlen(
+            q, k, v, cu_seqlens_q, cu_seqlens_k,
+            max_seqlen_q, max_seqlen_k, **kwargs
+        )
+    
+    # Convert tensor max_seqlen to Python int if needed
+    if torch.is_tensor(max_seqlen_q):
+        max_seqlen_q = int(max_seqlen_q.item())
+    if torch.is_tensor(max_seqlen_k):
+        max_seqlen_k = int(max_seqlen_k.item())
+    
+    # INT8 QK kernel requires FP16 inputs
+    out_dtype = q.dtype
+    if q.dtype != torch.float16:
+        q = q.to(torch.float16)
+    if k.dtype != torch.float16:
+        k = k.to(torch.float16)
+    if v.dtype != torch.float16:
+        v = v.to(torch.float16)
+    
+    # Reshape for batched INT8 kernel: (total_seq, heads, dim) -> (batch, heads, seq, dim)
+    seq_lens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+    batch_size = len(seq_lens)
+    seq_len = int(seq_lens[0].item())
+    heads = q.shape[1]
+    dim = q.shape[2]
+    
+    q_batched = q.view(batch_size, seq_len, heads, dim).transpose(1, 2)
+    k_batched = k.view(batch_size, seq_len, heads, dim).transpose(1, 2)
+    v_batched = v.view(batch_size, seq_len, heads, dim).transpose(1, 2)
+    
+    is_causal = kwargs.get('causal', False)
+    sm_scale = 1.0 / (dim ** 0.5)
+    
+    # Call INT8 QK / FP16 PV kernel
+    out = sageattn_qk_int8_pv_fp16_cuda(
+        q_batched, k_batched, v_batched,
+        tensor_layout="HND",
+        is_causal=is_causal,
+        sm_scale=sm_scale,
+    )
+    
+    # Reshape back to varlen format
+    out = out.transpose(1, 2).reshape(-1, heads, dim).contiguous()
+    
+    return out.to(out_dtype) if out.dtype != out_dtype else out
+
+
+@torch._dynamo.disable
 def call_sage_attn_3_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs):
     """
     Wrapper for SageAttention 3 (Blackwell) that converts varlen format to batched format.
@@ -495,6 +585,12 @@ def call_sage_attn_3_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, m
     if not (uniform_q and uniform_k):
         # Fall back to SA2 for variable-length sequences
         # This is expected behavior - SA3 Blackwell doesn't support varlen natively
+        # Prefer SA2 INT8 QK kernel for best Blackwell performance when available
+        if SAGE_ATTN_2_INT8_AVAILABLE:
+            return call_sage_attn_2_int8_varlen(
+                q, k, v, cu_seqlens_q, cu_seqlens_k,
+                max_seqlen_q, max_seqlen_k, **kwargs
+            )
         if SAGE_ATTN_2_AVAILABLE:
             return call_sage_attn_2_varlen(
                 q, k, v, cu_seqlens_q, cu_seqlens_k,
@@ -646,6 +742,7 @@ if not os.environ.get("SEEDVR2_OPTIMIZATIONS_LOGGED"):
     
     # Build status strings
     sage_status = "✅" if SAGE_ATTN_AVAILABLE else "❌"
+    sage_int8_status = "✅" if SAGE_ATTN_2_INT8_AVAILABLE else "❌"
     flash_status = "✅" if FLASH_ATTN_AVAILABLE else "❌"
     triton_status = "✅" if TRITON_AVAILABLE else "❌"
     
@@ -654,13 +751,13 @@ if not os.environ.get("SEEDVR2_OPTIMIZATIONS_LOGGED"):
     num_available = sum(available)
     
     if num_available == 3:
-        print(f"⚡ SeedVR2 optimizations check: SageAttention {sage_status} | Flash Attention {flash_status} | Triton {triton_status}")
+        print(f"⚡ SeedVR2 optimizations check: SageAttention {sage_status} | SA2-INT8 {sage_int8_status} | Flash Attention {flash_status} | Triton {triton_status}")
     elif num_available == 0:
-        print(f"⚠️  SeedVR2 optimizations check: SageAttention {sage_status} | Flash Attention {flash_status} | Triton {triton_status}")
+        print(f"⚠️  SeedVR2 optimizations check: SageAttention {sage_status} | SA2-INT8 {sage_int8_status} | Flash Attention {flash_status} | Triton {triton_status}")
         print("💡 For best performance: pip install sageattention flash-attn triton")
     else:
         icon = "⚡" if num_available >= 2 else "⚠️ "
-        print(f"{icon} SeedVR2 optimizations check: SageAttention {sage_status} | Flash Attention {flash_status} | Triton {triton_status}")
+        print(f"{icon} SeedVR2 optimizations check: SageAttention {sage_status} | SA2-INT8 {sage_int8_status} | Flash Attention {flash_status} | Triton {triton_status}")
         
         # Build install suggestions for missing packages
         missing = []

@@ -667,6 +667,75 @@ def manage_tensor(
         return tensor.to(dtype=target_dtype)
 
 
+def pin_tensor_for_transfer(
+    tensor: torch.Tensor,
+    target_device: torch.device,
+    non_blocking: bool = True,
+    debug: Optional['Debug'] = None,
+) -> torch.Tensor:
+    """
+    Transfer tensor between CPU and GPU using pinned (page-locked) memory for async transfers.
+    
+    Pinned memory enables overlapping CPU↔GPU data transfers with GPU computation via
+    non-blocking transfers. This is particularly beneficial for systems with large RAM
+    (e.g., 96GB DDR5) that can serve as activation spillover buffers.
+    
+    For CPU→GPU: Pins the CPU tensor in page-locked memory, then transfers asynchronously.
+    For GPU→CPU: Transfers to a pre-pinned CPU tensor for zero-copy DMA.
+    For GPU→GPU or CPU→CPU: Falls back to standard transfer.
+    
+    Args:
+        tensor: Source tensor to transfer
+        target_device: Target device
+        non_blocking: Whether to use non-blocking transfer (default True for async)
+        debug: Optional debug instance for logging
+        
+    Returns:
+        Tensor on target device
+    """
+    if tensor is None:
+        return tensor
+    
+    src_device = tensor.device
+    target_type = target_device.type if isinstance(target_device, torch.device) else str(target_device).split(':')[0]
+    src_type = src_device.type
+    
+    # Same device type - standard transfer
+    if src_type == target_type:
+        return tensor.to(target_device, non_blocking=non_blocking)
+    
+    # CPU → GPU: pin source memory for DMA transfer
+    if src_type == 'cpu' and target_type == 'cuda':
+        if not tensor.is_pinned():
+            tensor = tensor.pin_memory()
+        return tensor.to(target_device, non_blocking=non_blocking)
+    
+    # GPU → CPU: allocate pinned destination for async readback
+    if src_type == 'cuda' and target_type == 'cpu':
+        pinned_dest = torch.empty_like(tensor, device='cpu', pin_memory=True)
+        pinned_dest.copy_(tensor, non_blocking=non_blocking)
+        return pinned_dest
+    
+    # Fallback for other device combinations
+    return tensor.to(target_device, non_blocking=non_blocking)
+
+
+def create_cuda_transfer_stream() -> Optional[torch.cuda.Stream]:
+    """
+    Create a dedicated CUDA stream for async data transfers.
+    
+    Using a separate stream for CPU↔GPU transfers allows overlapping data movement
+    with GPU computation on the default stream. The caller is responsible for
+    synchronizing the stream before consuming transferred data.
+    
+    Returns:
+        CUDA stream for transfers, or None if CUDA is not available
+    """
+    if not torch.cuda.is_available():
+        return None
+    return torch.cuda.Stream()
+
+
 def manage_model_device(model: torch.nn.Module, target_device: torch.device, model_name: str,
                        debug: Optional['Debug'] = None, reason: Optional[str] = None,
                        runner: Optional[Any] = None) -> bool:

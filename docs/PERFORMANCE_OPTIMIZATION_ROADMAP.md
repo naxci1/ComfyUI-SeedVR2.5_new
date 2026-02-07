@@ -186,7 +186,11 @@ The codebase is relatively clean. Only 3 `.clone()` calls exist in the entire `s
 3. Use `torch.compile(backend="cudagraphs")` for VAE on Windows
 4. ✅ Switch BlockSwap transfers to `non_blocking=True` — **DONE**
 5. ✅ Enable TF32 + CuDNN benchmark at import time — **DONE**
-6. Set `torch.cuda.memory.set_per_process_memory_fraction(0.95)`
+6. ✅ SA3→SA2 hybrid attention with INT8 QK kernel fallback — **DONE**
+7. ✅ Block pre-fetching via CUDA streams during BlockSwap — **DONE**
+8. ✅ Pinned memory tensor transfer utilities — **DONE**
+9. ✅ FP8 VAE decode path for Blackwell/Hopper — **DONE**
+10. Set `torch.cuda.memory.set_per_process_memory_fraction(0.95)`
 
 ### Phase 2: Medium Effort (1-2 weeks)
 1. Implement pinned memory activation streaming for VAE decode
@@ -194,6 +198,7 @@ The codebase is relatively clean. Only 3 `.clone()` calls exist in the entire `s
 3. Pre-allocate reusable transfer buffers for BlockSwap
 4. Integrate `transformer_engine` for FP8 linear layers
 5. AOTInductor cross-compilation (compile on Linux, deploy on Windows)
+6. TensorRT engine wrapping for VAE and DiT models
 
 ### Phase 3: Architectural (2-4 weeks)
 1. TensorRT integration for DiT inference
