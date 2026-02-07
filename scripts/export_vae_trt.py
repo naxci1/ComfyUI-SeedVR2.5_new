@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 def _patched_group_norm(g, input, num_groups, weight, bias, eps, cudnn_enabled):
     return g.op("GroupNorm", input, weight, bias, num_groups_i=num_groups, eps_f=eps)
 
-register_custom_op_symbolic('aten::group_norm', _patched_group_norm, 17)
+register_custom_op_symbolic('aten::group_norm', _patched_group_norm, 16)
 
 
 def load_vae_model(vae_path: str, device: str = "cuda") -> torch.nn.Module:
@@ -205,6 +205,15 @@ def export_to_onnx(
     logger.info(f"Creating decoder wrapper for ONNX export...")
     decoder = VAEDecoderWrapper(vae_model).to(device).eval()
     
+    # Deep copy weights into the wrapper to ensure they are independent
+    # in-memory tensors. Without this, the wrapper's submodules may share
+    # tensor storage with the original VAE model, and the ONNX exporter
+    # (especially PyTorch 2.x Dynamo-based) may fail to serialize shared
+    # weights, producing a near-empty 0.1MB file.
+    decoder.decoder.load_state_dict(vae_model.decoder.state_dict())
+    if vae_model.post_quant_conv is not None and decoder.post_quant_conv is not None:
+        decoder.post_quant_conv.load_state_dict(vae_model.post_quant_conv.state_dict())
+    
     # Export in FP32 to avoid "Cannot determine scalar type" errors.
     # TensorRT handles FP16/FP8 precision at engine build time.
     decoder = decoder.float()
@@ -244,7 +253,7 @@ def export_to_onnx(
                 onnx_path,
                 input_names=["latent"],
                 output_names=["decoded"],
-                opset_version=17,
+                opset_version=16,
                 export_params=True,
                 do_constant_folding=True,
                 keep_initializers_as_inputs=False,
