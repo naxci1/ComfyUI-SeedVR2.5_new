@@ -4,10 +4,16 @@
 
 | Component | Specification |
 |-----------|--------------|
-| GPU | NVIDIA GeForce RTX 5070 Ti (16 GB VRAM) |
+| OS | Windows 10 Pro |
+| GPU | NVIDIA GeForce RTX 5070 Ti (16 GB VRAM, Blackwell Architecture) |
 | CPU | Intel Core i7-14700KF |
 | RAM | 96 GB DDR5 |
-| Software | Python 3.12.10, PyTorch 2.7.1+cu128, CUDA 12.8, cuDNN 90701 |
+| Software | Python 3.12.10, PyTorch 2.10, CUDA 13.0 |
+
+### Windows-Specific Constraints
+- **No native Triton support**: `torch.compile` with the `inductor` backend requires Triton, which has limited Windows support. Use `cudagraphs` backend or SDPA-only paths.
+- **TensorRT/AOTInductor as alternatives**: For ahead-of-time compilation on Windows, `torch.export` + AOTInductor or TensorRT can bypass the Triton dependency.
+- **CUDA Graphs**: Available on Windows via PyTorch's native CUDA graph API (`torch.cuda.CUDAGraph`), independent of Triton.
 
 ---
 
@@ -86,12 +92,15 @@ Rather than tiling, exploit the 96GB system RAM as an activation spillover buffe
 - All C++ extension calls (Flash Attention, SageAttention, GGUF dequant) are wrapped with `@torch._dynamo.disable` to avoid tracing.
 - `pytorch_varlen_attention()` uses `torch.tensor_split` (not `.item()`) to avoid graph breaks.
 
+**Windows Constraint:** `torch.compile` with the `inductor` backend requires Triton, which is not natively available on Windows. Alternative approaches:
+
 | Priority | Recommendation | Impact | Complexity |
 |----------|---------------|--------|------------|
-| HIGH | **Enable `torch.compile(mode="max-autotune")` by default** — The codebase is already compile-ready. `max-autotune` triggers Triton autotuning for optimal kernel configurations on the specific hardware. First-run cost is ~2-5 minutes, but amortized over video processing. | 20-40% DiT throughput increase | LOW — already supported via TorchCompileSettings node |
-| HIGH | **Use `torch.compile(mode="reduce-overhead")` for VAE** — The VAE has simpler shapes and fewer dynamic paths. `reduce-overhead` mode uses CUDA graphs internally with minimal compilation cost. | 15-25% VAE throughput increase | LOW |
-| MEDIUM | **`torch._inductor.config.coordinate_descent_tuning = True`** — PyTorch 2.7's inductor backend supports coordinate descent autotuning. Enable this globally for the best Triton kernel configurations per-layer. | 5-15% additional throughput on compile | LOW — single config line |
-| MEDIUM | **`torch._inductor.config.triton.unique_kernel_names = True`** — Generates unique kernel names for profiling. Essential for identifying which layers are bottlenecks via `torch.profiler`. | Enables precise optimization | LOW |
+| HIGH | **Use `torch.compile(backend="cudagraphs")` on Windows** — The `cudagraphs` backend does not require Triton. It captures CUDA graphs for the computation, eliminating CPU-side kernel launch overhead. Available via the existing TorchCompileSettings node. | 10-20% throughput increase | LOW — already supported |
+| HIGH | **Direct CUDA Graph capture for DiT inference** — For fixed-shape batches, use `torch.cuda.CUDAGraph` API directly to capture and replay the DiT forward pass. This works on Windows without Triton. | 10-20% speedup on DiT pass | MEDIUM — requires fixed shapes |
+| MEDIUM | **AOTInductor (Ahead-of-Time)** — Use `torch.export` + `torch._inductor.aot_compile()` on a Linux machine to pre-compile optimized kernels, then load the compiled artifacts on Windows via `torch._export.aot_load()`. This gives inductor-level optimization without runtime Triton. | 20-40% throughput increase | HIGH — requires cross-platform workflow |
+| MEDIUM | **TensorRT integration** — Export DiT model via `torch.onnx.export()` or `torch_tensorrt.compile()` for TensorRT inference on Windows. Provides kernel-level optimization without Triton dependency. Requires `nvidia-tensorrt` and `torch_tensorrt` packages. | 30-50% DiT throughput increase | HIGH — requires model export pipeline |
+| LOW | **Triton on Windows via WSL2** — Run inference through WSL2 (Windows Subsystem for Linux) where Triton is natively supported. This enables full `torch.compile(mode="max-autotune")` support. | 20-40% throughput increase | LOW — WSL2 setup only |
 
 ### 3.2 SDPA Backend Selection
 
@@ -121,20 +130,21 @@ The codebase is relatively clean. Only 3 `.clone()` calls exist in the entire `s
 
 ### 4.2 Transfer Overhead Analysis
 
-| Pattern | Locations | Assessment |
-|---------|-----------|------------|
-| `non_blocking=False` in BlockSwap | `blockswap.py:377,385,506,512,585,591` | **Optimization opportunity** — Change to `non_blocking=True` with explicit `torch.cuda.synchronize()` before computation. Currently blocking on every swap. |
-| `non_blocking=False` in model loading | `model_loader.py:202` | **Optimization opportunity** — Model loading can use non-blocking transfers. |
-| `manage_tensor()` defaults | `memory_manager.py:589` | Already supports `non_blocking` parameter but defaults to `False`. |
+| Pattern | Locations | Status |
+|---------|-----------|--------|
+| `non_blocking` in BlockSwap | `blockswap.py:377,385,506,512,585,591` | ✅ **Implemented** — Swap-in uses `non_blocking=True` + `stream.synchronize()` before computation. Swap-out uses `non_blocking=True` (next swap-in synchronizes). |
+| `non_blocking` in model loading | `model_loader.py:202` | ✅ **Implemented** — GGUF tensor loading uses `non_blocking=True`. |
+| `manage_tensor()` defaults | `memory_manager.py:589` | Already supports `non_blocking` parameter, defaults to `False`. |
 
 ### 4.3 Zero-Copy Recommendations
 
-| Priority | Recommendation | Impact | Complexity |
-|----------|---------------|--------|------------|
-| HIGH | **Enable `non_blocking=True` for BlockSwap transfers** — The block swap mechanism (`blockswap.py`) uses synchronous transfers for safety. On a high-bandwidth PCIe 4.0 bus, switching to async transfers with strategic synchronization would hide latency behind computation. The `_on_forward_pre_hook` / `_on_forward_post_hook` pattern is ideal for this since the synchronization point is naturally at the forward pass boundary. | 20-40% faster block swapping | LOW |
-| HIGH | **Pre-allocate and reuse transfer buffers** — Instead of creating new tensors for each block swap, maintain a pair of pinned CPU buffers sized to the largest transformer block. Reuse them via `buffer.copy_(block_data, non_blocking=True)`. | Eliminates allocation overhead | MEDIUM |
-| MEDIUM | **Tensor view sharing between phases** — In `generation_phases.py`, the `_prepare_video_batch()` function (line 92) already uses view/slice instead of copy. Extend this pattern to phase transitions: when moving from Phase 1→2→3, avoid materializing intermediate lists where possible. | Reduces peak memory between phases | MEDIUM |
-| MEDIUM | **`torch.cuda.memory.set_per_process_memory_fraction(0.95)`** — Allow PyTorch to use 95% of GPU memory (vs default ~67%). On a dedicated inference machine with 16GB VRAM, this gives an extra ~4.5GB headroom. | ~4.5GB additional usable VRAM | LOW |
+| Priority | Recommendation | Impact | Status |
+|----------|---------------|--------|--------|
+| HIGH | **Enable `non_blocking=True` for BlockSwap transfers** — Async transfers with strategic synchronization hide latency behind computation. Swap-in synchronizes before forward(); swap-out is fire-and-forget. | 20-40% faster block swapping | ✅ **Implemented** |
+| HIGH | **TF32 + CuDNN benchmark** — Enable `torch.backends.cuda.matmul.allow_tf32` and `torch.backends.cudnn.benchmark` at module import time for all inference paths. | ~2× throughput on float32 ops | ✅ **Implemented** in `performance.py` |
+| HIGH | **Pre-allocate and reuse transfer buffers** — Instead of creating new tensors for each block swap, maintain a pair of pinned CPU buffers sized to the largest transformer block. Reuse them via `buffer.copy_(block_data, non_blocking=True)`. | Eliminates allocation overhead | Future |
+| MEDIUM | **Tensor view sharing between phases** — In `generation_phases.py`, the `_prepare_video_batch()` function (line 92) already uses view/slice instead of copy. Extend this pattern to phase transitions: when moving from Phase 1→2→3, avoid materializing intermediate lists where possible. | Reduces peak memory between phases | Future |
+| MEDIUM | **`torch.cuda.memory.set_per_process_memory_fraction(0.95)`** — Allow PyTorch to use 95% of GPU memory (vs default ~67%). On a dedicated inference machine with 16GB VRAM, this gives an extra ~4.5GB headroom. | ~4.5GB additional usable VRAM | Future |
 
 ---
 
@@ -172,19 +182,21 @@ The codebase is relatively clean. Only 3 `.clone()` calls exist in the entire `s
 
 ### Phase 1: Quick Wins (1-2 days)
 1. Default to `sageattn_3` on SM100+ hardware
-2. Enable `torch.compile(mode="max-autotune")` for DiT
-3. Enable `torch.compile(mode="reduce-overhead")` for VAE
-4. Switch BlockSwap transfers to `non_blocking=True`
-5. Set `torch.cuda.memory.set_per_process_memory_fraction(0.95)`
+2. Use `torch.compile(backend="cudagraphs")` for DiT on Windows (no Triton required)
+3. Use `torch.compile(backend="cudagraphs")` for VAE on Windows
+4. ✅ Switch BlockSwap transfers to `non_blocking=True` — **DONE**
+5. ✅ Enable TF32 + CuDNN benchmark at import time — **DONE**
+6. Set `torch.cuda.memory.set_per_process_memory_fraction(0.95)`
 
 ### Phase 2: Medium Effort (1-2 weeks)
 1. Implement pinned memory activation streaming for VAE decode
-2. CUDA Graph capture for DiT inference loop
+2. Direct CUDA Graph capture for DiT inference loop (Windows-compatible, no Triton)
 3. Pre-allocate reusable transfer buffers for BlockSwap
 4. Integrate `transformer_engine` for FP8 linear layers
+5. AOTInductor cross-compilation (compile on Linux, deploy on Windows)
 
 ### Phase 3: Architectural (2-4 weeks)
-1. Custom Triton kernel for fused RoPE + QKV
+1. TensorRT integration for DiT inference
 2. FlexAttention for windowed attention patterns
 3. Two-tier memory allocator (GPU + pinned CPU)
 4. KV-Cache quantization in attention layers
