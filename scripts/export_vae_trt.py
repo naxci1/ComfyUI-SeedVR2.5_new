@@ -134,6 +134,33 @@ class VAEDecoderWrapper(torch.nn.Module):
         return decoded
 
 
+def _force_half_precision(model: torch.nn.Module) -> torch.nn.Module:
+    """
+    Force all parameters and biases to FP16.
+    
+    The safetensors checkpoint may have FP16 weights but FP32 biases in some layers
+    (e.g., GroupNorm, Conv3d), causing 'Input type (c10::Half) and bias type (float)
+    should be the same' errors during F.conv3d in causal_inflation_lib.py.
+    
+    This function ensures uniform FP16 precision across the entire model.
+    
+    Args:
+        model: Model to cast to FP16
+        
+    Returns:
+        Model with all parameters and biases in FP16
+    """
+    model = model.half()
+    
+    # Explicitly cast any biases that may not have been converted by .half()
+    # (e.g., registered buffers or non-persistent parameters)
+    for m in model.modules():
+        if hasattr(m, 'bias') and m.bias is not None:
+            m.bias.data = m.bias.data.half()
+    
+    return model
+
+
 def export_to_onnx(
     vae_model: torch.nn.Module,
     onnx_path: str,
@@ -155,6 +182,10 @@ def export_to_onnx(
     logger.info(f"Creating decoder wrapper for ONNX export...")
     decoder = VAEDecoderWrapper(vae_model).to(device).eval()
     
+    # Force all parameters and biases to FP16 to prevent type mismatch errors
+    # during F.conv3d in the Causal Conv3D layers (causal_inflation_lib.py)
+    decoder = _force_half_precision(decoder)
+    
     dummy_input = torch.randn(*latent_shape, device=device, dtype=torch.float16)
     
     logger.info(f"Exporting to ONNX: {onnx_path}")
@@ -169,7 +200,13 @@ def export_to_onnx(
             input_names=["latent"],
             output_names=["decoded"],
             opset_version=17,
+            # Embed weights directly in the ONNX graph. This uses the legacy
+            # torch.onnx exporter path, avoiding torch.export which fails on Windows.
+            export_params=True,
             do_constant_folding=True,
+            # Use ATEN fallback for complex ops (Causal Conv3D, custom padding)
+            # that the standard ONNX exporter cannot trace on Windows
+            operator_export_type=torch.onnx.OperatorExportTypes.ONNX_ATEN_FALLBACK,
         )
     
     logger.info(f"ONNX export complete: {onnx_path} ({os.path.getsize(onnx_path) / 1e6:.1f} MB)")
