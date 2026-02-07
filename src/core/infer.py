@@ -142,16 +142,16 @@ class VideoDiffusionInfer():
             else:
                 batches = [sample.unsqueeze(0) for sample in samples]
 
+            # Detect VAE model dtype once (avoids repeated iteration)
+            try:
+                vae_dtype = next(self.vae.parameters()).dtype
+            except StopIteration:
+                vae_dtype = dtype  # Fallback
+
             # VAE process by each group.
             for sample in batches:
                 if hasattr(self.vae, "preprocess"):
                     sample = self.vae.preprocess(sample)
-
-                # Detect VAE model dtype
-                try:
-                    vae_dtype = next(self.vae.parameters()).dtype
-                except StopIteration:
-                    vae_dtype = dtype  # Fallback
 
                 # Use autocast if VAE dtype differs from input dtype
                 # Skip autocast on MPS (only supports bf16, unified memory = no benefit)
@@ -183,10 +183,19 @@ class VideoDiffusionInfer():
                         latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
                                             tile_overlap=self.encode_tile_overlap).posterior.mode().squeeze(2)
 
+                # Free input sample to reduce VRAM pressure
+                del sample
+
                 latent = latent.unsqueeze(2) if latent.ndim == 4 else latent
                 latent = optimized_channels_to_last(latent)
                 latent = (latent - shift) * scale
                 latents.append(latent)
+
+                # Clear GPU cache between encode iterations to prevent VRAM accumulation
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                elif device.type == 'mps':
+                    torch.mps.empty_cache()
 
             # Ungroup back to individual latent with the original order.
             if self.config.vae.grouping:
@@ -229,16 +238,16 @@ class VideoDiffusionInfer():
 
             self.debug.log(f"Latents shape: {latents[0].shape}", category="info", indent_level=1)
 
+            # Detect VAE model dtype once (avoids repeated iteration)
+            try:
+                vae_dtype = next(self.vae.parameters()).dtype
+            except StopIteration:
+                vae_dtype = dtype  # Fallback
+
             for i, latent in enumerate(latents):
                 latent = latent / scale + shift
                 latent = optimized_channels_to_second(latent)
                 latent = latent.squeeze(2)
-
-                # Detect VAE model dtype
-                try:
-                    vae_dtype = next(self.vae.parameters()).dtype
-                except StopIteration:
-                    vae_dtype = dtype  # Fallback
 
                 # Use autocast if VAE dtype differs from latent dtype
                 # Skip autocast on MPS (only supports bf16, unified memory = no benefit)
@@ -265,10 +274,19 @@ class VideoDiffusionInfer():
                         tile_overlap=self.decode_tile_overlap
                     ).sample
 
+                # Free input latent to reduce VRAM pressure before postprocess
+                del latent
+
                 if hasattr(self.vae, "postprocess"):
                     sample = self.vae.postprocess(sample)
 
                 samples.append(sample)
+
+                # Clear GPU cache between decode iterations to prevent VRAM accumulation
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                elif device.type == 'mps':
+                    torch.mps.empty_cache()
 
             if self.config.vae.grouping:
                 samples = na.unpack(samples, indices)
