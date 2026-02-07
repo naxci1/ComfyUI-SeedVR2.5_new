@@ -508,7 +508,14 @@ def call_sage_attn_2_int8_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen
         v = v.to(torch.float16)
     
     # Reshape for batched INT8 kernel: (total_seq, heads, dim) -> (batch, heads, seq, dim)
+    # INT8 kernel requires uniform sequence lengths for batched layout
     seq_lens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+    if not (seq_lens == seq_lens[0]).all():
+        # Variable-length sequences: fall back to standard SA2 varlen
+        return call_sage_attn_2_varlen(
+            q, k, v, cu_seqlens_q, cu_seqlens_k,
+            max_seqlen_q, max_seqlen_k, **kwargs
+        )
     batch_size = len(seq_lens)
     seq_len = int(seq_lens[0].item())
     heads = q.shape[1]
