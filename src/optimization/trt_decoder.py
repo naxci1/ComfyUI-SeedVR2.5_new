@@ -220,12 +220,19 @@ def patch_vae_with_trt(
             )
         
         # Prepare input: handle temporal dimension
-        squeeze_temporal = False
+        # The VAE uses 3D convolutions internally, so 5D input [B, C, T, H, W]
+        # is expected. TRT engine operates on 4D [B, C, H, W] for single frames.
         if z.ndim == 4:
             z_input = z
         elif z.ndim == 5:
+            # Only squeeze if temporal dim is singleton (T=1)
+            if z.shape[2] != 1:
+                # Multi-frame temporal input - TRT engine doesn't support this
+                return self._original_decode(
+                    z, return_dict=return_dict, tiled=tiled,
+                    tile_size=tile_size, tile_overlap=tile_overlap
+                )
             z_input = z.squeeze(2)
-            squeeze_temporal = True
         else:
             # Unexpected shape, fall back
             return self._original_decode(

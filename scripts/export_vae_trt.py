@@ -117,7 +117,10 @@ class VAEDecoderWrapper(torch.nn.Module):
         Returns:
             Decoded pixel tensor of shape [B, 3, H*8, W*8]
         """
-        # Add temporal dimension for 3D convolutions (VAE expects [B, C, T, H, W])
+        # The decoder uses 3D (causal) convolutions internally, so it expects
+        # 5D input [B, C, T, H, W] even for single-frame decoding. We add a
+        # singleton temporal dimension T=1 for the forward pass and remove it
+        # from the output to keep the ONNX graph operating on 4D tensors.
         z = z.unsqueeze(2)  # [B, C, 1, H, W]
         
         if self.post_quant_conv is not None:
@@ -370,9 +373,9 @@ def main():
     logger.info(f"  ONNX:   {onnx_path}")
     logger.info(f"  Engine: {engine_path}")
     logger.info("")
-    logger.info("To use this engine in SeedVR2, the TRT decoder will be")
-    logger.info("loaded automatically when the engine file is found at the")
-    logger.info("expected path, or you can set the TRT_ENGINE_PATH environment variable.")
+    logger.info("To use this engine in SeedVR2:")
+    logger.info("  from src.optimization.trt_decoder import patch_vae_with_trt")
+    logger.info(f"  patch_vae_with_trt(vae_model, engine_path='{engine_path}')")
     logger.info("=" * 60)
 
 
