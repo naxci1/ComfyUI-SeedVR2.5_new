@@ -1463,7 +1463,9 @@ def _load_standard_weights_impl(model: torch.nn.Module, state: Dict[str, Any],
     # ============================================================================
     if "vae" in model_type_lower or "vae" in str(getattr(model, "file_name", "")).lower():
         if debug:
-            debug.log("[SYSTEM_OVERRIDE] Bypassing NVFP4 scaling for VAE - using original logic", category="info")
+            debug.log("[SYSTEM_OVERRIDE] Materializing and Bypassing for VAE", category="info")
+        # CRITICAL: Move from meta to CPU before loading
+        model.to_empty(device="cpu")
         model.load_state_dict(state, strict=False)
         return model
     
