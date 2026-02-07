@@ -186,12 +186,16 @@ def export_to_onnx(
     # during F.conv3d in the Causal Conv3D layers (causal_inflation_lib.py)
     decoder = _force_half_precision(decoder)
     
-    # Disable CuDNN benchmarking to force standard convolution ops.
-    # Without this, PyTorch routes convolutions through aten.cudnn_convolution
-    # which the ONNX exporter cannot decompose, causing:
-    #   DispatchError: No ONNX function found for <OpOverload(op='aten.cudnn_convolution')>
+    # Disable CuDNN entirely during export. Setting only cudnn.benchmark=False
+    # is insufficient - PyTorch still routes through aten.cudnn_convolution
+    # when cudnn.enabled=True, causing:
+    #   DispatchError: No ONNX function found for aten.cudnn_convolution
+    # With cudnn.enabled=False, convolutions use standard ATen ops that the
+    # ONNX exporter handles natively.
+    prev_cudnn_enabled = torch.backends.cudnn.enabled
     prev_benchmark = torch.backends.cudnn.benchmark
     prev_deterministic = torch.backends.cudnn.deterministic
+    torch.backends.cudnn.enabled = False
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
     
@@ -202,24 +206,30 @@ def export_to_onnx(
     logger.info(f"  Expected output: [{latent_shape[0]}, 3, {latent_shape[2] * 8}, {latent_shape[3] * 8}]")
     
     try:
-        with torch.no_grad():
+        # Use JIT tracing to capture a clean graph before ONNX export.
+        # This bypasses the Dynamo-based exporter which fails on the model's
+        # 3D causal convolutions with complex padding/slicing logic.
+        with torch.inference_mode():
+            logger.info("  JIT tracing decoder...")
+            traced_model = torch.jit.trace(decoder, dummy_input, check_trace=False)
+            
+            logger.info("  Exporting traced model to ONNX...")
             torch.onnx.export(
-                decoder,
+                traced_model,
                 dummy_input,
                 onnx_path,
                 input_names=["latent"],
                 output_names=["decoded"],
-                opset_version=17,
-                # Embed weights directly in the ONNX graph. This uses the legacy
-                # torch.onnx exporter path, avoiding torch.export which fails on Windows.
+                # Opset 16 for maximum compatibility with TensorRT 10.x on Blackwell
+                opset_version=16,
                 export_params=True,
                 do_constant_folding=True,
-                # Use ATEN fallback for complex ops (Causal Conv3D, custom padding)
-                # that the standard ONNX exporter cannot trace on Windows
-                operator_export_type=torch.onnx.OperatorExportTypes.ONNX_ATEN_FALLBACK,
+                # Standard ONNX ops (no ATen fallback needed since CuDNN is disabled)
+                operator_export_type=torch.onnx.OperatorExportTypes.ONNX,
             )
     finally:
         # Restore CuDNN settings
+        torch.backends.cudnn.enabled = prev_cudnn_enabled
         torch.backends.cudnn.benchmark = prev_benchmark
         torch.backends.cudnn.deterministic = prev_deterministic
     
