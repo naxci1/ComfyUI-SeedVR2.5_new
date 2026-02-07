@@ -209,6 +209,12 @@ def export_to_onnx(
     # TensorRT handles FP16/FP8 precision at engine build time.
     decoder = decoder.float()
     
+    # Verify weights are loaded (non-zero parameter count)
+    param_count = sum(p.numel() for p in decoder.parameters())
+    logger.info(f"  Decoder wrapper: {param_count / 1e6:.1f}M parameters")
+    if param_count == 0:
+        raise RuntimeError("Decoder wrapper has 0 parameters — weights were not loaded correctly")
+    
     # Disable CuDNN entirely during export to prevent aten.cudnn_convolution
     # ops that the ONNX exporter cannot decompose.
     prev_cudnn_enabled = torch.backends.cudnn.enabled
@@ -226,10 +232,11 @@ def export_to_onnx(
     logger.info(f"  Expected output: [{latent_shape[0]}, 3, {latent_shape[2] * 8}, {latent_shape[3] * 8}]")
     
     try:
-        # Direct export without JIT tracing. The GroupNorm symbolic patch
-        # handles dtype resolution, and CuDNN is disabled to avoid
-        # aten.cudnn_convolution dispatch errors.
-        with torch.inference_mode():
+        # Use torch.no_grad() instead of torch.inference_mode().
+        # inference_mode() creates tensors that don't participate in autograd
+        # at all, which can prevent export_params from capturing weights
+        # into the ONNX graph (resulting in a near-empty 0.1MB file).
+        with torch.no_grad():
             logger.info("  Exporting decoder to ONNX (direct, no JIT trace)...")
             torch.onnx.export(
                 decoder,
@@ -250,7 +257,15 @@ def export_to_onnx(
         torch.backends.cudnn.benchmark = prev_benchmark
         torch.backends.cudnn.deterministic = prev_deterministic
     
-    logger.info(f"ONNX export complete: {onnx_path} ({os.path.getsize(onnx_path) / 1e6:.1f} MB)")
+    # Validate exported file contains weights (empty export produces ~0.1MB)
+    onnx_size_mb = os.path.getsize(onnx_path) / 1e6
+    logger.info(f"ONNX export complete: {onnx_path} ({onnx_size_mb:.1f} MB)")
+    if onnx_size_mb < 100:
+        raise RuntimeError(
+            f"Weights failed to export: ONNX file is only {onnx_size_mb:.1f} MB "
+            f"(expected >100 MB for SeedVR2 VAE decoder). "
+            f"This indicates export_params did not capture model weights."
+        )
     return onnx_path
 
 
