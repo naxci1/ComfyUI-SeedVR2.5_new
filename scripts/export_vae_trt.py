@@ -31,9 +31,22 @@ import sys
 import logging
 
 import torch
+from torch.onnx import symbolic_helper, register_custom_op_symbolic
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+
+# Patch GroupNorm ONNX symbolic to provide concrete dtype information.
+# Without this, the ONNX exporter fails with "Cannot determine scalar type"
+# when GroupNorm receives tensors from einops.rearrange/reshape operations.
+# The custom "GroupNorm" op is recognized by TensorRT's ONNX parser natively.
+# The cudnn_enabled parameter is accepted for API compatibility but is not
+# relevant in the ONNX graph representation.
+@symbolic_helper.parse_args('v', 'i', 'v', 'v', 'f', 'i')
+def _patched_group_norm(g, input, num_groups, weight, bias, eps, cudnn_enabled):
+    return g.op("GroupNorm", input, weight, bias, num_groups_i=num_groups, eps_f=eps)
+
+register_custom_op_symbolic('aten::group_norm', _patched_group_norm, 17)
 
 
 def load_vae_model(vae_path: str, device: str = "cuda") -> torch.nn.Module:
@@ -174,9 +187,11 @@ def export_to_onnx(
     
     The model is exported in FP32 to avoid scalar type ambiguity errors
     (SymbolicValueError: Cannot determine scalar type) that occur when
-    GroupNorm receives FP16 tensors after einops.rearrange/reshape ops
-    during JIT tracing. TensorRT handles FP16/FP8 conversion at engine
-    build time via its precision flags.
+    GroupNorm receives tensors after einops.rearrange/reshape ops.
+    TensorRT handles FP16/FP8 conversion at engine build time.
+    
+    The GroupNorm symbolic patch (registered at module level) ensures
+    GroupNorm layers export correctly without JIT tracing.
     
     Args:
         vae_model: Full VAE model (VideoAutoencoderKLWrapper)
@@ -191,8 +206,6 @@ def export_to_onnx(
     decoder = VAEDecoderWrapper(vae_model).to(device).eval()
     
     # Export in FP32 to avoid "Cannot determine scalar type" errors.
-    # FP16 causes type ambiguity in the JIT tracer around GroupNorm layers
-    # that receive tensors from einops.rearrange/reshape operations.
     # TensorRT handles FP16/FP8 precision at engine build time.
     decoder = decoder.float()
     
@@ -209,28 +222,27 @@ def export_to_onnx(
     
     logger.info(f"Exporting to ONNX: {onnx_path}")
     logger.info(f"  Input shape: {latent_shape}")
-    logger.info(f"  Precision: FP32 (TRT handles FP16/FP8 conversion)")
+    logger.info(f"  Precision: FP32 (TensorRT handles FP16/FP8 conversion)")
     logger.info(f"  Expected output: [{latent_shape[0]}, 3, {latent_shape[2] * 8}, {latent_shape[3] * 8}]")
     
     try:
+        # Direct export without JIT tracing. The GroupNorm symbolic patch
+        # handles dtype resolution, and CuDNN is disabled to avoid
+        # aten.cudnn_convolution dispatch errors.
         with torch.inference_mode():
-            logger.info("  JIT tracing decoder in FP32...")
-            traced_model = torch.jit.trace(decoder, dummy_input, check_trace=False)
-            
-            logger.info("  Exporting traced model to ONNX...")
+            logger.info("  Exporting decoder to ONNX (direct, no JIT trace)...")
             torch.onnx.export(
-                traced_model,
+                decoder,
                 dummy_input,
                 onnx_path,
                 input_names=["latent"],
                 output_names=["decoded"],
-                opset_version=16,
+                opset_version=17,
                 export_params=True,
                 do_constant_folding=True,
                 keep_initializers_as_inputs=False,
                 training=torch.onnx.TrainingMode.EVAL,
                 operator_export_type=torch.onnx.OperatorExportTypes.ONNX,
-                dynamo=False,
             )
     finally:
         # Restore CuDNN settings
