@@ -186,28 +186,42 @@ def export_to_onnx(
     # during F.conv3d in the Causal Conv3D layers (causal_inflation_lib.py)
     decoder = _force_half_precision(decoder)
     
+    # Disable CuDNN benchmarking to force standard convolution ops.
+    # Without this, PyTorch routes convolutions through aten.cudnn_convolution
+    # which the ONNX exporter cannot decompose, causing:
+    #   DispatchError: No ONNX function found for <OpOverload(op='aten.cudnn_convolution')>
+    prev_benchmark = torch.backends.cudnn.benchmark
+    prev_deterministic = torch.backends.cudnn.deterministic
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    
     dummy_input = torch.randn(*latent_shape, device=device, dtype=torch.float16)
     
     logger.info(f"Exporting to ONNX: {onnx_path}")
     logger.info(f"  Input shape: {latent_shape}")
     logger.info(f"  Expected output: [{latent_shape[0]}, 3, {latent_shape[2] * 8}, {latent_shape[3] * 8}]")
     
-    with torch.no_grad():
-        torch.onnx.export(
-            decoder,
-            dummy_input,
-            onnx_path,
-            input_names=["latent"],
-            output_names=["decoded"],
-            opset_version=17,
-            # Embed weights directly in the ONNX graph. This uses the legacy
-            # torch.onnx exporter path, avoiding torch.export which fails on Windows.
-            export_params=True,
-            do_constant_folding=True,
-            # Use ATEN fallback for complex ops (Causal Conv3D, custom padding)
-            # that the standard ONNX exporter cannot trace on Windows
-            operator_export_type=torch.onnx.OperatorExportTypes.ONNX_ATEN_FALLBACK,
-        )
+    try:
+        with torch.no_grad():
+            torch.onnx.export(
+                decoder,
+                dummy_input,
+                onnx_path,
+                input_names=["latent"],
+                output_names=["decoded"],
+                opset_version=17,
+                # Embed weights directly in the ONNX graph. This uses the legacy
+                # torch.onnx exporter path, avoiding torch.export which fails on Windows.
+                export_params=True,
+                do_constant_folding=True,
+                # Use ATEN fallback for complex ops (Causal Conv3D, custom padding)
+                # that the standard ONNX exporter cannot trace on Windows
+                operator_export_type=torch.onnx.OperatorExportTypes.ONNX_ATEN_FALLBACK,
+            )
+    finally:
+        # Restore CuDNN settings
+        torch.backends.cudnn.benchmark = prev_benchmark
+        torch.backends.cudnn.deterministic = prev_deterministic
     
     logger.info(f"ONNX export complete: {onnx_path} ({os.path.getsize(onnx_path) / 1e6:.1f} MB)")
     return onnx_path
