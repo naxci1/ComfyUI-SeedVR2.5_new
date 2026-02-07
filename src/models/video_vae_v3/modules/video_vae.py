@@ -794,6 +794,8 @@ class VideoAutoencoderKL(nn.Module):
     def encode(self, x: torch.FloatTensor, tiled: bool = False,
                tile_size: Tuple[int, int] = (512, 512),
                tile_overlap: Tuple[int, int] = (64, 64)) -> CausalEncoderOutput:
+        # tiled/tile_size/tile_overlap accepted for API compatibility with attn_video_vae variant
+        # This VAE variant uses slicing-based encoding instead of spatial tiling
         if x.ndim == 4:
             x = x.unsqueeze(2)
         h = self.slicing_encode(x)
@@ -804,6 +806,8 @@ class VideoAutoencoderKL(nn.Module):
     def decode(self, z: torch.FloatTensor, tiled: bool = False,
                tile_size: Tuple[int, int] = (512, 512),
                tile_overlap: Tuple[int, int] = (64, 64)) -> CausalDecoderOutput:
+        # tiled/tile_size/tile_overlap accepted for API compatibility with attn_video_vae variant
+        # This VAE variant uses slicing-based decoding instead of spatial tiling
         if z.ndim == 4:
             z = z.unsqueeze(2)
         x = self.slicing_decode(z)
