@@ -12,12 +12,14 @@ Usage:
     python scripts/export_vae_trt.py \
         --vae-path /path/to/ema_vae_fp16.safetensors \
         --output-dir ./trt_engines \
-        --latent-height 135 \
-        --latent-width 240 \
+        --resolutions 1280x720,1920x1080 \
         --fp8
 
-The default latent shape [1, 4, 135, 240] corresponds to 1080p output (1080×1920)
-with the SeedVR2 VAE spatial downsample factor of 8.
+By default, exports engines for 720p and 1080p. The latent shape is calculated
+automatically from the pixel resolution using the VAE spatial downsample factor of 8
+(e.g., 1920x1080 → latent 240x135, channels=16).
+
+Output files are named: seedvr2_vae_{width}x{height}_{precision}.engine
 
 Note: This script exports the decoder portion of the VAE only. The encoder is not
 needed for the inference hot path (Phase 3: VAE Decoding).
@@ -226,6 +228,10 @@ def export_to_onnx(
                 do_constant_folding=True,
                 # Standard ONNX ops (no ATen fallback needed since CuDNN is disabled)
                 operator_export_type=torch.onnx.OperatorExportTypes.ONNX,
+                # Force legacy exporter. PyTorch 2.5+ defaults to the Dynamo-based
+                # exporter which raises "Exporting a ScriptModule is not supported"
+                # when given a JIT-traced model.
+                dynamo=False,
             )
     finally:
         # Restore CuDNN settings
@@ -345,16 +351,10 @@ def main():
         help="Output directory for ONNX and engine files (default: ./trt_engines)",
     )
     parser.add_argument(
-        "--latent-height",
-        type=int,
-        default=135,
-        help="Latent height (default: 135 for 1080p)",
-    )
-    parser.add_argument(
-        "--latent-width",
-        type=int,
-        default=240,
-        help="Latent width (default: 240 for 1080p/1920px)",
+        "--resolutions",
+        type=str,
+        default="1280x720,1920x1080",
+        help="Comma-separated WxH resolutions to export (default: 1280x720,1920x1080)",
     )
     parser.add_argument(
         "--fp8",
@@ -389,54 +389,77 @@ def main():
     
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # File paths
-    # Note: latent_channels=16 (not 4) for SeedVR2 VAE
-    latent_shape = (1, 16, args.latent_height, args.latent_width)
-    shape_tag = f"{args.latent_height}x{args.latent_width}"
+    # Parse resolutions (WxH format)
+    resolutions = []
+    for res_str in args.resolutions.split(","):
+        res_str = res_str.strip()
+        parts = res_str.split("x")
+        if len(parts) != 2:
+            logger.error(f"Invalid resolution format '{res_str}': expected WxH (e.g., 1920x1080)")
+            sys.exit(1)
+        try:
+            w, h = int(parts[0]), int(parts[1])
+        except ValueError:
+            logger.error(f"Invalid resolution '{res_str}': width and height must be integers")
+            sys.exit(1)
+        if w % 8 != 0 or h % 8 != 0:
+            logger.error(f"Resolution {w}x{h} must be divisible by 8 (VAE spatial downsample factor)")
+            sys.exit(1)
+        resolutions.append((w, h))
+    
     precision_tag = "fp8" if args.fp8 else "fp16"
     
-    onnx_path = os.path.join(args.output_dir, f"seedvr2_vae_decoder_{shape_tag}.onnx")
-    engine_path = os.path.join(args.output_dir, f"seedvr2_vae_decoder_{shape_tag}_{precision_tag}.engine")
-    
-    # Step 1: Load VAE model
+    # Step 1: Load VAE model (once, reused for all resolutions)
     logger.info("=" * 60)
     logger.info("Step 1: Loading VAE model")
     logger.info("=" * 60)
     vae_model = load_vae_model(args.vae_path, device=args.device)
     
-    # Step 2: Export to ONNX
-    if not args.skip_onnx:
+    # Step 2-3: Export ONNX and build TRT engine for each resolution
+    for width, height in resolutions:
+        # Calculate latent shape from pixel resolution
+        # SeedVR2 VAE has spatial_downsample_factor=8, latent_channels=16
+        latent_h = height // 8
+        latent_w = width // 8
+        latent_shape = (1, 16, latent_h, latent_w)
+        
+        onnx_path = os.path.join(args.output_dir, f"seedvr2_vae_{width}x{height}.onnx")
+        engine_path = os.path.join(args.output_dir, f"seedvr2_vae_{width}x{height}_{precision_tag}.engine")
+        
         logger.info("=" * 60)
-        logger.info("Step 2: Exporting decoder to ONNX")
+        logger.info(f"Resolution: {width}x{height} (latent: {latent_w}x{latent_h})")
         logger.info("=" * 60)
-        export_to_onnx(vae_model, onnx_path, latent_shape=latent_shape, device=args.device)
-    else:
-        logger.info(f"Skipping ONNX export, using existing: {onnx_path}")
+        
+        # Step 2: Export to ONNX
+        if not args.skip_onnx:
+            logger.info(f"Step 2: Exporting decoder to ONNX ({width}x{height})")
+            export_to_onnx(vae_model, onnx_path, latent_shape=latent_shape, device=args.device)
+        else:
+            logger.info(f"Skipping ONNX export, using existing: {onnx_path}")
+        
+        # Step 3: Build TensorRT engine
+        logger.info(f"Step 3: Building TensorRT engine ({width}x{height})")
+        build_trt_engine(
+            onnx_path,
+            engine_path,
+            enable_fp8=args.fp8,
+            enable_fp16=True,
+            workspace_gb=args.workspace_gb,
+        )
+        
+        logger.info(f"  ONNX:   {onnx_path}")
+        logger.info(f"  Engine: {engine_path}")
     
     # Free VAE model from GPU
     del vae_model
     torch.cuda.empty_cache()
     
-    # Step 3: Build TensorRT engine
     logger.info("=" * 60)
-    logger.info("Step 3: Building TensorRT engine")
-    logger.info("=" * 60)
-    build_trt_engine(
-        onnx_path,
-        engine_path,
-        enable_fp8=args.fp8,
-        enable_fp16=True,
-        workspace_gb=args.workspace_gb,
-    )
-    
-    logger.info("=" * 60)
-    logger.info("DONE!")
-    logger.info(f"  ONNX:   {onnx_path}")
-    logger.info(f"  Engine: {engine_path}")
+    logger.info("DONE! All resolutions exported.")
     logger.info("")
-    logger.info("To use this engine in SeedVR2:")
+    logger.info("To use an engine in SeedVR2:")
     logger.info("  from src.optimization.trt_decoder import patch_vae_with_trt")
-    logger.info(f"  patch_vae_with_trt(vae_model, engine_path='{engine_path}')")
+    logger.info(f"  patch_vae_with_trt(vae_model, engine_path='<engine_path>')")
     logger.info("=" * 60)
 
 
