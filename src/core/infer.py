@@ -30,7 +30,7 @@ from ..optimization.performance import (
     optimized_channels_to_last,
     optimized_channels_to_second
 )
-from ..optimization.cuda_graph_vae import VaeDecodeGraphCache
+from ..optimization.cuda_graph_vae import VaeDecodeGraphCache, VaeEncodeGraphCache, DitGraphCache
 from ..models.dit_3b import na
 
 
@@ -53,8 +53,14 @@ class VideoDiffusionInfer():
         self.decode_tile_overlap = decode_tile_overlap
         self.tile_debug = tile_debug
         self.use_vae_decode_cuda_graph = use_vae_decode_cuda_graph
-        # CUDA Graph cache (created lazily when first needed)
+        self.use_vae_encode_cuda_graph = use_vae_decode_cuda_graph
+        self.use_dit_cuda_graph = use_vae_decode_cuda_graph
+        # CUDA Graph caches (created lazily when first needed)
         self._cuda_graph_cache: Optional[VaeDecodeGraphCache] = None
+        self._vae_encode_graph_cache: Optional[VaeEncodeGraphCache] = None
+        self._vae_decode_tile_graph_cache: Optional[VaeDecodeGraphCache] = None
+        self._vae_encode_tile_graph_cache: Optional[VaeEncodeGraphCache] = None
+        self._dit_graph_cache: Optional[DitGraphCache] = None
         
     def get_condition(self, latent: Tensor, latent_blur: Tensor, task: str) -> Tensor:
         t, h, w, c = latent.shape
@@ -118,6 +124,16 @@ class VideoDiffusionInfer():
 
     # -------------------------------- Helper ------------------------------- #
 
+    @staticmethod
+    def _empty_cuda_cache(device: Optional[torch.device]) -> None:
+        if (
+            device is not None
+            and isinstance(device, torch.device)
+            and device.type == "cuda"
+            and torch.cuda.is_available()
+        ):
+            torch.cuda.empty_cache()
+
     @torch.no_grad()
     def vae_encode(self, samples: List[Tensor]) -> List[Tensor]:
         """VAE encode with configured dtype - converts samples to latents with optional tiling"""
@@ -131,6 +147,7 @@ class VideoDiffusionInfer():
             except StopIteration:
                 # Fallback if VAE has no parameters (shouldn't happen)
                 device = get_device()
+            self._empty_cuda_cache(device)
             
             dtype = getattr(torch, self.config.vae.dtype)
             scale = self.config.vae.scaling_factor
@@ -158,35 +175,75 @@ class VideoDiffusionInfer():
                 except StopIteration:
                     vae_dtype = dtype  # Fallback
 
-                # Use autocast if VAE dtype differs from input dtype
-                # Skip autocast on MPS (only supports bf16, unified memory = no benefit)
-                # Instead, explicitly convert input to model dtype
-                if vae_dtype != sample.dtype:
-                    if device.type == 'mps':
-                        # MPS: explicit dtype conversion instead of autocast
-                        sample = sample.to(vae_dtype)
-                        if use_sample:
-                            latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size, 
-                                                    tile_overlap=self.encode_tile_overlap).latent
+                _use_cuda_graph = (
+                    self.use_vae_encode_cuda_graph
+                    and device.type == 'cuda'
+                    and VaeEncodeGraphCache.is_available()
+                )
+                if _use_cuda_graph and self._vae_encode_graph_cache is None:
+                    self._vae_encode_graph_cache = VaeEncodeGraphCache()
+
+                if _use_cuda_graph:
+                    _autocast_dtype = sample.dtype
+                    _device_type = device.type
+                    _vae = self.vae
+
+                    def _encode_fn(x: Tensor) -> Tensor:
+                        if vae_dtype != x.dtype and _device_type != 'mps':
+                            with torch.autocast(_device_type, _autocast_dtype, enabled=True):
+                                out = _vae.encode(
+                                    x, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
+                                    tile_overlap=self.encode_tile_overlap
+                                )
                         else:
-                            latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
-                                                tile_overlap=self.encode_tile_overlap).posterior.mode().squeeze(2)
-                    else:
-                        with torch.autocast(device.type, sample.dtype, enabled=True):
+                            x = x.to(vae_dtype) if (vae_dtype != x.dtype and _device_type == 'mps') else x
+                            out = _vae.encode(
+                                x, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
+                                tile_overlap=self.encode_tile_overlap
+                            )
+                        return out.latent if use_sample else out.posterior.mode().squeeze(2)
+
+                    try:
+                        latent = self._vae_encode_graph_cache.run(
+                            _encode_fn,
+                            sample,
+                            self.debug,
+                            graph_group="encode_tiled" if self.encode_tiled else "encode_full",
+                        )
+                    except Exception:
+                        self._vae_encode_graph_cache.reset()
+                        _use_cuda_graph = False
+
+                if not _use_cuda_graph:
+                    # Use autocast if VAE dtype differs from input dtype
+                    # Skip autocast on MPS (only supports bf16, unified memory = no benefit)
+                    # Instead, explicitly convert input to model dtype
+                    if vae_dtype != sample.dtype:
+                        if device.type == 'mps':
+                            # MPS: explicit dtype conversion instead of autocast
+                            sample = sample.to(vae_dtype)
                             if use_sample:
-                                latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size, 
+                                latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
                                                         tile_overlap=self.encode_tile_overlap).latent
                             else:
                                 latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
                                                     tile_overlap=self.encode_tile_overlap).posterior.mode().squeeze(2)
-                else:
-                    if use_sample:
-                        latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size, 
-                                                tile_overlap=self.encode_tile_overlap).latent
+                        else:
+                            with torch.autocast(device.type, sample.dtype, enabled=True):
+                                if use_sample:
+                                    latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
+                                                            tile_overlap=self.encode_tile_overlap).latent
+                                else:
+                                    latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
+                                                        tile_overlap=self.encode_tile_overlap).posterior.mode().squeeze(2)
                     else:
-                        # Deterministic vae encode, only used for i2v inference (optionally)
-                        latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
-                                            tile_overlap=self.encode_tile_overlap).posterior.mode().squeeze(2)
+                        if use_sample:
+                            latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
+                                                    tile_overlap=self.encode_tile_overlap).latent
+                        else:
+                            # Deterministic vae encode, only used for i2v inference (optionally)
+                            latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
+                                                tile_overlap=self.encode_tile_overlap).posterior.mode().squeeze(2)
 
                 latent = latent.unsqueeze(2) if latent.ndim == 4 else latent
                 latent = optimized_channels_to_last(latent)
@@ -233,6 +290,7 @@ class VideoDiffusionInfer():
                     device = get_device()
             elif not isinstance(device, torch.device):
                 device = torch.device(device)
+            self._empty_cuda_cache(device)
             
             dtype = getattr(torch, self.config.vae.dtype)
             scale = self.config.vae.scaling_factor
@@ -269,42 +327,91 @@ class VideoDiffusionInfer():
                 _use_cuda_graph = (
                     use_cuda_graph
                     and device.type == 'cuda'
-                    and not self.decode_tiled
                     and VaeDecodeGraphCache.is_available()
                 )
 
                 if _use_cuda_graph:
-                    # Lazy initialisation of per-runner graph cache
-                    if self._cuda_graph_cache is None:
-                        self._cuda_graph_cache = VaeDecodeGraphCache()
-
-                    # Build the decode callable that the graph will capture.
-                    # Autocast (if needed) is included inside the callable so
-                    # that it is active during both capture *and* conceptual
-                    # replay (the captured kernels already encode the chosen
-                    # precision, so autocast during replay is a no-op in terms
-                    # of CUDA ops but keeps the interface consistent).
-                    if vae_dtype != latent.dtype:
-                        _autocast_dtype = latent.dtype
-                        _device_type = device.type
-                        _vae = self.vae
-                        def _decode_fn(x: Tensor) -> Tensor:
-                            with torch.autocast(_device_type, _autocast_dtype, enabled=True):
-                                return _vae.decode(x, tiled=False).sample
-                    else:
-                        _vae = self.vae
-                        def _decode_fn(x: Tensor) -> Tensor:
-                            return _vae.decode(x, tiled=False).sample
-
-                    _prev_count = self._cuda_graph_cache._capture_count
                     try:
-                        sample = self._cuda_graph_cache.run(_decode_fn, latent, self.debug)
+                        # Tiled path: capture graph once for slicing_decode(tile) and
+                        # replay for each same-shape tile processed by tiled_decode.
+                        if self.decode_tiled and hasattr(self.vae, "slicing_decode"):
+                            if self._vae_decode_tile_graph_cache is None:
+                                self._vae_decode_tile_graph_cache = VaeDecodeGraphCache()
+
+                            _autocast_dtype = latent.dtype
+                            _device_type = device.type
+                            _vae = self.vae
+                            _original_slicing_decode = _vae.slicing_decode
+
+                            def _decode_tile_fn(tile_latent: Tensor) -> Tensor:
+                                if vae_dtype != tile_latent.dtype and _device_type != 'mps':
+                                    with torch.autocast(_device_type, _autocast_dtype, enabled=True):
+                                        return _original_slicing_decode(tile_latent)
+                                tile_latent = tile_latent.to(vae_dtype) if (vae_dtype != tile_latent.dtype and _device_type == 'mps') else tile_latent
+                                return _original_slicing_decode(tile_latent)
+
+                            def _graph_slicing_decode(tile_latent: Tensor) -> Tensor:
+                                return self._vae_decode_tile_graph_cache.run(
+                                    _decode_tile_fn,
+                                    tile_latent,
+                                    self.debug,
+                                    graph_group=f"tile_{self.decode_tile_size}_{self.decode_tile_overlap}",
+                                )
+
+                            _vae.slicing_decode = _graph_slicing_decode
+                            try:
+                                sample = _vae.decode(
+                                    latent,
+                                    tiled=True, tile_size=self.decode_tile_size,
+                                    tile_overlap=self.decode_tile_overlap
+                                ).sample
+                            finally:
+                                _vae.slicing_decode = _original_slicing_decode
+                        else:
+                            # Lazy initialisation of per-runner full-latent graph cache
+                            if self._cuda_graph_cache is None:
+                                self._cuda_graph_cache = VaeDecodeGraphCache()
+                            if vae_dtype != latent.dtype:
+                                _autocast_dtype = latent.dtype
+                                _device_type = device.type
+                                _vae = self.vae
+
+                                def _decode_fn(x: Tensor) -> Tensor:
+                                    with torch.autocast(_device_type, _autocast_dtype, enabled=True):
+                                        return _vae.decode(
+                                            x,
+                                            tiled=False, tile_size=self.decode_tile_size,
+                                            tile_overlap=self.decode_tile_overlap
+                                        ).sample
+                            else:
+                                _vae = self.vae
+
+                                def _decode_fn(x: Tensor) -> Tensor:
+                                    return _vae.decode(
+                                        x,
+                                        tiled=False, tile_size=self.decode_tile_size,
+                                        tile_overlap=self.decode_tile_overlap
+                                    ).sample
+
+                            _prev_count = self._cuda_graph_cache._capture_count
+                            sample = self._cuda_graph_cache.run(_decode_fn, latent, self.debug)
+                            if self._cuda_graph_cache._capture_count == 1 and _prev_count == 0:
+                                print(
+                                    f"[SeedVR] CUDA Graph VAE Decode Enabled "
+                                    f"(shape={latent.shape}, dtype={latent.dtype}, "
+                                    f"device={latent.device})"
+                                )
+
                         # Print a visible confirmation the first time the graph is captured
-                        if self._cuda_graph_cache._capture_count == 1 and _prev_count == 0:
+                        if (
+                            self.decode_tiled
+                            and self._vae_decode_tile_graph_cache is not None
+                            and self._vae_decode_tile_graph_cache._capture_count == 1
+                        ):
                             print(
-                                f"[SeedVR] CUDA Graph VAE Decode Enabled "
-                                f"(shape={latent.shape}, dtype={latent.dtype}, "
-                                f"device={latent.device})"
+                                f"[SeedVR] CUDA Graph VAE Tiled Decode Enabled "
+                                f"(tile={self.decode_tile_size}, overlap={self.decode_tile_overlap}, "
+                                f"dtype={latent.dtype}, device={latent.device})"
                             )
                     except Exception as _cg_exc:
                         _msg = (
@@ -317,7 +424,10 @@ class VideoDiffusionInfer():
                             import logging
                             logging.getLogger(__name__).warning(_msg)
                         # Fall back and invalidate so next call retries
-                        self._cuda_graph_cache.reset()
+                        if self._cuda_graph_cache is not None:
+                            self._cuda_graph_cache.reset()
+                        if self._vae_decode_tile_graph_cache is not None:
+                            self._vae_decode_tile_graph_cache.reset()
                         _use_cuda_graph = False
 
                 if not _use_cuda_graph:
@@ -435,24 +545,64 @@ class VideoDiffusionInfer():
         # Flatten.
         latents, latents_shapes = na.flatten(noises)
         latents_cond, _ = na.flatten(conditions)
+
+        # Phase transition (VAE -> DiT): free cached CUDA allocator blocks.
+        self._empty_cuda_cache(latents.device if torch.is_tensor(latents) else None)
+
+        _use_dit_cuda_graph = (
+            self.use_dit_cuda_graph
+            and torch.is_tensor(latents)
+            and latents.device.type == 'cuda'
+            and DitGraphCache.is_available()
+        )
+        if _use_dit_cuda_graph and self._dit_graph_cache is None:
+            self._dit_graph_cache = DitGraphCache()
+
+        def _text_cache_key(txt):
+            if isinstance(txt, list):
+                return tuple(
+                    (tuple(t.shape), t.dtype, str(t.device))
+                    for t in txt if torch.is_tensor(t)
+                )
+            if torch.is_tensor(txt):
+                return (tuple(txt.shape), txt.dtype, str(txt.device))
+            return str(type(txt))
+
+        def _dit_forward(args, txt_embeds, txt_shapes, graph_group: str) -> Tensor:
+            vid = torch.cat([args.x_t, latents_cond], dim=-1)
+            timestep = args.t.repeat(batch_size)
+            if _use_dit_cuda_graph:
+                _dit = self.dit
+
+                def _dit_fn(vid_input: Tensor, t_input: Tensor) -> Tensor:
+                    return _dit(
+                        vid=vid_input,
+                        txt=txt_embeds,
+                        vid_shape=latents_shapes,
+                        txt_shape=txt_shapes,
+                        timestep=t_input,
+                    ).vid_sample
+
+                return self._dit_graph_cache.run(
+                    _dit_fn,
+                    vid,
+                    timestep,
+                    self.debug,
+                    graph_group=f"{graph_group}_{_text_cache_key(txt_embeds)}_{tuple(latents_shapes.shape)}",
+                )
+            return self.dit(
+                vid=vid,
+                txt=txt_embeds,
+                vid_shape=latents_shapes,
+                txt_shape=txt_shapes,
+                timestep=timestep,
+            ).vid_sample
         
         latents = self.sampler.sample(
             x=latents,
             f=lambda args: classifier_free_guidance_dispatcher(
-                pos=lambda: self.dit(
-                    vid=torch.cat([args.x_t, latents_cond], dim=-1),
-                    txt=text_pos_embeds,
-                    vid_shape=latents_shapes,
-                    txt_shape=text_pos_shapes,
-                    timestep=args.t.repeat(batch_size),
-                ).vid_sample,
-                neg=lambda: self.dit(
-                    vid=torch.cat([args.x_t, latents_cond], dim=-1),
-                    txt=text_neg_embeds,
-                    vid_shape=latents_shapes,
-                    txt_shape=text_neg_shapes,
-                    timestep=args.t.repeat(batch_size),
-                ).vid_sample,
+                pos=lambda: _dit_forward(args, text_pos_embeds, text_pos_shapes, "pos"),
+                neg=lambda: _dit_forward(args, text_neg_embeds, text_neg_shapes, "neg"),
                 scale=(
                     cfg_scale
                     if (args.i + 1) / len(self.sampler.timesteps)
