@@ -897,6 +897,7 @@ def _configure_runner_settings(
     ):
         runner._cuda_graph_cache.reset()
     runner.use_vae_decode_cuda_graph = vae_decode_cuda_graph
+    print(f"[SeedVR] CUDA Graph status: {vae_decode_cuda_graph}")
     
     # Store the new configs temporarily for later comparison
     # Don't set them as attributes yet - let the update functions handle that

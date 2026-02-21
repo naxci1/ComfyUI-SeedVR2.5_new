@@ -55,7 +55,6 @@ class VideoDiffusionInfer():
         self.use_vae_decode_cuda_graph = use_vae_decode_cuda_graph
         # CUDA Graph cache (created lazily when first needed)
         self._cuda_graph_cache: Optional[VaeDecodeGraphCache] = None
-        print(f"[SeedVR] CUDA Graph status: {self.use_vae_decode_cuda_graph}")
         
     def get_condition(self, latent: Tensor, latent_blur: Tensor, task: str) -> Tensor:
         t, h, w, c = latent.shape
