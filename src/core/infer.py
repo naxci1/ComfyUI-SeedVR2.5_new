@@ -41,7 +41,9 @@ class VideoDiffusionInfer():
                  decode_tiled: bool = False, decode_tile_size: Tuple[int, int] = (512, 512),
                  decode_tile_overlap: Tuple[int, int] = (64, 64),
                  tile_debug: str = "false",
-                 use_vae_decode_cuda_graph: bool = False):
+                 use_vae_decode_cuda_graph: bool = False,
+                 use_vae_encode_cuda_graph: Optional[bool] = None,
+                 use_dit_cuda_graph: Optional[bool] = None):
         self.config = config
         self.debug = debug
         # Store separate encode and decode tiling parameters
@@ -53,13 +55,20 @@ class VideoDiffusionInfer():
         self.decode_tile_overlap = decode_tile_overlap
         self.tile_debug = tile_debug
         self.use_vae_decode_cuda_graph = use_vae_decode_cuda_graph
-        self.use_vae_encode_cuda_graph = use_vae_decode_cuda_graph
-        self.use_dit_cuda_graph = use_vae_decode_cuda_graph
+        self.use_vae_encode_cuda_graph = (
+            use_vae_decode_cuda_graph
+            if use_vae_encode_cuda_graph is None
+            else use_vae_encode_cuda_graph
+        )
+        self.use_dit_cuda_graph = (
+            use_vae_decode_cuda_graph
+            if use_dit_cuda_graph is None
+            else use_dit_cuda_graph
+        )
         # CUDA Graph caches (created lazily when first needed)
         self._cuda_graph_cache: Optional[VaeDecodeGraphCache] = None
         self._vae_encode_graph_cache: Optional[VaeEncodeGraphCache] = None
         self._vae_decode_tile_graph_cache: Optional[VaeDecodeGraphCache] = None
-        self._vae_encode_tile_graph_cache: Optional[VaeEncodeGraphCache] = None
         self._dit_graph_cache: Optional[DitGraphCache] = None
         
     def get_condition(self, latent: Tensor, latent_blur: Tensor, task: str) -> Tensor:
@@ -355,7 +364,7 @@ class VideoDiffusionInfer():
                                     _decode_tile_fn,
                                     tile_latent,
                                     self.debug,
-                                    graph_group=f"tile_{self.decode_tile_size}_{self.decode_tile_overlap}",
+                                    graph_group=f"tile_{tuple(self.decode_tile_size)}_{tuple(self.decode_tile_overlap)}",
                                 )
 
                             _vae.slicing_decode = _graph_slicing_decode
@@ -588,7 +597,7 @@ class VideoDiffusionInfer():
                     vid,
                     timestep,
                     self.debug,
-                    graph_group=f"{graph_group}_{_text_cache_key(txt_embeds)}_{tuple(latents_shapes.shape)}",
+                    graph_group=graph_group,
                 )
             return self.dit(
                 vid=vid,
@@ -597,12 +606,16 @@ class VideoDiffusionInfer():
                 txt_shape=txt_shapes,
                 timestep=timestep,
             ).vid_sample
-        
+
+        _text_pos_key = _text_cache_key(text_pos_embeds)
+        _text_neg_key = _text_cache_key(text_neg_embeds)
+        _latents_shape_key = tuple(latents_shapes.shape)
+
         latents = self.sampler.sample(
             x=latents,
             f=lambda args: classifier_free_guidance_dispatcher(
-                pos=lambda: _dit_forward(args, text_pos_embeds, text_pos_shapes, "pos"),
-                neg=lambda: _dit_forward(args, text_neg_embeds, text_neg_shapes, "neg"),
+                pos=lambda: _dit_forward(args, text_pos_embeds, text_pos_shapes, f"pos_{_text_pos_key}_{_latents_shape_key}"),
+                neg=lambda: _dit_forward(args, text_neg_embeds, text_neg_shapes, f"neg_{_text_neg_key}_{_latents_shape_key}"),
                 scale=(
                     cfg_scale
                     if (args.i + 1) / len(self.sampler.timesteps)

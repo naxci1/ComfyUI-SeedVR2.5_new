@@ -4,7 +4,7 @@ CUDA Graph helpers for SeedVR2 VAE and DiT execution paths.
 
 import logging
 import time
-from typing import Callable, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 import torch
 
@@ -30,7 +30,7 @@ class _CudaGraphCacheBase:
         inputs: Tuple[torch.Tensor, ...],
         *,
         key_extra: Tuple = (),
-        debug=None,
+        debug: Optional[Any] = None,
     ):
         if not isinstance(inputs, tuple):
             inputs = (inputs,)
@@ -69,7 +69,7 @@ class _CudaGraphCacheBase:
         fn: Callable[..., torch.Tensor],
         inputs: Tuple[torch.Tensor, ...],
         key: Tuple,
-        debug=None,
+        debug: Optional[Any] = None,
     ) -> None:
         shape_str = ", ".join(str(tuple(x.shape)) for x in inputs)
         try:
@@ -104,7 +104,7 @@ class _CudaGraphCacheBase:
             logger.warning(err)
             raise RuntimeError(err) from exc
 
-    def _invalidate(self, debug=None) -> None:
+    def _invalidate(self, debug: Optional[Any] = None) -> None:
         if self._graph is not None:
             if debug is not None:
                 debug.log(
@@ -119,7 +119,7 @@ class _CudaGraphCacheBase:
         self._graph_key = None
 
     @staticmethod
-    def _clone_output(output):
+    def _clone_output(output: Any) -> Any:
         if torch.is_tensor(output):
             return output.clone()
         if isinstance(output, tuple):
