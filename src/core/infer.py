@@ -55,6 +55,7 @@ class VideoDiffusionInfer():
         self.use_vae_decode_cuda_graph = use_vae_decode_cuda_graph
         # CUDA Graph cache (created lazily when first needed)
         self._cuda_graph_cache: Optional[VaeDecodeGraphCache] = None
+        print(f"[SeedVR] CUDA Graph status: {self.use_vae_decode_cuda_graph}")
         
     def get_condition(self, latent: Tensor, latent_blur: Tensor, task: str) -> Tensor:
         t, h, w, c = latent.shape
@@ -279,8 +280,16 @@ class VideoDiffusionInfer():
                         def _decode_fn(x: Tensor) -> Tensor:
                             return _vae.decode(x, tiled=False).sample
 
+                    _prev_count = self._cuda_graph_cache._capture_count
                     try:
                         sample = self._cuda_graph_cache.run(_decode_fn, latent, self.debug)
+                        # Print a visible confirmation the first time the graph is captured
+                        if self._cuda_graph_cache._capture_count == 1 and _prev_count == 0:
+                            print(
+                                f"[SeedVR] CUDA Graph VAE Decode Enabled "
+                                f"(shape={latent.shape}, dtype={latent.dtype}, "
+                                f"device={latent.device})"
+                            )
                     except Exception as _cg_exc:
                         _msg = (
                             f"CUDA Graph decode failed ({_cg_exc!r}); "

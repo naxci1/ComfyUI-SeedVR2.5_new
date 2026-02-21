@@ -129,7 +129,12 @@ class VaeDecodeGraphCache:
         key: Tuple,
         debug=None,
     ) -> None:
-        """Warmup then capture a new CUDA Graph for *latent*'s shape/dtype/device."""
+        """Warmup then capture a new CUDA Graph for *latent*'s shape/dtype/device.
+
+        Raises:
+            RuntimeError: If warmup or graph capture fails (caller should fall back
+                to eager decode and call ``reset()``).
+        """
         shape_str = str(latent.shape)
 
         if debug is not None:
@@ -142,42 +147,51 @@ class VaeDecodeGraphCache:
         else:
             logger.info("CUDA Graph: warmup for shape %s", shape_str)
 
-        # Warmup: run on a side stream so we don't pollute the default stream.
-        warmup_stream = torch.cuda.Stream(device=latent.device)
-        with torch.cuda.stream(warmup_stream):
-            for _ in range(2):
-                _ = decode_fn(latent)
-        torch.cuda.synchronize(latent.device)
+        try:
+            # Warmup: run on a side stream so we don't pollute the default stream.
+            warmup_stream = torch.cuda.Stream(device=latent.device)
+            with torch.cuda.stream(warmup_stream):
+                for _ in range(2):
+                    _ = decode_fn(latent)
+            torch.cuda.synchronize(latent.device)
 
-        # Capture
-        if debug is not None:
-            debug.log(
-                f"CUDA Graph: capturing for shape {shape_str}",
-                category="perf",
-                indent_level=2,
+            # Capture
+            if debug is not None:
+                debug.log(
+                    f"CUDA Graph: capturing for shape {shape_str}",
+                    category="perf",
+                    indent_level=2,
+                )
+            else:
+                logger.info("CUDA Graph: capturing for shape %s", shape_str)
+
+            t0 = time.perf_counter()
+            self._static_input = latent.clone()
+            self._graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self._graph, stream=torch.cuda.Stream(device=latent.device)):
+                self._static_output = decode_fn(self._static_input)
+            torch.cuda.synchronize(latent.device)
+            self._graph_key = key
+            self._capture_count += 1
+
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            msg = (
+                f"CUDA Graph: captured graph #{self._capture_count} in "
+                f"{elapsed_ms:.1f} ms "
+                f"(shape={latent.shape}, dtype={latent.dtype})"
             )
-        else:
-            logger.info("CUDA Graph: capturing for shape %s", shape_str)
+            if debug is not None:
+                debug.log(msg, category="perf", indent_level=2)
+            else:
+                logger.info(msg)
 
-        t0 = time.perf_counter()
-        self._static_input = latent.clone()
-        self._graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self._graph, stream=torch.cuda.Stream(device=latent.device)):
-            self._static_output = decode_fn(self._static_input)
-        torch.cuda.synchronize(latent.device)
-        self._graph_key = key
-        self._capture_count += 1
-
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
-        msg = (
-            f"CUDA Graph: captured graph #{self._capture_count} in "
-            f"{elapsed_ms:.1f} ms "
-            f"(shape={latent.shape}, dtype={latent.dtype})"
-        )
-        if debug is not None:
-            debug.log(msg, category="perf", indent_level=2)
-        else:
-            logger.info(msg)
+        except Exception as exc:
+            # Clean up any partially-initialised state so the object stays consistent.
+            self._invalidate()
+            err_msg = f"[SeedVR] CUDA Graph capture failed ({exc!r}); falling back to eager decode."
+            print(err_msg)
+            logger.warning(err_msg)
+            raise RuntimeError(err_msg) from exc
 
     def _invalidate(self, debug=None) -> None:
         """Free the current graph and static tensors."""

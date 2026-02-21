@@ -126,6 +126,23 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                         "Only works when respective tiling is enabled."
                     )
                 ),
+                io.Boolean.Input("decode_cuda_graph",
+                    default=False,
+                    optional=True,
+                    tooltip=(
+                        "Enable CUDA Graph capture/replay for VAE decode (default: False).\n"
+                        "Reduces CUDA kernel-launch overhead on NVIDIA GPUs; "
+                        "useful when torch.compile is unavailable (e.g. with SageAttention2).\n"
+                        "\n"
+                        "Requirements:\n"
+                        "• NVIDIA GPU with CUDA support only (no-op on CPU / Apple Silicon)\n"
+                        "• Incompatible with decode_tiled (variable tile shapes prevent graph reuse)\n"
+                        "• Two warmup forward passes are run before the graph is captured\n"
+                        "• Graph is automatically re-captured when latent shape or dtype changes\n"
+                        "\n"
+                        "Recommended: enable uniform_batch_size in the upscaler node for stable shapes."
+                    )
+                ),
                 io.Combo.Input("offload_device",
                     options=get_device_list(include_none=True, include_cpu=True),
                     default="none",
@@ -167,6 +184,7 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                      encode_tile_size: int = 512, encode_tile_overlap: int = 64,
                      decode_tiled: bool = False, decode_tile_size: int = 512, 
                      decode_tile_overlap: int = 64, tile_debug: str = "false",
+                     decode_cuda_graph: bool = False,
                      torch_compile_args: Dict[str, Any] = None
                      ) -> io.NodeOutput:
         """
@@ -184,6 +202,7 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
             decode_tile_size: Tile size for decoding
             decode_tile_overlap: Tile overlap for decoding
             tile_debug: Tile visualization mode (false/encode/decode)
+            decode_cuda_graph: Enable CUDA Graph capture/replay for VAE decode
             torch_compile_args: Optional torch.compile configuration from settings node
             
         Returns:
@@ -213,6 +232,7 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
             "decode_tile_size": decode_tile_size,
             "decode_tile_overlap": decode_tile_overlap,
             "tile_debug": tile_debug,
+            "decode_cuda_graph": decode_cuda_graph,
             "torch_compile_args": torch_compile_args,
             "node_id": get_executing_context().node_id,
         }
