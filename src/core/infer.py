@@ -208,14 +208,14 @@ class VideoDiffusionInfer():
     def vae_decode(
         self,
         latents: List[Tensor],
-        device: Optional[Union[torch.device, str, bool]] = None,
+        device: Optional[Union[torch.device, str]] = None,
         use_cuda_graph: Optional[bool] = None
     ) -> List[Tensor]:
         """VAE decode with configured dtype - converts latents to samples with optional tiling"""
         samples = []
         if len(latents) > 0:
-            # Backward compatibility for older positional usage:
-            # vae_decode(latents, use_cuda_graph)
+            # Backward compatibility for older positional usage where a boolean
+            # was passed as the second positional argument.
             if isinstance(device, bool):
                 if use_cuda_graph is None:
                     use_cuda_graph = device
