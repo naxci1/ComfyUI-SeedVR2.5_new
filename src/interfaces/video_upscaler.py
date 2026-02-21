@@ -372,6 +372,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
         decode_tile_size = vae.get("decode_tile_size", 512)
         decode_tile_overlap = vae.get("decode_tile_overlap", 64)
         tile_debug = vae.get("tile_debug", False)
+        vae_decode_cuda_graph = vae.get("decode_cuda_graph", False)
 
         # TorchCompile args (optional connection, can be None)
         dit_torch_compile_args = dit.get("torch_compile_args")
@@ -433,7 +434,8 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                 tile_debug=tile_debug,
                 attention_mode=attention_mode,
                 torch_compile_args_dit=dit_torch_compile_args,
-                torch_compile_args_vae=vae_torch_compile_args
+                torch_compile_args_vae=vae_torch_compile_args,
+                vae_decode_cuda_graph=vae_decode_cuda_graph
             )
 
             # Store cache context in ctx for use in generation phases

@@ -30,6 +30,7 @@ from ..optimization.performance import (
     optimized_channels_to_last,
     optimized_channels_to_second
 )
+from ..optimization.cuda_graph_vae import VaeDecodeGraphCache
 from ..models.dit_3b import na
 
 
@@ -39,7 +40,8 @@ class VideoDiffusionInfer():
                  encode_tile_overlap: Tuple[int, int] = (64, 64),
                  decode_tiled: bool = False, decode_tile_size: Tuple[int, int] = (512, 512),
                  decode_tile_overlap: Tuple[int, int] = (64, 64),
-                 tile_debug: str = "false"):
+                 tile_debug: str = "false",
+                 use_vae_decode_cuda_graph: bool = False):
         self.config = config
         self.debug = debug
         # Store separate encode and decode tiling parameters
@@ -50,6 +52,9 @@ class VideoDiffusionInfer():
         self.decode_tile_size = decode_tile_size
         self.decode_tile_overlap = decode_tile_overlap
         self.tile_debug = tile_debug
+        self.use_vae_decode_cuda_graph = use_vae_decode_cuda_graph
+        # CUDA Graph cache (created lazily when first needed)
+        self._cuda_graph_cache: Optional[VaeDecodeGraphCache] = None
         
     def get_condition(self, latent: Tensor, latent_blur: Tensor, task: str) -> Tensor:
         t, h, w, c = latent.shape
@@ -240,30 +245,81 @@ class VideoDiffusionInfer():
                 except StopIteration:
                     vae_dtype = dtype  # Fallback
 
-                # Use autocast if VAE dtype differs from latent dtype
-                # Skip autocast on MPS (only supports bf16, unified memory = no benefit)
-                if vae_dtype != latent.dtype:
-                    if device.type == 'mps':
-                        # MPS: explicit dtype conversion instead of autocast
-                        latent = latent.to(vae_dtype)
-                        sample = self.vae.decode(
-                            latent,
-                            tiled=self.decode_tiled, tile_size=self.decode_tile_size,
-                            tile_overlap=self.decode_tile_overlap
-                        ).sample
+                # Determine whether CUDA Graph decode is applicable for this latent.
+                # Requirements: feature enabled, CUDA device, tiling disabled.
+                # CUDA Graphs require fixed tensor shapes, so tiled decode (variable
+                # tile sizes) is incompatible and will fall back to the standard path.
+                _use_cuda_graph = (
+                    self.use_vae_decode_cuda_graph
+                    and device.type == 'cuda'
+                    and not self.decode_tiled
+                    and VaeDecodeGraphCache.is_available()
+                )
+
+                if _use_cuda_graph:
+                    # Lazy initialisation of per-runner graph cache
+                    if self._cuda_graph_cache is None:
+                        self._cuda_graph_cache = VaeDecodeGraphCache()
+
+                    # Build the decode callable that the graph will capture.
+                    # Autocast (if needed) is included inside the callable so
+                    # that it is active during both capture *and* conceptual
+                    # replay (the captured kernels already encode the chosen
+                    # precision, so autocast during replay is a no-op in terms
+                    # of CUDA ops but keeps the interface consistent).
+                    if vae_dtype != latent.dtype:
+                        _autocast_dtype = latent.dtype
+                        _device_type = device.type
+                        _vae = self.vae
+                        def _decode_fn(x: Tensor) -> Tensor:
+                            with torch.autocast(_device_type, _autocast_dtype, enabled=True):
+                                return _vae.decode(x, tiled=False).sample
                     else:
-                        with torch.autocast(device.type, latent.dtype, enabled=True):
+                        _vae = self.vae
+                        def _decode_fn(x: Tensor) -> Tensor:
+                            return _vae.decode(x, tiled=False).sample
+
+                    try:
+                        sample = self._cuda_graph_cache.run(_decode_fn, latent, self.debug)
+                    except Exception as _cg_exc:
+                        _msg = (
+                            f"CUDA Graph decode failed ({_cg_exc!r}); "
+                            "falling back to standard decode"
+                        )
+                        if self.debug is not None:
+                            self.debug.log(_msg, category="perf", indent_level=2)
+                        else:
+                            import logging
+                            logging.getLogger(__name__).warning(_msg)
+                        # Fall back and invalidate so next call retries
+                        self._cuda_graph_cache.reset()
+                        _use_cuda_graph = False
+
+                if not _use_cuda_graph:
+                    # Use autocast if VAE dtype differs from latent dtype
+                    # Skip autocast on MPS (only supports bf16, unified memory = no benefit)
+                    if vae_dtype != latent.dtype:
+                        if device.type == 'mps':
+                            # MPS: explicit dtype conversion instead of autocast
+                            latent = latent.to(vae_dtype)
                             sample = self.vae.decode(
                                 latent,
                                 tiled=self.decode_tiled, tile_size=self.decode_tile_size,
                                 tile_overlap=self.decode_tile_overlap
                             ).sample
-                else:
-                    sample = self.vae.decode(
-                        latent,
-                        tiled=self.decode_tiled, tile_size=self.decode_tile_size,
-                        tile_overlap=self.decode_tile_overlap
-                    ).sample
+                        else:
+                            with torch.autocast(device.type, latent.dtype, enabled=True):
+                                sample = self.vae.decode(
+                                    latent,
+                                    tiled=self.decode_tiled, tile_size=self.decode_tile_size,
+                                    tile_overlap=self.decode_tile_overlap
+                                ).sample
+                    else:
+                        sample = self.vae.decode(
+                            latent,
+                            tiled=self.decode_tiled, tile_size=self.decode_tile_size,
+                            tile_overlap=self.decode_tile_overlap
+                        ).sample
 
                 if hasattr(self.vae, "postprocess"):
                     sample = self.vae.postprocess(sample)
