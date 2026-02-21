@@ -179,13 +179,12 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
         )
     
     @classmethod
-    def execute(cls, model: str, device: str, offload_device: str = "none",
-                     cache_model: bool = False, encode_tiled: bool = False,
+    def execute(cls, model: str, device: str, encode_tiled: bool = False,
                      encode_tile_size: int = 512, encode_tile_overlap: int = 64,
-                     decode_tiled: bool = False, decode_tile_size: int = 512, 
+                     decode_tiled: bool = False, decode_tile_size: int = 512,
                      decode_tile_overlap: int = 64, tile_debug: str = "false",
-                     decode_cuda_graph: bool = False,
-                     torch_compile_args: Dict[str, Any] = None
+                     decode_cuda_graph: bool = False, offload_device: str = "none",
+                     cache_model: bool = False, torch_compile_args: Dict[str, Any] = None
                      ) -> io.NodeOutput:
         """
         Create VAE model configuration for SeedVR2 main node

@@ -205,17 +205,34 @@ class VideoDiffusionInfer():
     
 
     @torch.no_grad()
-    def vae_decode(self, latents: List[Tensor]) -> List[Tensor]:
+    def vae_decode(
+        self,
+        latents: List[Tensor],
+        device: Optional[Union[torch.device, str, bool]] = None,
+        use_cuda_graph: Optional[bool] = None
+    ) -> List[Tensor]:
         """VAE decode with configured dtype - converts latents to samples with optional tiling"""
         samples = []
         if len(latents) > 0:
-            # Use VAE model's current device
-            # This ensures consistency with where the VAE model is loaded
-            try:
-                device = next(self.vae.parameters()).device
-            except StopIteration:
-                # Fallback if VAE has no parameters (shouldn't happen)
-                device = get_device()
+            # Backward compatibility for older positional usage:
+            # vae_decode(latents, use_cuda_graph)
+            if isinstance(device, bool):
+                if use_cuda_graph is None:
+                    use_cuda_graph = device
+                device = None
+
+            if use_cuda_graph is None:
+                use_cuda_graph = self.use_vae_decode_cuda_graph
+
+            # Use explicit device when provided, otherwise VAE model's current device
+            if device is None:
+                try:
+                    device = next(self.vae.parameters()).device
+                except StopIteration:
+                    # Fallback if VAE has no parameters (shouldn't happen)
+                    device = get_device()
+            elif not isinstance(device, torch.device):
+                device = torch.device(device)
             
             dtype = getattr(torch, self.config.vae.dtype)
             scale = self.config.vae.scaling_factor
@@ -250,7 +267,7 @@ class VideoDiffusionInfer():
                 # CUDA Graphs require fixed tensor shapes, so tiled decode (variable
                 # tile sizes) is incompatible and will fall back to the standard path.
                 _use_cuda_graph = (
-                    self.use_vae_decode_cuda_graph
+                    use_cuda_graph
                     and device.type == 'cuda'
                     and not self.decode_tiled
                     and VaeDecodeGraphCache.is_available()
