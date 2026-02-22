@@ -75,7 +75,7 @@ class _CudaGraphCacheBase:
         try:
             warmup_stream = torch.cuda.Stream(device=inputs[0].device)
             with torch.cuda.stream(warmup_stream):
-                for _ in range(getattr(self, "_warmup_steps", 2)):
+                for _ in range(getattr(self, "warmup_steps", getattr(self, "_warmup_steps", 2))):
                     _ = fn(*inputs)
             torch.cuda.synchronize(inputs[0].device)
 

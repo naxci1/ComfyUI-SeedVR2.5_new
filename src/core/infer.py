@@ -191,7 +191,7 @@ class VideoDiffusionInfer():
                 )
                 if _use_cuda_graph and self._vae_encode_graph_cache is None:
                     self._vae_encode_graph_cache = VaeEncodeGraphCache()
-                    self._vae_encode_graph_cache._warmup_steps = 1
+                    self._vae_encode_graph_cache.warmup_steps = 1
 
                 if _use_cuda_graph:
                     _autocast_dtype = sample.dtype
@@ -459,7 +459,15 @@ class VideoDiffusionInfer():
                             self._cuda_graph_cache.reset()
                         if self._vae_decode_tile_graph_cache is not None:
                             self._vae_decode_tile_graph_cache.reset()
-                        _oom_during_capture = "out of memory" in str(_cg_exc).lower()
+                        _exc_l = str(_cg_exc).lower()
+                        _oom_type = hasattr(torch.cuda, "OutOfMemoryError") and isinstance(
+                            _cg_exc, torch.cuda.OutOfMemoryError
+                        )
+                        _oom_during_capture = _oom_type or (
+                            "out of memory" in _exc_l
+                            or "memory allocation" in _exc_l
+                            or " oom" in f" {_exc_l}"
+                        )
                         _fallback_graphed_ok = False
                         if (
                             _oom_during_capture
