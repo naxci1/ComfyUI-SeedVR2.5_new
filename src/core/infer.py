@@ -191,6 +191,7 @@ class VideoDiffusionInfer():
                 )
                 if _use_cuda_graph and self._vae_encode_graph_cache is None:
                     self._vae_encode_graph_cache = VaeEncodeGraphCache()
+                    self._vae_encode_graph_cache._warmup_steps = 1
 
                 if _use_cuda_graph:
                     _autocast_dtype = sample.dtype
@@ -329,6 +330,27 @@ class VideoDiffusionInfer():
                 except StopIteration:
                     vae_dtype = dtype  # Fallback
 
+                def _decode_eager(x: Tensor) -> Tensor:
+                    if vae_dtype != x.dtype:
+                        if device.type == 'mps':
+                            x = x.to(vae_dtype)
+                            return self.vae.decode(
+                                x,
+                                tiled=self.decode_tiled, tile_size=self.decode_tile_size,
+                                tile_overlap=self.decode_tile_overlap
+                            ).sample
+                        with torch.autocast(device.type, x.dtype, enabled=True):
+                            return self.vae.decode(
+                                x,
+                                tiled=self.decode_tiled, tile_size=self.decode_tile_size,
+                                tile_overlap=self.decode_tile_overlap
+                            ).sample
+                    return self.vae.decode(
+                        x,
+                        tiled=self.decode_tiled, tile_size=self.decode_tile_size,
+                        tile_overlap=self.decode_tile_overlap
+                    ).sample
+
                 # Determine whether CUDA Graph decode is applicable for this latent.
                 # Requirements: feature enabled, CUDA device, tiling disabled.
                 # CUDA Graphs require fixed tensor shapes, so tiled decode (variable
@@ -437,33 +459,35 @@ class VideoDiffusionInfer():
                             self._cuda_graph_cache.reset()
                         if self._vae_decode_tile_graph_cache is not None:
                             self._vae_decode_tile_graph_cache.reset()
-                        _use_cuda_graph = False
+                        _oom_during_capture = "out of memory" in str(_cg_exc).lower()
+                        _fallback_graphed_ok = False
+                        if (
+                            _oom_during_capture
+                            and device.type == 'cuda'
+                            and hasattr(torch.cuda, "make_graphed_callables")
+                        ):
+                            try:
+                                # Clear allocator state before attempting alternate graph path.
+                                self._empty_cuda_cache(device)
+                                _decode_graphed = torch.cuda.make_graphed_callables(
+                                    _decode_eager,
+                                    (latent,),
+                                    pool=torch.cuda.graph_pool_handle(),
+                                )
+                                sample = _decode_graphed(latent)
+                                _fallback_graphed_ok = True
+                            except Exception as _mgc_exc:
+                                if self.debug is not None:
+                                    self.debug.log(
+                                        f"make_graphed_callables fallback failed ({_mgc_exc!r}); "
+                                        "falling back to eager decode",
+                                        category="perf",
+                                        indent_level=2,
+                                    )
+                        _use_cuda_graph = _fallback_graphed_ok
 
                 if not _use_cuda_graph:
-                    # Use autocast if VAE dtype differs from latent dtype
-                    # Skip autocast on MPS (only supports bf16, unified memory = no benefit)
-                    if vae_dtype != latent.dtype:
-                        if device.type == 'mps':
-                            # MPS: explicit dtype conversion instead of autocast
-                            latent = latent.to(vae_dtype)
-                            sample = self.vae.decode(
-                                latent,
-                                tiled=self.decode_tiled, tile_size=self.decode_tile_size,
-                                tile_overlap=self.decode_tile_overlap
-                            ).sample
-                        else:
-                            with torch.autocast(device.type, latent.dtype, enabled=True):
-                                sample = self.vae.decode(
-                                    latent,
-                                    tiled=self.decode_tiled, tile_size=self.decode_tile_size,
-                                    tile_overlap=self.decode_tile_overlap
-                                ).sample
-                    else:
-                        sample = self.vae.decode(
-                            latent,
-                            tiled=self.decode_tiled, tile_size=self.decode_tile_size,
-                            tile_overlap=self.decode_tile_overlap
-                        ).sample
+                    sample = _decode_eager(latent)
 
                 if hasattr(self.vae, "postprocess"):
                     sample = self.vae.postprocess(sample)
@@ -557,13 +581,22 @@ class VideoDiffusionInfer():
 
         # Phase transition (VAE -> DiT): free cached CUDA allocator blocks.
         self._empty_cuda_cache(latents.device if torch.is_tensor(latents) else None)
+        _dit_offload_device = getattr(self, "_dit_offload_device", None)
+        _dit_offload_is_cpu = False
+        if isinstance(_dit_offload_device, torch.device):
+            _dit_offload_is_cpu = _dit_offload_device.type == "cpu"
+        elif isinstance(_dit_offload_device, str):
+            _dit_offload_is_cpu = _dit_offload_device.startswith("cpu")
 
         _use_dit_cuda_graph = (
             self.use_dit_cuda_graph
             and torch.is_tensor(latents)
             and latents.device.type == 'cuda'
             and DitGraphCache.is_available()
+            and not _dit_offload_is_cpu
         )
+        if _dit_offload_is_cpu and self._dit_graph_cache is not None:
+            self._dit_graph_cache.reset()
         if _use_dit_cuda_graph and self._dit_graph_cache is None:
             self._dit_graph_cache = DitGraphCache()
 
