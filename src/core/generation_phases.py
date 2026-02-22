@@ -934,7 +934,11 @@ def decode_all_batches(
             
             # Decode latent
             debug.start_timer("vae_decode")
-            samples = runner.vae_decode([upscaled_latent])
+            samples = runner.vae_decode(
+                [upscaled_latent],
+                device=ctx['vae_device'],
+                use_cuda_graph=getattr(runner, 'use_vae_decode_cuda_graph', False)
+            )
             debug.end_timer("vae_decode", "VAE decode")
             
             # Process samples - get the single decoded sample
