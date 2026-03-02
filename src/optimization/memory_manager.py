@@ -213,6 +213,50 @@ def get_ram_usage(debug: Optional['Debug'] = None) -> Tuple[float, float, float,
         return 0.0, 0.0, 0.0, 0.0
     
     
+def get_safe_batch_limit(device: Optional[torch.device] = None, 
+                         resolution_height: int = 0,
+                         debug: Optional['Debug'] = None) -> Optional[int]:
+    """
+    Get safe maximum batch size for DiT attention based on available VRAM.
+    
+    SageAttention 3's internal padding (pad_128) and .contiguous() calls require
+    significant temporary VRAM.  On ≤16GB GPUs (e.g. RTX 5070 Ti) with 720p+
+    resolutions, batch sizes above ~48 can trigger OOM during pad_128.
+    
+    Args:
+        device: GPU device to check. If None, uses cuda:0
+        resolution_height: Target resolution height (e.g. 720, 1080). 
+                          0 = no resolution-based limit.
+        debug: Optional debug instance for logging
+        
+    Returns:
+        int: Recommended max batch size, or None if no limit needed (e.g. >16GB VRAM)
+    """
+    if not is_cuda_available():
+        return None
+    
+    mem_info = get_basic_vram_info(device=device)
+    if "error" in mem_info:
+        return None
+    
+    total_gb = mem_info["total_gb"]
+    
+    # Only apply limits on GPUs with ≤16GB VRAM
+    if total_gb > 17.0:
+        return None
+    
+    # For 720p+ on ≤16GB: cap to 48 to leave room for SA3's internal allocations
+    if resolution_height >= 720:
+        limit = 48
+        if debug:
+            debug.log(f"Batch size capped to {limit} for {resolution_height}p on "
+                      f"{total_gb:.0f}GB VRAM (SA3 padding headroom)", 
+                      category="memory")
+        return limit
+    
+    return None
+    
+    
 # Global cache for OS libraries (initialized once)
 _os_memory_lib = None
 

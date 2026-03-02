@@ -47,6 +47,7 @@ from ..optimization.memory_manager import (
     cleanup_dit,
     cleanup_vae,
     cleanup_text_embeddings,
+    clear_memory,
     manage_tensor,
     manage_model_device,
     release_tensor_memory,
@@ -695,6 +696,11 @@ def upscale_all_batches(
     upscale_idx = 0
     
     try:
+        # Deep memory cleanup before DiT loading to maximize available VRAM.
+        # After Phase 1, VAE is offloaded but CUDA may still hold reserved memory.
+        # This ensures the full 16GB is available for DiT + SA3 padding allocations.
+        clear_memory(debug=debug, deep=True, force=True, timer_name="pre_dit_cleanup")
+        
         # Materialize DiT if still on meta device
         if runner.dit and next(runner.dit.parameters()).device.type == 'meta':
             materialize_model(runner, "dit", ctx['dit_device'], runner.config, debug)

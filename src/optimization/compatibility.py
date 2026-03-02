@@ -566,10 +566,17 @@ def call_sage_attn_3_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, m
         k_padded.index_copy_(0, dst_idx_k, k.index_select(0, src_idx_k))
         v_padded.index_copy_(0, dst_idx_k, v.index_select(0, src_idx_k))
         
-        # Reshape to (batch, heads, seq, dim) for SA3
-        q_padded = q_padded.view(batch_size, max_seqlen_q, heads, dim).transpose(1, 2)
-        k_padded = k_padded.view(batch_size, max_seqlen_k, heads, dim).transpose(1, 2)
-        v_padded = v_padded.view(batch_size, max_seqlen_k, heads, dim).transpose(1, 2)
+        # Reshape to (batch, heads, seq, dim) for SA3.
+        # .contiguous() is called here so SA3's internal pad_128 receives
+        # already-contiguous tensors and doesn't allocate a second copy
+        # (which caused OOM on 16GB Blackwell GPUs with large batch sizes).
+        q_padded = q_padded.view(batch_size, max_seqlen_q, heads, dim).transpose(1, 2).contiguous()
+        k_padded = k_padded.view(batch_size, max_seqlen_k, heads, dim).transpose(1, 2).contiguous()
+        v_padded = v_padded.view(batch_size, max_seqlen_k, heads, dim).transpose(1, 2).contiguous()
+        
+        # Free original packed tensors before SA3 allocates its internal buffers.
+        # Keep dst_idx_q — it's needed to gather valid positions from the output.
+        del q, k, v, src_idx_q, src_idx_k, dst_idx_k
         
         out_padded = sageattn_blackwell(q_padded, k_padded, v_padded, per_block_mean=False)
         
@@ -602,10 +609,12 @@ def call_sage_attn_3_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, m
     k_batched = k.view(batch_size, seq_len_k, heads, dim)
     v_batched = v.view(batch_size, seq_len_k, heads, dim)
     
-    # SA3/Blackwell expects (batch, heads, seq, dim) layout
-    q_batched = q_batched.transpose(1, 2)  # (batch, heads, seq, dim)
-    k_batched = k_batched.transpose(1, 2)
-    v_batched = v_batched.transpose(1, 2)
+    # SA3/Blackwell expects (batch, heads, seq, dim) layout.
+    # .contiguous() ensures SA3's internal pad_128 doesn't allocate a second
+    # copy of each tensor (OOM risk on 16GB GPUs with large batch sizes).
+    q_batched = q_batched.transpose(1, 2).contiguous()  # (batch, heads, seq, dim)
+    k_batched = k_batched.transpose(1, 2).contiguous()
+    v_batched = v_batched.transpose(1, 2).contiguous()
     
     # Call SA3 Blackwell
     out = sageattn_blackwell(q_batched, k_batched, v_batched, per_block_mean=False)
