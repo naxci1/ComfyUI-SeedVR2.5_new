@@ -1249,6 +1249,8 @@ def apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionIn
         # is a legacy diffusers default that triples decoder attention latency on
         # modern GPUs (Blackwell / Ampere) without measurable quality benefit for
         # inference-only workloads.
+        # We iterate all submodules of mid_block because the attention module type
+        # varies across diffusers versions (Attention, AttentionProcessor, etc.).
         decoder = getattr(model, 'decoder', None)
         if decoder and hasattr(decoder, 'mid_block'):
             disabled_count = 0

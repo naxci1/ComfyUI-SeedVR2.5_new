@@ -933,13 +933,16 @@ class CompatibleDiT(torch.nn.Module):
         # For FP8 models this converts FP8 inputs; for non-FP8 models with
         # mismatched input dtype (e.g., FP16 inputs + BF16 compute) this also
         # ensures the DiT receives consistent precision throughout.
-        needs_cast = self.is_fp8_model or any(
-            isinstance(a, torch.Tensor) and a.is_floating_point() and a.dtype != target_dtype
-            for a in args
-        ) or any(
-            isinstance(v, torch.Tensor) and v.is_floating_point() and v.dtype != target_dtype
-            for v in kwargs.values()
-        )
+        # Short-circuit: FP8 models always need casting; otherwise check lazily.
+        needs_cast = self.is_fp8_model
+        if not needs_cast:
+            needs_cast = any(
+                isinstance(a, torch.Tensor) and a.is_floating_point() and a.dtype != target_dtype
+                for a in args
+            ) or any(
+                isinstance(v, torch.Tensor) and v.is_floating_point() and v.dtype != target_dtype
+                for v in kwargs.values()
+            )
         
         if needs_cast:
             # Convert args
