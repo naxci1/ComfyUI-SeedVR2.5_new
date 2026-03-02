@@ -268,29 +268,28 @@ class VideoDiffusionInfer():
                             category="warning", indent_level=1, force=True
                         )
 
-                # Use autocast if VAE dtype differs from latent dtype
-                # Skip autocast on MPS (only supports bf16, unified memory = no benefit)
-                if vae_dtype != latent.dtype:
-                    if device.type == 'mps':
-                        # MPS: explicit dtype conversion instead of autocast
-                        latent = latent.to(vae_dtype)
+                # Decode with dtype handling:
+                # - CUDA: disable autocast to prevent FP32 upcasting (causes Blackwell corruption)
+                #   Cast latent to BF16 explicitly for pure BF16 pipeline
+                # - MPS: explicit dtype conversion (no autocast support)
+                # - Matching dtypes: direct decode
+                if device.type == 'cuda':
+                    # Pure BF16 pipeline: cast latent to BF16, disable autocast
+                    latent = latent.to(torch.bfloat16)
+                    with torch.cuda.amp.autocast(enabled=False):
                         sample = self.vae.decode(
                             latent,
                             tiled=self.decode_tiled, tile_size=self.decode_tile_size,
                             tile_overlap=self.decode_tile_overlap
                         ).sample
-                    else:
-                        # Force BF16 autocast on CUDA to prevent FP16 overflow artifacts.
-                        # Blackwell (RTX 50xx) and Ada Lovelace (RTX 40xx) 5th/4th gen
-                        # Tensor Cores are optimized for BF16 and produce visual corruption
-                        # when FP16 overflows during VAE decode convolutions.
-                        autocast_dtype = torch.bfloat16 if device.type == 'cuda' else latent.dtype
-                        with torch.autocast(device.type, autocast_dtype, enabled=True):
-                            sample = self.vae.decode(
-                                latent,
-                                tiled=self.decode_tiled, tile_size=self.decode_tile_size,
-                                tile_overlap=self.decode_tile_overlap
-                            ).sample
+                elif device.type == 'mps' and vae_dtype != latent.dtype:
+                    # MPS: explicit dtype conversion instead of autocast
+                    latent = latent.to(vae_dtype)
+                    sample = self.vae.decode(
+                        latent,
+                        tiled=self.decode_tiled, tile_size=self.decode_tile_size,
+                        tile_overlap=self.decode_tile_overlap
+                    ).sample
                 else:
                     sample = self.vae.decode(
                         latent,
