@@ -574,13 +574,32 @@ def call_sage_attn_3_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, m
         k_padded = k_padded.view(batch_size, max_seqlen_k, heads, dim).transpose(1, 2).contiguous()
         v_padded = v_padded.view(batch_size, max_seqlen_k, heads, dim).transpose(1, 2).contiguous()
         
+        # Pre-emptive pad sequence dimension to nearest multiple of 128 so that
+        # SA3's internal pad_128 becomes a no-op (no extra allocation).
+        pad_q = (128 - max_seqlen_q % 128) % 128
+        pad_k = (128 - max_seqlen_k % 128) % 128
+        if pad_q > 0:
+            q_padded = torch.nn.functional.pad(q_padded, (0, 0, 0, pad_q))
+        if pad_k > 0:
+            k_padded = torch.nn.functional.pad(k_padded, (0, 0, 0, pad_k))
+            v_padded = torch.nn.functional.pad(v_padded, (0, 0, 0, pad_k))
+        
         # Free original packed tensors before SA3 allocates its internal buffers.
         # Keep dst_idx_q — it's needed to gather valid positions from the output.
         del q, k, v, src_idx_q, src_idx_k, dst_idx_k
         
+        # Defragment CUDA memory for large sequences to prevent OOM during SA3 kernel.
+        # Threshold of 2000 tokens corresponds to ~720p+ resolution where peak VRAM from
+        # SA3's internal buffers risks exceeding 16GB on RTX 5070 Ti class GPUs.
+        if max_seqlen_q > 2000 and q_padded.is_cuda:
+            torch.cuda.empty_cache()
+        
         out_padded = sageattn_blackwell(q_padded, k_padded, v_padded, per_block_mean=False)
         
         # Gather valid (non-padded) positions back into varlen layout
+        # Slice off the pre-emptive padding before flattening
+        if pad_q > 0:
+            out_padded = out_padded[:, :, :max_seqlen_q, :]
         out_flat = out_padded.transpose(1, 2).reshape(batch_size * max_seqlen_q, heads, dim)
         out = out_flat.index_select(0, dst_idx_q).contiguous()
         
@@ -616,10 +635,23 @@ def call_sage_attn_3_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, m
     k_batched = k_batched.transpose(1, 2).contiguous()
     v_batched = v_batched.transpose(1, 2).contiguous()
     
+    # Pre-emptive pad sequence dimension to nearest multiple of 128 so that
+    # SA3's internal pad_128 becomes a no-op (no extra allocation).
+    pad_q = (128 - seq_len_q % 128) % 128
+    pad_k = (128 - seq_len_k % 128) % 128
+    if pad_q > 0:
+        q_batched = torch.nn.functional.pad(q_batched, (0, 0, 0, pad_q))
+    if pad_k > 0:
+        k_batched = torch.nn.functional.pad(k_batched, (0, 0, 0, pad_k))
+        v_batched = torch.nn.functional.pad(v_batched, (0, 0, 0, pad_k))
+    
     # Call SA3 Blackwell
     out = sageattn_blackwell(q_batched, k_batched, v_batched, per_block_mean=False)
     
     # Reshape back to varlen format (total_seq, heads, dim)
+    # Slice off the pre-emptive padding before flattening
+    if pad_q > 0:
+        out = out[:, :, :seq_len_q, :]
     out = out.transpose(1, 2).reshape(-1, heads, dim).contiguous()
     
     return out.to(out_dtype) if out.dtype != out_dtype else out
@@ -840,6 +872,19 @@ class CompatibleDiT(torch.nn.Module):
                 self.debug.start_timer("_force_nadit_precision")
                 self._force_nadit_precision(target_dtype=self.compute_dtype)
                 self.debug.end_timer("_force_nadit_precision", "NaDiT parameters/buffers conversion")
+        
+        # CUDA: Align non-FP8 model parameters to compute_dtype to eliminate FP32 leaks.
+        # Without this, FP32 model weights cause linear projections to output FP32 Q/K/V,
+        # forcing the attention layer to hold both FP32 and BF16 copies simultaneously
+        # (wasting ~5GB VRAM on large batch sizes like 81 frames).
+        if (not skip_conversion and not self.is_fp8_model
+                and torch.cuda.is_available()
+                and self.model_dtype != self.compute_dtype
+                and not (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available())):
+            self.debug.log(f"Aligning NaDiT parameters to {self.compute_dtype} for VRAM efficiency", category="setup", force=True)
+            self.debug.start_timer("_force_nadit_precision_cuda")
+            self._force_nadit_precision(target_dtype=self.compute_dtype)
+            self.debug.end_timer("_force_nadit_precision_cuda", "NaDiT CUDA precision alignment")
             
         # Apply RoPE stabilization for numerical stability
         self.debug.log(f"Stabilizing RoPE computations for numerical stability", category="setup")
