@@ -30,6 +30,7 @@ from ..optimization.performance import (
     optimized_channels_to_last,
     optimized_channels_to_second
 )
+from ..optimization.vae_tiling import apply_blackwell_tiled_decode_patch
 from ..models.dit_3b import na
 
 
@@ -51,6 +52,7 @@ class VideoDiffusionInfer():
         self.decode_tile_overlap = decode_tile_overlap
         self.tile_debug = tile_debug
         self._vae_decode_diag_logged = False
+        self._blackwell_patch_applied = False
         
     def get_condition(self, latent: Tensor, latent_blur: Tensor, task: str) -> Tensor:
         t, h, w, c = latent.shape
@@ -231,6 +233,13 @@ class VideoDiffusionInfer():
                 latents = [latent.unsqueeze(0) for latent in latents]
 
             self.debug.log(f"Latents shape: {latents[0].shape}", category="info", indent_level=1)
+
+            # Apply Blackwell tiled_decode patch (once per session)
+            # This replaces the VAE's default tiled_decode with the optimized version
+            # that uses dynamic tile sizing, BF16 enforcement, and VRAM-aware overlap
+            if self.decode_tiled and not self._blackwell_patch_applied:
+                self._blackwell_patch_applied = True
+                apply_blackwell_tiled_decode_patch(self.vae, debug=self.debug)
 
             for i, latent in enumerate(latents):
                 latent = latent / scale + shift

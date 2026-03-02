@@ -4,23 +4,26 @@ Blackwell-optimized VAE tiling module for SeedVR2.
 Provides memory-efficient spatial tiling for VAE decode (Phase 3) with
 optimizations targeting RTX 50xx (Blackwell / SM120) GPUs:
 
+- Dynamic VRAM-aware tile sizing (no hardcoded dimensions)
 - BF16 enforcement to prevent FP16 overflow artifacts
 - VRAM-aware tile streaming with inter-tile cache clearing (<13GB peak)
-- Ping-pong double-buffering for overlap accumulation
-- 64px minimum overlap with cosine ramp blending for seamless reconstruction
-- CUDA toolkit version diagnostics
-- Blackwell GPU detection and architecture-specific configuration
+- Dynamic overlap ratio (minimum 12.5% of tile size) for seamless reconstruction
+- Cosine ramp blending for zero visual seams
+- Monkey-patching to override default VideoAutoencoderKL.tiled_decode
+- CUDA toolkit version diagnostics and Blackwell GPU detection
 
 Usage:
     from src.optimization.vae_tiling import (
         get_blackwell_tile_config,
         blackwell_tiled_decode,
         log_tiling_backend_status,
+        apply_blackwell_tiled_decode_patch,
+        calculate_optimal_tile_size,
     )
 """
 
 import torch
-import torch.nn.functional as F
+import math
 from typing import Tuple, Dict, Any, Optional, TYPE_CHECKING
 
 from .memory_manager import (
@@ -35,40 +38,152 @@ if TYPE_CHECKING:
     from ...utils.debug import Debug
 
 
-# ── Blackwell Tile Configuration ─────────────────────────────────────────────
+# ── Configuration ────────────────────────────────────────────────────────────
 
-# Minimum overlap to ensure seamless reconstruction (pixels in output space)
-_BLACKWELL_MIN_OVERLAP = 64
+# Minimum overlap ratio relative to tile size (12.5% minimum)
+_MIN_OVERLAP_RATIO = 0.125
 
-# Default tile sizes optimized for 16GB Blackwell GPUs (RTX 5070 Ti class)
-_BLACKWELL_TILE_SIZE = (512, 512)
-_BLACKWELL_TILE_OVERLAP = (64, 64)
+# Absolute minimum overlap in output pixels (safety floor)
+_ABS_MIN_OVERLAP = 32
 
 # VRAM budget: keep peak usage below this fraction of total VRAM
 _VRAM_BUDGET_FRACTION = 0.85  # ~13.6GB on a 16GB card
 
+# Tile size must be a multiple of this (VAE spatial downsample factor alignment)
+_TILE_ALIGNMENT = 64
+
 # Backend status flag (logged once per session)
 _backend_status_logged = False
+
+# Monkey-patch tracking
+_patch_applied = False
+
+
+# ── Dynamic Tile Sizing ──────────────────────────────────────────────────────
+
+def calculate_optimal_tile_size(
+    latent_h: int,
+    latent_w: int,
+    spatial_scale_factor: int = 8,
+    total_vram_gb: Optional[float] = None,
+    vram_budget_fraction: float = _VRAM_BUDGET_FRACTION,
+    channels: int = 16,
+    frames: int = 1,
+) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+    """
+    Calculate optimal tile size and overlap dynamically based on VRAM and resolution.
+    
+    Instead of hardcoded tile sizes, computes the largest tile that fits within
+    the VRAM budget while maintaining alignment and minimum overlap guarantees.
+    
+    Args:
+        latent_h: Latent height dimension
+        latent_w: Latent width dimension
+        spatial_scale_factor: VAE spatial downsample factor (typically 8)
+        total_vram_gb: Total VRAM in GB (auto-detected if None)
+        vram_budget_fraction: Fraction of VRAM available for tiling
+        channels: Number of output channels (typically 3 for RGB)
+        frames: Number of temporal frames
+    
+    Returns:
+        (tile_size, tile_overlap) - both as (H, W) tuples in output pixels
+    """
+    # Auto-detect VRAM
+    if total_vram_gb is None and is_cuda_available():
+        try:
+            total_vram_gb = torch.cuda.mem_get_info()[1] / (1024**3)
+        except Exception:
+            total_vram_gb = 16.0
+    elif total_vram_gb is None:
+        total_vram_gb = 16.0
+    
+    vram_budget_bytes = total_vram_gb * vram_budget_fraction * (1024**3)
+    
+    # Output resolution
+    output_h = latent_h * spatial_scale_factor
+    output_w = latent_w * spatial_scale_factor
+    
+    # If the full output fits in a single tile within budget, use it
+    # Estimate: tile memory ≈ 2 * (input_tile + output_tile) * bytes_per_element
+    # BF16 = 2 bytes per element
+    bytes_per_elem = 2  # bfloat16
+    
+    # Try progressively smaller tile sizes, starting from full resolution
+    # Aligned to _TILE_ALIGNMENT for VAE compatibility
+    max_tile_dim = min(output_h, output_w, 2048)  # Cap at 2048px per side
+    
+    best_tile_h = _TILE_ALIGNMENT
+    best_tile_w = _TILE_ALIGNMENT
+    
+    for tile_dim in range(max_tile_dim, _TILE_ALIGNMENT - 1, -_TILE_ALIGNMENT):
+        # Ensure alignment
+        tile_dim = (tile_dim // _TILE_ALIGNMENT) * _TILE_ALIGNMENT
+        if tile_dim <= 0:
+            tile_dim = _TILE_ALIGNMENT
+        
+        # Estimate memory for one tile decode:
+        # Input tile (latent space): B * C_latent * F * (tile/scale)^2 * bytes
+        # Output tile (pixel space): B * C_out * F * tile^2 * bytes
+        # Working memory: ~2x output for intermediate activations
+        latent_tile = tile_dim // spatial_scale_factor
+        input_mem = 1 * channels * frames * latent_tile * latent_tile * bytes_per_elem
+        output_mem = 1 * 3 * frames * tile_dim * tile_dim * bytes_per_elem
+        working_mem = output_mem * 3  # Conservative: 3x for decoder activations
+        
+        # Accumulation buffer (full output)
+        accum_mem = 1 * 3 * frames * output_h * output_w * bytes_per_elem
+        
+        tile_total_mem = input_mem + output_mem + working_mem + accum_mem
+        
+        if tile_total_mem <= vram_budget_bytes * 0.7:  # Leave 30% headroom
+            best_tile_h = min(tile_dim, output_h)
+            best_tile_w = min(tile_dim, output_w)
+            break
+    
+    # Align to _TILE_ALIGNMENT
+    best_tile_h = max(_TILE_ALIGNMENT, (best_tile_h // _TILE_ALIGNMENT) * _TILE_ALIGNMENT)
+    best_tile_w = max(_TILE_ALIGNMENT, (best_tile_w // _TILE_ALIGNMENT) * _TILE_ALIGNMENT)
+    
+    # Dynamic overlap: minimum 12.5% of tile size, at least _ABS_MIN_OVERLAP px
+    overlap_h = max(_ABS_MIN_OVERLAP, int(best_tile_h * _MIN_OVERLAP_RATIO))
+    overlap_w = max(_ABS_MIN_OVERLAP, int(best_tile_w * _MIN_OVERLAP_RATIO))
+    
+    # Align overlap to 8px (latent-space alignment)
+    overlap_h = (overlap_h // 8) * 8
+    overlap_w = (overlap_w // 8) * 8
+    overlap_h = max(_ABS_MIN_OVERLAP, overlap_h)
+    overlap_w = max(_ABS_MIN_OVERLAP, overlap_w)
+    
+    # Blackwell minimum: 64px overlap
+    if is_blackwell_gpu():
+        overlap_h = max(64, overlap_h)
+        overlap_w = max(64, overlap_w)
+    
+    return (best_tile_h, best_tile_w), (overlap_h, overlap_w)
 
 
 def get_blackwell_tile_config(
     total_vram_gb: Optional[float] = None,
+    latent_h: int = 64,
+    latent_w: int = 64,
     debug: Optional['Debug'] = None,
 ) -> Dict[str, Any]:
     """
     Return Blackwell-optimized tiling configuration for VAE decode.
     
-    Automatically adjusts tile size and overlap based on available VRAM
-    and GPU architecture. Enforces BF16 precision and minimum 64px overlap.
+    Uses dynamic tile sizing based on VRAM and input resolution.
+    Enforces BF16 precision and dynamic overlap ratio.
     
     Args:
         total_vram_gb: Total VRAM in GB (auto-detected if None)
+        latent_h: Latent spatial height
+        latent_w: Latent spatial width
         debug: Debug instance for logging
         
     Returns:
         Dict with keys:
-            tile_size: (H, W) tile dimensions in output pixels
-            tile_overlap: (H, W) overlap in output pixels 
+            tile_size: (H, W) tile dimensions in output pixels (dynamically calculated)
+            tile_overlap: (H, W) overlap in output pixels (min 12.5% of tile size)
             compute_dtype: torch.dtype for tile processing
             use_ping_pong: Whether to use double-buffered accumulation
             defrag_between_tiles: Whether to clear CUDA cache between tiles
@@ -81,23 +196,18 @@ def get_blackwell_tile_config(
         try:
             total_vram_gb = torch.cuda.mem_get_info()[1] / (1024**3)
         except Exception:
-            total_vram_gb = 16.0  # Conservative default
+            total_vram_gb = 16.0
     elif total_vram_gb is None:
         total_vram_gb = 16.0
     
     vram_budget = total_vram_gb * _VRAM_BUDGET_FRACTION
     
-    # Tile size: scale down for smaller VRAM cards
-    if total_vram_gb <= 8:
-        tile_size = (256, 256)
-    elif total_vram_gb <= 12:
-        tile_size = (384, 384)
-    else:
-        tile_size = _BLACKWELL_TILE_SIZE
-    
-    # Overlap: always at least 64px for Blackwell, 32px for older
-    min_overlap = _BLACKWELL_MIN_OVERLAP if arch["is_blackwell"] else 32
-    tile_overlap = (max(min_overlap, 64), max(min_overlap, 64))
+    # Dynamic tile sizing based on VRAM and resolution
+    tile_size, tile_overlap = calculate_optimal_tile_size(
+        latent_h=latent_h,
+        latent_w=latent_w,
+        total_vram_gb=total_vram_gb,
+    )
     
     # BF16 for Blackwell (prevents FP16 overflow), FP16 fallback for older GPUs
     if arch["is_blackwell"] or arch["sm_major"] >= 8:
@@ -109,7 +219,7 @@ def get_blackwell_tile_config(
         "tile_size": tile_size,
         "tile_overlap": tile_overlap,
         "compute_dtype": compute_dtype,
-        "use_ping_pong": total_vram_gb <= 16,  # Double-buffer on ≤16GB cards
+        "use_ping_pong": total_vram_gb <= 16,
         "defrag_between_tiles": total_vram_gb <= 16,
         "vram_budget_gb": vram_budget,
         "is_blackwell": arch["is_blackwell"],
@@ -119,8 +229,9 @@ def get_blackwell_tile_config(
     
     if debug:
         debug.log(
-            f"Tile config: {tile_size[0]}×{tile_size[1]}px, "
-            f"overlap={tile_overlap[0]}px, dtype={compute_dtype}, "
+            f"Tile config: {tile_size[0]}×{tile_size[1]}px (dynamic), "
+            f"overlap={tile_overlap[0]}px ({tile_overlap[0]*100//tile_size[0]}%), "
+            f"dtype={compute_dtype}, "
             f"ping_pong={'yes' if config['use_ping_pong'] else 'no'}",
             category="vae", indent_level=1
         )
@@ -159,7 +270,7 @@ def log_tiling_backend_status(debug: Optional['Debug'] = None) -> Dict[str, Any]
             category="success", force=True
         )
         debug.log(
-            "cuTile Backend: Active — BF16 enforced, 64px overlap minimum",
+            "cuTile Backend: Active — BF16 enforced, dynamic overlap (≥12.5%)",
             category="info", indent_level=1
         )
         debug.log(
@@ -203,8 +314,8 @@ def _build_cosine_ramp(length: int, device: torch.device, dtype: torch.dtype) ->
 def blackwell_tiled_decode(
     vae_model: torch.nn.Module,
     latent: torch.Tensor,
-    tile_size: Tuple[int, int] = _BLACKWELL_TILE_SIZE,
-    tile_overlap: Tuple[int, int] = _BLACKWELL_TILE_OVERLAP,
+    tile_size: Optional[Tuple[int, int]] = None,
+    tile_overlap: Optional[Tuple[int, int]] = None,
     compute_dtype: torch.dtype = torch.bfloat16,
     defrag_between_tiles: bool = True,
     debug: Optional['Debug'] = None,
@@ -216,17 +327,19 @@ def blackwell_tiled_decode(
     tile independently through the VAE decoder, and blending overlapping
     regions with cosine ramps for seamless reconstruction.
     
-    Blackwell-specific optimizations:
+    Key features:
+    - Dynamic tile sizing when tile_size=None (VRAM-aware)
     - BF16 precision to prevent FP16 overflow artifacts
+    - Dynamic overlap ratio (minimum 12.5% of tile size)
     - Inter-tile CUDA cache clearing to keep peak VRAM < 13GB
-    - Ping-pong accumulation pattern for memory efficiency
-    - Minimum 64px overlap with cosine ramp blending
     
     Args:
         vae_model: VAE model with slicing_decode() method
         latent: Input latent tensor [B, C, F, H, W]
-        tile_size: Output-space tile size (H, W) in pixels
-        tile_overlap: Output-space overlap (H, W) in pixels
+        tile_size: Output-space tile size (H, W) in pixels. 
+                   If None, calculated dynamically based on VRAM.
+        tile_overlap: Output-space overlap (H, W) in pixels.
+                      If None, calculated as max(12.5% of tile_size, 64px on Blackwell).
         compute_dtype: Compute precision (torch.bfloat16 recommended)
         defrag_between_tiles: Clear CUDA cache between tiles
         debug: Debug instance for logging
@@ -242,13 +355,30 @@ def blackwell_tiled_decode(
     # Get spatial scale factor from VAE model
     scale_factor = getattr(vae_model, 'spatial_downsample_factor', 8)
     
+    # Dynamic tile sizing when not specified
+    if tile_size is None or tile_overlap is None:
+        dyn_tile_size, dyn_tile_overlap = calculate_optimal_tile_size(
+            latent_h=H, latent_w=W,
+            spatial_scale_factor=scale_factor,
+            frames=f,
+        )
+        if tile_size is None:
+            tile_size = dyn_tile_size
+        if tile_overlap is None:
+            tile_overlap = dyn_tile_overlap
+    
     # Convert output-space tile params to latent-space
     tile_h, tile_w = tile_size
     overlap_h, overlap_w = tile_overlap
     
-    # Enforce minimum overlap
-    overlap_h = max(overlap_h, _BLACKWELL_MIN_OVERLAP)
-    overlap_w = max(overlap_w, _BLACKWELL_MIN_OVERLAP)
+    # Enforce minimum overlap ratio (12.5%)
+    min_overlap_h = max(_ABS_MIN_OVERLAP, int(tile_h * _MIN_OVERLAP_RATIO))
+    min_overlap_w = max(_ABS_MIN_OVERLAP, int(tile_w * _MIN_OVERLAP_RATIO))
+    if is_blackwell_gpu():
+        min_overlap_h = max(64, min_overlap_h)
+        min_overlap_w = max(64, min_overlap_w)
+    overlap_h = max(overlap_h, min_overlap_h)
+    overlap_w = max(overlap_w, min_overlap_w)
     
     latent_tile_h = max(1, tile_h // scale_factor)
     latent_tile_w = max(1, tile_w // scale_factor)
@@ -269,10 +399,12 @@ def blackwell_tiled_decode(
     num_tiles = num_tiles_h * num_tiles_w
     
     if debug:
+        overlap_pct = overlap_h * 100 // tile_h if tile_h > 0 else 0
         debug.log(
             f"Blackwell tiled decode: {num_tiles} tiles "
             f"({num_tiles_h}×{num_tiles_w}), "
-            f"tile={tile_size}, overlap={overlap_h}px, dtype={compute_dtype}",
+            f"tile={tile_h}×{tile_w}px (dynamic), "
+            f"overlap={overlap_h}px ({overlap_pct}%), dtype={compute_dtype}",
             category="vae", force=True, indent_level=1
         )
     
@@ -315,14 +447,18 @@ def blackwell_tiled_decode(
                 output_h = H * scale_factor
                 output_w = W * scale_factor
                 
-                # Accumulate on same device as decoded output
+                # Accumulate on offload device if specified, else same device
+                accum_device = getattr(vae_model, 'tensor_offload_device', None)
+                if accum_device is None or accum_device == decoded_tile.device:
+                    accum_device = decoded_tile.device
+                
                 result = torch.zeros(
                     (b_out, c_out, out_f, output_h, output_w),
-                    device=decoded_tile.device, dtype=compute_dtype
+                    device=accum_device, dtype=compute_dtype
                 )
                 count = torch.zeros(
                     (1, 1, 1, output_h, output_w),
-                    device=decoded_tile.device, dtype=compute_dtype
+                    device=accum_device, dtype=compute_dtype
                 )
             
             # Map to output space
@@ -362,7 +498,12 @@ def blackwell_tiled_decode(
             
             decoded_tile.mul_(weight_h_5d).mul_(weight_w_5d)
             
-            # Accumulate
+            # Accumulate (move to result device if different)
+            if result.device != decoded_tile.device:
+                decoded_tile = decoded_tile.to(result.device)
+                weight_h_5d = weight_h_5d.to(result.device)
+                weight_w_5d = weight_w_5d.to(result.device)
+            
             result[:, :, :decoded_tile.shape[2], y_out:y_out_end, x_out:x_out_end] += decoded_tile
             count[:, :, :, y_out:y_out_end, x_out:x_out_end].addcmul_(weight_h_5d, weight_w_5d)
             
@@ -383,6 +524,10 @@ def blackwell_tiled_decode(
     
     # Normalize by accumulated weights
     if result is not None:
+        # Move back to input device if accumulated elsewhere
+        if result.device != latent.device:
+            result = result.to(latent.device)
+            count = count.to(latent.device)
         result.div_(count.clamp(min=1e-6))
     
     # Handle single-frame squeeze
@@ -390,3 +535,118 @@ def blackwell_tiled_decode(
         result = result.squeeze(2)
     
     return result
+
+
+# ── Monkey-Patching: Override VideoAutoencoderKL.tiled_decode ────────────────
+
+def _patched_tiled_decode(self, z: torch.Tensor, 
+                          tile_size: Tuple[int, int] = (512, 512),
+                          tile_overlap: Tuple[int, int] = (64, 64)) -> torch.Tensor:
+    """
+    Replacement for VideoAutoencoderKL.tiled_decode that uses Blackwell-optimized
+    dynamic tiling with BF16 enforcement and VRAM-aware tile sizing.
+    
+    This method is monkey-patched onto VideoAutoencoderKL instances when
+    apply_blackwell_tiled_decode_patch() is called. It replaces the default
+    tiled_decode with the Blackwell-optimized version from vae_tiling.py.
+    
+    The tile_size and tile_overlap parameters from the caller are used as
+    initial hints, but may be overridden by dynamic calculation on Blackwell GPUs.
+    """
+    arch = detect_gpu_architecture()
+    debug = getattr(self, 'debug', None)
+    
+    # Determine compute dtype: BF16 for SM8+ GPUs
+    if arch["is_blackwell"] or arch["sm_major"] >= 8:
+        compute_dtype = torch.bfloat16
+    else:
+        compute_dtype = z.dtype
+    
+    # On Blackwell: use dynamic tile sizing, ignoring caller's hardcoded values
+    if arch["is_blackwell"]:
+        if z.ndim != 5:
+            z_check = z.unsqueeze(2)
+        else:
+            z_check = z
+        _, _, _, H, W = z_check.shape
+        
+        dyn_tile_size, dyn_tile_overlap = calculate_optimal_tile_size(
+            latent_h=H, latent_w=W,
+            spatial_scale_factor=getattr(self, 'spatial_downsample_factor', 8),
+        )
+        tile_size = dyn_tile_size
+        tile_overlap = dyn_tile_overlap
+    else:
+        # Non-Blackwell: enforce minimum overlap ratio on provided values
+        min_ov_h = max(_ABS_MIN_OVERLAP, int(tile_size[0] * _MIN_OVERLAP_RATIO))
+        min_ov_w = max(_ABS_MIN_OVERLAP, int(tile_size[1] * _MIN_OVERLAP_RATIO))
+        tile_overlap = (max(tile_overlap[0], min_ov_h), max(tile_overlap[1], min_ov_w))
+    
+    defrag = is_cuda_available() and (
+        not is_cuda_available() or 
+        torch.cuda.mem_get_info()[1] / (1024**3) <= 16
+    ) if is_cuda_available() else False
+    
+    return blackwell_tiled_decode(
+        vae_model=self,
+        latent=z,
+        tile_size=tile_size,
+        tile_overlap=tile_overlap,
+        compute_dtype=compute_dtype,
+        defrag_between_tiles=defrag,
+        debug=debug,
+    )
+
+
+def apply_blackwell_tiled_decode_patch(vae_model: torch.nn.Module, 
+                                        debug: Optional['Debug'] = None) -> bool:
+    """
+    Monkey-patch the VAE model's tiled_decode method with the Blackwell-optimized version.
+    
+    This is the key integration point: without this patch, the VAE model uses its own
+    legacy tiled_decode which does not have Blackwell optimizations (dynamic tile sizing,
+    BF16 enforcement, VRAM-aware overlap, inter-tile cache clearing).
+    
+    Args:
+        vae_model: VideoAutoencoderKL instance to patch
+        debug: Debug instance for logging
+        
+    Returns:
+        True if patch was applied, False if already applied or not applicable
+    """
+    global _patch_applied
+    
+    if _patch_applied:
+        return False
+    
+    if not hasattr(vae_model, 'tiled_decode'):
+        if debug:
+            debug.log("VAE model has no tiled_decode method, skipping patch", 
+                      category="warning", indent_level=1)
+        return False
+    
+    import types
+    vae_model.tiled_decode = types.MethodType(_patched_tiled_decode, vae_model)
+    _patch_applied = True
+    
+    # Log backend status on first patch application
+    log_tiling_backend_status(debug=debug)
+    
+    # On Blackwell: disable force_upcast to prevent FP32 upcasting
+    # that causes numerical issues with the BF16 pipeline
+    arch = detect_gpu_architecture()
+    if arch["is_blackwell"] and hasattr(vae_model.config, 'force_upcast'):
+        vae_model.config.force_upcast = False
+        if debug:
+            debug.log(
+                "Blackwell: force_upcast disabled — pure BF16 pipeline active",
+                category="info", indent_level=1
+            )
+    
+    if debug:
+        debug.log(
+            "Blackwell tiled_decode patch applied — dynamic tile sizing active",
+            category="success", indent_level=1, force=True
+        )
+    
+    return True
