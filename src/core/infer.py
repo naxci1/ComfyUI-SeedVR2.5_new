@@ -50,6 +50,7 @@ class VideoDiffusionInfer():
         self.decode_tile_size = decode_tile_size
         self.decode_tile_overlap = decode_tile_overlap
         self.tile_debug = tile_debug
+        self._vae_decode_diag_logged = False
         
     def get_condition(self, latent: Tensor, latent_blur: Tensor, task: str) -> Tensor:
         t, h, w, c = latent.shape
@@ -239,6 +240,22 @@ class VideoDiffusionInfer():
                     vae_dtype = next(self.vae.parameters()).dtype
                 except StopIteration:
                     vae_dtype = dtype  # Fallback
+
+                # First-call decode diagnostic: log dtype mismatch and autocast usage
+                if not self._vae_decode_diag_logged:
+                    self._vae_decode_diag_logged = True
+                    uses_autocast = vae_dtype != latent.dtype and device.type != 'mps'
+                    self.debug.log(
+                        f"VAE decode: model_dtype={vae_dtype}, latent_dtype={latent.dtype}, "
+                        f"tiled={self.decode_tiled}, autocast={'yes' if uses_autocast else 'no'}",
+                        category="vae", indent_level=1
+                    )
+                    if vae_dtype != latent.dtype:
+                        self.debug.log(
+                            f"⚠️ VAE/latent dtype mismatch ({vae_dtype} vs {latent.dtype}) — "
+                            f"causes {'autocast' if uses_autocast else 'explicit cast'} overhead",
+                            category="warning", indent_level=1, force=True
+                        )
 
                 # Use autocast if VAE dtype differs from latent dtype
                 # Skip autocast on MPS (only supports bf16, unified memory = no benefit)

@@ -171,6 +171,9 @@ except (ImportError, AttributeError, OSError):
 
 SAGE_ATTN_AVAILABLE = SAGE_ATTN_2_AVAILABLE or SAGE_ATTN_3_AVAILABLE
 
+# Diagnostic flag: logs SA3 details on first call only to avoid hot-loop overhead
+_sa3_diagnostics_logged = False
+
 
 def validate_attention_mode(requested_mode: str, debug=None) -> str:
     """
@@ -478,6 +481,8 @@ def call_sage_attn_3_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, m
     if not SAGE_ATTN_3_AVAILABLE:
         raise ImportError("SageAttention 3 (Blackwell) is not available")
     
+    global _sa3_diagnostics_logged
+    
     # Convert tensor max_seqlen to Python int if needed
     if torch.is_tensor(max_seqlen_q):
         max_seqlen_q = int(max_seqlen_q.item())
@@ -496,6 +501,9 @@ def call_sage_attn_3_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, m
         # Fall back to SA2 for variable-length sequences
         # This is expected behavior - SA3 Blackwell doesn't support varlen natively
         if SAGE_ATTN_2_AVAILABLE:
+            if not _sa3_diagnostics_logged:
+                _sa3_diagnostics_logged = True
+                print("[SeedVR2 SA3 Diag] ⚠️ Non-uniform sequence lengths detected, falling back to SageAttention 2")
             return call_sage_attn_2_varlen(
                 q, k, v, cu_seqlens_q, cu_seqlens_k,
                 max_seqlen_q, max_seqlen_k, **kwargs
@@ -525,6 +533,20 @@ def call_sage_attn_3_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, m
         q = q.to(torch.bfloat16)
         k = k.to(torch.bfloat16)
         v = v.to(torch.bfloat16)
+    
+    # First-call diagnostics: log kernel selection, tensor alignment, and dtype info
+    if not _sa3_diagnostics_logged:
+        _sa3_diagnostics_logged = True
+        dtype_cast = out_dtype not in half_dtypes
+        print(f"[SeedVR2 SA3 Diag] ✅ SageAttention 3 Blackwell kernel active (sageattn_blackwell)")
+        print(f"[SeedVR2 SA3 Diag]   Input dtype: {out_dtype} → Kernel dtype: {q.dtype}"
+              f"{' (cast required)' if dtype_cast else ' (native, no cast)'}")
+        print(f"[SeedVR2 SA3 Diag]   Q contiguous: {q.is_contiguous()}, K contiguous: {k.is_contiguous()}, V contiguous: {v.is_contiguous()}")
+        print(f"[SeedVR2 SA3 Diag]   Batch: {batch_size}, SeqLen Q: {seq_len_q}, SeqLen K: {seq_len_k}, Heads: {heads}, Dim: {dim}")
+        if q.dtype == torch.float16:
+            print(f"[SeedVR2 SA3 Diag]   FP16 mode: sageattn_qk_int8_pv_fp16_cuda kernel expected")
+        elif q.dtype == torch.bfloat16:
+            print(f"[SeedVR2 SA3 Diag]   BF16 mode: sageattn_qk_int8_pv_bf16_cuda kernel expected")
     
     # Reshape varlen (total_seq, heads, dim) -> batched (batch, seq, heads, dim)
     q_batched = q.view(batch_size, seq_len_q, heads, dim)

@@ -66,6 +66,85 @@ from ..utils.color_fix import (
 )
 
 
+def _log_vae_decode_diagnostics(
+    runner: 'VideoDiffusionInfer',
+    ctx: Dict[str, Any],
+    debug: 'Debug'
+) -> None:
+    """
+    Log VAE decode configuration diagnostics for bottleneck investigation.
+    
+    Reports tiling/slicing status, parameter dtypes, FP32 upcasting detection,
+    and VRAM-aware optimization suggestions.
+    """
+    # Minimum free VRAM (GB) above which tiling is unnecessary for typical workloads
+    VRAM_TILING_THRESHOLD_GB = 12.0
+    
+    if not debug.enabled:
+        return
+    
+    debug.log("── VAE Decode Diagnostics ──", category="vae")
+    
+    # 1. Tiling & slicing status
+    decode_tiled = getattr(runner, 'decode_tiled', False)
+    use_slicing = getattr(runner.vae, 'use_slicing', False) if runner.vae else False
+    debug.log(f"Tiling: {'ENABLED' if decode_tiled else 'disabled'}, "
+              f"Causal slicing: {'ENABLED' if use_slicing else 'disabled'}", 
+              category="vae", indent_level=1)
+    
+    # 2. VAE parameter dtype analysis - detect FP32 upcasting
+    if runner.vae is not None:
+        dtype_counts = {}
+        for name, param in runner.vae.named_parameters():
+            dt = str(param.dtype)
+            dtype_counts[dt] = dtype_counts.get(dt, 0) + 1
+        
+        dtype_summary = ", ".join(f"{dt}: {count}" for dt, count in sorted(dtype_counts.items()))
+        debug.log(f"VAE parameter dtypes: {dtype_summary}", category="vae", indent_level=1)
+        
+        if 'torch.float32' in dtype_counts:
+            fp32_count = dtype_counts['torch.float32']
+            total = sum(dtype_counts.values())
+            debug.log(f"⚠️ FP32 parameters detected: {fp32_count}/{total} params are float32 "
+                      f"(may cause decode slowdown)", category="warning", indent_level=1, force=True)
+        
+        # Check force_upcast config (from diffusers base class)
+        force_upcast = getattr(getattr(runner.vae, 'config', None), 'force_upcast', None)
+        if force_upcast is not None:
+            debug.log(f"force_upcast config: {force_upcast} "
+                      f"(note: overridden _decode does not apply this)", 
+                      category="vae", indent_level=1)
+        
+        # Check upcast_softmax in mid block attention
+        decoder = getattr(runner.vae, 'decoder', None)
+        if decoder and hasattr(decoder, 'mid_block'):
+            for module in decoder.mid_block.modules():
+                if hasattr(module, 'upcast_softmax') and module.upcast_softmax:
+                    debug.log("upcast_softmax=True in decoder mid_block attention "
+                              "(softmax computed in FP32)", category="vae", indent_level=1)
+                    break
+    
+    # 3. VRAM availability and optimization suggestions
+    vae_device = ctx.get('vae_device')
+    if vae_device is not None and vae_device.type == 'cuda':
+        try:
+            free_vram_gb = torch.cuda.mem_get_info(vae_device)[0] / (1024**3)
+            total_vram_gb = torch.cuda.mem_get_info(vae_device)[1] / (1024**3)
+            debug.log(f"VRAM: {free_vram_gb:.1f}GB free / {total_vram_gb:.1f}GB total", 
+                      category="vae", indent_level=1)
+            if decode_tiled and free_vram_gb > VRAM_TILING_THRESHOLD_GB:
+                debug.log("💡 Tiling is enabled but >12GB VRAM is free. "
+                          "Consider disabling decode_tiled for faster decoding.", 
+                          category="tip", indent_level=1, force=True)
+        except Exception:
+            pass
+    
+    # 4. Compute dtype context
+    debug.log(f"Pipeline compute_dtype: {ctx.get('compute_dtype', 'unknown')}", 
+              category="vae", indent_level=1)
+    debug.log("── End VAE Decode Diagnostics ──", category="vae")
+
+
 def _prepare_video_batch(
     images: torch.Tensor,
     start_idx: int,
@@ -898,6 +977,9 @@ def decode_all_batches(
 
         # Precision should already be initialized from encoding phase
         ensure_precision_initialized(ctx, runner, debug)
+
+        # VAE decode diagnostics: log tiling, slicing, dtype, and upcasting info
+        _log_vae_decode_diagnostics(runner, ctx, debug)
 
         # Move VAE to GPU for decoding (no-op if already there)
         manage_model_device(model=runner.vae, target_device=ctx['vae_device'], 
