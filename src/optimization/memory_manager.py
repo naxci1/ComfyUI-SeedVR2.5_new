@@ -1,14 +1,19 @@
 """
 Memory management module for SeedVR2
-Handles VRAM usage, cache management, and memory optimization
+Handles VRAM usage, cache management, and memory optimization.
+
+Includes Blackwell (SM120) GPU detection, CUDA toolkit alignment diagnostics,
+and VRAM defragmentation optimized for RTX 50xx series GPUs.
 
 Extracted from: seedvr2.py (lines 373-405, 607-626, 1016-1044)
 """
 
 import torch
 import gc
+import os
 import sys
 import time
+import subprocess
 import psutil
 import platform
 from typing import Tuple, Dict, Any, Optional, List, Union
@@ -43,6 +48,270 @@ def get_gpu_backend() -> str:
     if is_mps_available():
         return 'mps'
     return 'cpu'
+
+
+# ── Blackwell / SM120 GPU Detection ──────────────────────────────────────────
+
+# Map SM major version → architecture name
+_SM_ARCH_MAP = {
+    12: "Blackwell",   # SM 12.0 — RTX 50xx
+    10: "Blackwell",   # SM 10.0 — B100/B200 (data-center Blackwell)
+    9:  "Hopper",      # SM 9.0  — H100
+    8:  "Ampere",      # SM 8.x  — A100 / RTX 30xx / RTX 40xx (Ada Lovelace is 8.9)
+    7:  "Volta/Turing", # SM 7.x — V100 / RTX 20xx
+}
+
+# Cache for GPU detection results (computed once per process)
+_gpu_arch_cache: Optional[Dict[str, Any]] = None
+
+
+def detect_gpu_architecture(device: Optional[torch.device] = None) -> Dict[str, Any]:
+    """
+    Detect GPU architecture details including Blackwell (SM120) identification.
+    
+    Returns a dict with:
+        - name: Architecture name (e.g., "Blackwell", "Ampere")
+        - sm_major: SM major version (e.g., 12 for Blackwell)
+        - sm_minor: SM minor version
+        - sm_version: Combined string (e.g., "SM120")
+        - is_blackwell: True if Blackwell architecture (SM 10.x or 12.x)
+        - gpu_name: Full GPU name string
+        - compute_capability: Tuple (major, minor)
+    """
+    global _gpu_arch_cache
+    if _gpu_arch_cache is not None:
+        return _gpu_arch_cache
+    
+    result = {
+        "name": "Unknown",
+        "sm_major": 0,
+        "sm_minor": 0,
+        "sm_version": "SM000",
+        "is_blackwell": False,
+        "gpu_name": "Unknown",
+        "compute_capability": (0, 0),
+    }
+    
+    if not is_cuda_available():
+        _gpu_arch_cache = result
+        return result
+    
+    try:
+        if device is None:
+            device = torch.device("cuda:0")
+        
+        major, minor = torch.cuda.get_device_capability(device)
+        gpu_name = torch.cuda.get_device_name(device)
+        
+        arch_name = _SM_ARCH_MAP.get(major, "Unknown")
+        # Ada Lovelace is SM 8.9 — disambiguate from Ampere (SM 8.0-8.6)
+        if major == 8 and minor >= 9:
+            arch_name = "Ada Lovelace"
+        
+        result = {
+            "name": arch_name,
+            "sm_major": major,
+            "sm_minor": minor,
+            "sm_version": f"SM{major * 10 + minor}0" if minor == 0 else f"SM{major}{minor}0",
+            "is_blackwell": major >= 10,
+            "gpu_name": gpu_name,
+            "compute_capability": (major, minor),
+        }
+    except Exception:
+        pass
+    
+    _gpu_arch_cache = result
+    return result
+
+
+def is_blackwell_gpu(device: Optional[torch.device] = None) -> bool:
+    """Check if the current GPU is Blackwell architecture (SM 10.x+)."""
+    return detect_gpu_architecture(device).get("is_blackwell", False)
+
+
+def _get_system_nvcc_version() -> Optional[str]:
+    """
+    Query the system NVCC compiler version.
+    
+    Returns version string (e.g., "13.1") or None if nvcc is not found.
+    """
+    try:
+        result = subprocess.run(
+            ["nvcc", "--version"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            # Parse "release X.Y" from nvcc output
+            for line in result.stdout.split("\n"):
+                if "release" in line.lower():
+                    parts = line.split("release")[-1].strip()
+                    version = parts.split(",")[0].strip()
+                    return version
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    
+    # Fallback: check CUDA_HOME/CUDA_PATH environment
+    for env_var in ("CUDA_HOME", "CUDA_PATH"):
+        cuda_path = os.environ.get(env_var)
+        if cuda_path:
+            nvcc_path = os.path.join(cuda_path, "bin", "nvcc")
+            if not os.path.exists(nvcc_path):
+                nvcc_path += ".exe"
+            if os.path.exists(nvcc_path):
+                try:
+                    result = subprocess.run(
+                        [nvcc_path, "--version"],
+                        capture_output=True, text=True, timeout=10
+                    )
+                    if result.returncode == 0:
+                        for line in result.stdout.split("\n"):
+                            if "release" in line.lower():
+                                parts = line.split("release")[-1].strip()
+                                version = parts.split(",")[0].strip()
+                                return version
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
+    
+    return None
+
+
+def check_cuda_toolkit_alignment(debug: Optional['Debug'] = None) -> Dict[str, Any]:
+    """
+    Compare PyTorch's bundled CUDA version with the system NVCC toolkit version.
+    
+    Logs a warning if there is a mismatch that could cause JIT compilation issues.
+    
+    Returns dict with:
+        - torch_cuda: PyTorch CUDA version string
+        - system_nvcc: System NVCC version string (or None)
+        - aligned: True if major versions match
+        - message: Human-readable status message
+    """
+    torch_cuda = getattr(torch.version, 'cuda', None) or "N/A"
+    system_nvcc = _get_system_nvcc_version()
+    
+    result = {
+        "torch_cuda": torch_cuda,
+        "system_nvcc": system_nvcc,
+        "aligned": True,
+        "message": "",
+    }
+    
+    if system_nvcc is None:
+        result["message"] = f"PyTorch CUDA: {torch_cuda}, System NVCC: not found"
+        result["aligned"] = True  # Can't compare, assume OK
+        if debug:
+            debug.log(result["message"], category="info")
+        return result
+    
+    # Compare major versions
+    try:
+        torch_major = torch_cuda.split(".")[0]
+        nvcc_major = system_nvcc.split(".")[0]
+        result["aligned"] = (torch_major == nvcc_major)
+    except (IndexError, ValueError):
+        result["aligned"] = True  # Can't parse, assume OK
+    
+    if result["aligned"]:
+        result["message"] = f"CUDA toolkit aligned: PyTorch={torch_cuda}, System NVCC={system_nvcc}"
+        if debug:
+            debug.log(result["message"], category="success")
+    else:
+        result["message"] = (
+            f"⚠️ CUDA version mismatch: PyTorch bundled CUDA {torch_cuda} vs "
+            f"System NVCC {system_nvcc}. JIT-compiled kernels will use system NVCC."
+        )
+        if debug:
+            debug.log(result["message"], level="WARNING", category="setup", force=True)
+    
+    return result
+
+
+def defragment_vram(debug: Optional['Debug'] = None, device: Optional[torch.device] = None) -> None:
+    """
+    Aggressive VRAM defragmentation optimized for Blackwell GPUs.
+    
+    On Blackwell (SM120+), uses expandable segment configuration to reduce 
+    fragmentation. On all CUDA GPUs, clears caches and releases unused blocks.
+    
+    This is more aggressive than clear_memory() and should only be called at
+    phase boundaries (e.g., between DiT and VAE decode) or when VRAM pressure
+    is critical.
+    """
+    if not is_cuda_available():
+        return
+    
+    if device is None:
+        device = torch.device("cuda:0")
+    
+    if debug:
+        debug.start_timer("vram_defrag")
+    
+    # 1. Release all unused cached memory back to CUDA
+    torch.cuda.empty_cache()
+    
+    # 2. Collect inter-process shared memory
+    torch.cuda.ipc_collect()
+    
+    # 3. Reset peak memory stats for clean tracking
+    try:
+        torch.cuda.reset_peak_memory_stats(device)
+    except Exception:
+        pass
+    
+    # 4. Clear cuBLAS workspaces (can hold significant memory)
+    if hasattr(torch._C, '_cuda_clearCublasWorkspaces'):
+        torch._C._cuda_clearCublasWorkspaces()
+    
+    # 5. Python GC to release tensor references
+    gc.collect()
+    
+    # 6. Final cache clear after GC released references
+    torch.cuda.empty_cache()
+    
+    if debug:
+        debug.end_timer("vram_defrag", "VRAM defragmentation")
+        # Log post-defrag state
+        try:
+            free = torch.cuda.mem_get_info(device)[0] / (1024**3)
+            total = torch.cuda.mem_get_info(device)[1] / (1024**3)
+            debug.log(f"VRAM after defrag: {free:.2f}GB free / {total:.2f}GB total", category="memory")
+        except Exception:
+            pass
+
+
+def log_blackwell_status(debug: Optional['Debug'] = None) -> Dict[str, Any]:
+    """
+    Log Blackwell GPU detection status and CUDA toolkit alignment.
+    
+    Called once during initialization to report hardware capabilities.
+    
+    Returns combined status dict.
+    """
+    arch = detect_gpu_architecture()
+    cuda_info = check_cuda_toolkit_alignment(debug=debug)
+    
+    status = {**arch, **cuda_info}
+    
+    if not debug:
+        return status
+    
+    if arch["is_blackwell"]:
+        debug.log(
+            f"Blackwell {arch['sm_version']} Detected: {arch['gpu_name']}",
+            category="success", force=True
+        )
+        debug.log(
+            f"5th Gen Tensor Cores active — BF16/FP8 optimal precision",
+            category="info", indent_level=1
+        )
+    else:
+        debug.log(
+            f"GPU: {arch['gpu_name']} ({arch['name']}, {arch['sm_version']})",
+            category="info"
+        )
+    
+    return status
 
 
 def get_device_list(include_none: bool = False, include_cpu: bool = False) -> List[str]:

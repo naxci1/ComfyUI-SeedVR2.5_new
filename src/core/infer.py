@@ -168,7 +168,9 @@ class VideoDiffusionInfer():
                             latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
                                                 tile_overlap=self.encode_tile_overlap).posterior.mode().squeeze(2)
                     else:
-                        with torch.autocast(device.type, sample.dtype, enabled=True):
+                        # Force BF16 autocast on CUDA to prevent FP16 overflow artifacts
+                        autocast_dtype = torch.bfloat16 if device.type == 'cuda' else sample.dtype
+                        with torch.autocast(device.type, autocast_dtype, enabled=True):
                             if use_sample:
                                 latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size, 
                                                         tile_overlap=self.encode_tile_overlap).latent
@@ -269,7 +271,12 @@ class VideoDiffusionInfer():
                             tile_overlap=self.decode_tile_overlap
                         ).sample
                     else:
-                        with torch.autocast(device.type, latent.dtype, enabled=True):
+                        # Force BF16 autocast on CUDA to prevent FP16 overflow artifacts.
+                        # Blackwell (RTX 50xx) and Ada Lovelace (RTX 40xx) 5th/4th gen
+                        # Tensor Cores are optimized for BF16 and produce visual corruption
+                        # when FP16 overflows during VAE decode convolutions.
+                        autocast_dtype = torch.bfloat16 if device.type == 'cuda' else latent.dtype
+                        with torch.autocast(device.type, autocast_dtype, enabled=True):
                             sample = self.vae.decode(
                                 latent,
                                 tiled=self.decode_tiled, tile_size=self.decode_tile_size,
