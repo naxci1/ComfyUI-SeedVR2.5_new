@@ -23,7 +23,6 @@ Usage:
 """
 
 import torch
-import math
 from typing import Tuple, Dict, Any, Optional, TYPE_CHECKING
 
 from .memory_manager import (
@@ -228,9 +227,10 @@ def get_blackwell_tile_config(
     }
     
     if debug:
+        ovlp_pct = tile_overlap[0] * 100 // tile_size[0] if tile_size[0] > 0 else 0
         debug.log(
             f"Tile config: {tile_size[0]}×{tile_size[1]}px (dynamic), "
-            f"overlap={tile_overlap[0]}px ({tile_overlap[0]*100//tile_size[0]}%), "
+            f"overlap={tile_overlap[0]}px ({ovlp_pct}%), "
             f"dtype={compute_dtype}, "
             f"ping_pong={'yes' if config['use_ping_pong'] else 'no'}",
             category="vae", indent_level=1
@@ -448,9 +448,7 @@ def blackwell_tiled_decode(
                 output_w = W * scale_factor
                 
                 # Accumulate on offload device if specified, else same device
-                accum_device = getattr(vae_model, 'tensor_offload_device', None)
-                if accum_device is None or accum_device == decoded_tile.device:
-                    accum_device = decoded_tile.device
+                accum_device = getattr(vae_model, 'tensor_offload_device', None) or decoded_tile.device
                 
                 result = torch.zeros(
                     (b_out, c_out, out_f, output_h, output_w),
@@ -564,11 +562,7 @@ def _patched_tiled_decode(self, z: torch.Tensor,
     
     # On Blackwell: use dynamic tile sizing, ignoring caller's hardcoded values
     if arch["is_blackwell"]:
-        if z.ndim != 5:
-            z_check = z.unsqueeze(2)
-        else:
-            z_check = z
-        _, _, _, H, W = z_check.shape
+        H, W = z.shape[-2:]
         
         dyn_tile_size, dyn_tile_overlap = calculate_optimal_tile_size(
             latent_h=H, latent_w=W,
@@ -582,10 +576,11 @@ def _patched_tiled_decode(self, z: torch.Tensor,
         min_ov_w = max(_ABS_MIN_OVERLAP, int(tile_size[1] * _MIN_OVERLAP_RATIO))
         tile_overlap = (max(tile_overlap[0], min_ov_h), max(tile_overlap[1], min_ov_w))
     
-    defrag = is_cuda_available() and (
-        not is_cuda_available() or 
-        torch.cuda.mem_get_info()[1] / (1024**3) <= 16
-    ) if is_cuda_available() else False
+    # Enable defragmentation on ≤16GB cards
+    try:
+        defrag = is_cuda_available() and torch.cuda.mem_get_info()[1] / (1024**3) <= 16
+    except Exception:
+        defrag = False
     
     return blackwell_tiled_decode(
         vae_model=self,
