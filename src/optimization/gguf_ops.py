@@ -112,8 +112,9 @@ class _GGUFQuantizedBase(nn.Module):
         """
         Get dequantized weight optimized for computation.
         
-        For GGUF models: Dequantizes to FP16 first (original precision), 
-        then converts to compute dtype to preserve maximum precision.
+        Dequantizes directly to the caller's compute dtype (e.g. BF16) in a single
+        step.  The previous FP16→convert pattern caused an extra copy on BF16
+        pipelines; dequantizing straight to compute_dtype avoids that overhead.
         
         Args:
             input: Input tensor (used to determine device and compute dtype)
@@ -124,14 +125,8 @@ class _GGUFQuantizedBase(nn.Module):
         device = input.device
         compute_dtype = input.dtype
         
-        # Dequantize GGUF to FP16 first (original precision), then convert to compute dtype
-        # This preserves maximum precision during dequantization
-        dequant_dtype = torch.float16
-        weight = self.dequantize_weight(device, dequant_dtype)
-        
-        # Convert to compute dtype if different
-        if weight.dtype != compute_dtype:
-            weight = weight.to(compute_dtype)
+        # Dequantize directly to compute_dtype to avoid the FP16→BF16 copy overhead
+        weight = self.dequantize_weight(device, compute_dtype)
             
         return weight
 

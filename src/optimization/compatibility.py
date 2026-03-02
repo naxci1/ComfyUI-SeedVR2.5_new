@@ -916,23 +916,36 @@ class CompatibleDiT(torch.nn.Module):
     
     def forward(self, *args, **kwargs):
         """
-        Forward pass with minimal dtype conversion overhead
+        Forward pass with proactive dtype conversion to eliminate casting overhead.
         
         Conversion strategy:
-            - FP16/BFloat16/Float32 models: Use native precision (no conversion needed)
-            - FP8 models: Convert FP8 tensors to compute_dtype for arithmetic operations
-            (FP8 parameters stay in FP8 for memory efficiency, only converted for computation)
+            - All models: Pre-cast all tensor inputs to compute_dtype before the DiT
+              forward pass. This ensures downstream attention kernels (SageAttention 3,
+              FlashAttention) receive native-dtype tensors without per-layer casting.
+            - FP8 models: Additionally handles FP8-specific tensor types.
+            - GGUF models: On-the-fly dequantization already targets compute_dtype.
         """
+        target_dtype = self.compute_dtype
+        fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
         
-        # Only convert if we have an FP8 model for arithmetic operations 
-        if self.is_fp8_model:
-            fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
-            target_dtype = self.compute_dtype
-            
+        # Pre-cast all tensor inputs to compute_dtype to eliminate downstream
+        # dtype casting overhead (e.g., in attention kernels like SageAttention 3).
+        # For FP8 models this converts FP8 inputs; for non-FP8 models with
+        # mismatched input dtype (e.g., FP16 inputs + BF16 compute) this also
+        # ensures the DiT receives consistent precision throughout.
+        needs_cast = self.is_fp8_model or any(
+            isinstance(a, torch.Tensor) and a.is_floating_point() and a.dtype != target_dtype
+            for a in args
+        ) or any(
+            isinstance(v, torch.Tensor) and v.is_floating_point() and v.dtype != target_dtype
+            for v in kwargs.values()
+        )
+        
+        if needs_cast:
             # Convert args
             converted_args = []
             for arg in args:
-                if isinstance(arg, torch.Tensor) and arg.dtype in fp8_dtypes:
+                if isinstance(arg, torch.Tensor) and arg.is_floating_point() and arg.dtype != target_dtype:
                     converted_args.append(arg.to(target_dtype))
                 else:
                     converted_args.append(arg)
@@ -940,7 +953,7 @@ class CompatibleDiT(torch.nn.Module):
             # Convert kwargs
             converted_kwargs = {}
             for key, value in kwargs.items():
-                if isinstance(value, torch.Tensor) and value.dtype in fp8_dtypes:
+                if isinstance(value, torch.Tensor) and value.is_floating_point() and value.dtype != target_dtype:
                     converted_kwargs[key] = value.to(target_dtype)
                 else:
                     converted_kwargs[key] = value
@@ -956,7 +969,7 @@ class CompatibleDiT(torch.nn.Module):
             if self.is_fp8_model:
                 self.debug.log(f"FP8 model - converted FP8 tensors to {self.compute_dtype}", category="info", force=True)
             else:
-                self.debug.log(f"{self.model_dtype} model - no conversion applied", category="info", force=True)
+                self.debug.log(f"{self.model_dtype} model - inputs cast to {self.compute_dtype}", category="info", force=True)
             raise
     
     def __getattr__(self, name):

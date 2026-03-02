@@ -1244,6 +1244,22 @@ def apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionIn
             model.requires_grad_(False).eval()
             debug.end_timer("model_requires_grad", "VAE model set to eval mode")
         
+        # Disable upcast_softmax in decoder mid-block attention to keep the entire
+        # VAE pipeline in half precision (bf16/fp16).  The softmax upcast to FP32
+        # is a legacy diffusers default that triples decoder attention latency on
+        # modern GPUs (Blackwell / Ampere) without measurable quality benefit for
+        # inference-only workloads.
+        decoder = getattr(model, 'decoder', None)
+        if decoder and hasattr(decoder, 'mid_block'):
+            disabled_count = 0
+            for module in decoder.mid_block.modules():
+                if hasattr(module, 'upcast_softmax') and module.upcast_softmax:
+                    module.upcast_softmax = False
+                    disabled_count += 1
+            if disabled_count > 0:
+                debug.log(f"Disabled upcast_softmax in {disabled_count} decoder mid-block attention module(s) "
+                          f"for faster half-precision decoding", category="vae")
+        
         # Configure causal slicing if available - always apply as it's lightweight
         if hasattr(model, "set_causal_slicing") and hasattr(config.vae, "slicing"):
             debug.log("Configuring VAE causal slicing for temporal processing", category="vae")
