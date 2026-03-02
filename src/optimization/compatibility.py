@@ -456,8 +456,11 @@ def call_sage_attn_3_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, m
     SageAttention 3 / Blackwell provides maximum performance on RTX 50xx series GPUs.
     However, it only supports batched attention (uniform sequence lengths), not varlen.
     
-    This wrapper detects uniform-length batches and reshapes accordingly.
-    For variable-length sequences, it automatically falls back to SageAttention 2.
+    This wrapper handles two cases:
+    1. Uniform sequences: Zero-copy reshape to batched format (fastest path).
+    2. Non-uniform sequences: Pad shorter sequences to max length, run SA3 in
+       batched mode, then extract only the valid (non-padded) positions from the
+       output.  This avoids falling back to the slower SageAttention 2.
     
     This function is excluded from torch.compile because:
     1. SageAttention is a C++ extension that can't be compiled anyway
@@ -473,7 +476,7 @@ def call_sage_attn_3_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, m
         cu_seqlens_k: Cumulative sequence lengths for keys
         max_seqlen_q: Maximum query sequence length (can be tensor or int)
         max_seqlen_k: Maximum key sequence length (can be tensor or int)
-        **kwargs: Additional arguments (passed to SA2 fallback if needed)
+        **kwargs: Additional arguments (ignored for SA3)
         
     Returns:
         Attention output tensor (total_seq, heads, head_dim)
@@ -497,27 +500,8 @@ def call_sage_attn_3_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, m
     uniform_q = (seq_lens_q == seq_lens_q[0]).all()
     uniform_k = (seq_lens_k == seq_lens_k[0]).all()
     
-    if not (uniform_q and uniform_k):
-        # Fall back to SA2 for variable-length sequences
-        # This is expected behavior - SA3 Blackwell doesn't support varlen natively
-        if SAGE_ATTN_2_AVAILABLE:
-            if not _sa3_diagnostics_logged:
-                _sa3_diagnostics_logged = True
-                print("[SeedVR2 SA3 Diag] ⚠️ Non-uniform sequence lengths detected, falling back to SageAttention 2")
-            return call_sage_attn_2_varlen(
-                q, k, v, cu_seqlens_q, cu_seqlens_k,
-                max_seqlen_q, max_seqlen_k, **kwargs
-            )
-        raise RuntimeError(
-            "SageAttention 3 (Blackwell) requires uniform sequence lengths, "
-            "and SageAttention 2 is not available as fallback. "
-            "Please install sageattention package or use flash_attn/sdpa instead."
-        )
-    
-    # Extract batch dimensions
+    # Extract batch / head dimensions
     batch_size = len(cu_seqlens_q) - 1
-    seq_len_q = int(seq_lens_q[0].item())
-    seq_len_k = int(seq_lens_k[0].item())
     heads = q.shape[1]
     dim = q.shape[2]
     
@@ -533,6 +517,71 @@ def call_sage_attn_3_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, m
         q = q.to(torch.bfloat16)
         k = k.to(torch.bfloat16)
         v = v.to(torch.bfloat16)
+    
+    if not (uniform_q and uniform_k):
+        # ── Non-uniform path: pad to max length so SA3 can run in batched mode ──
+        if not _sa3_diagnostics_logged:
+            _sa3_diagnostics_logged = True
+            print(f"[SeedVR2 SA3 Diag] ✅ SageAttention 3 Blackwell with zero-pad (non-uniform seqlens)")
+            print(f"[SeedVR2 SA3 Diag]   Batch: {batch_size}, MaxSeqLen Q: {max_seqlen_q}, MaxSeqLen K: {max_seqlen_k}, Heads: {heads}, Dim: {dim}")
+            if q.dtype == torch.float16:
+                print(f"[SeedVR2 SA3 Diag]   FP16 mode: sageattn_qk_int8_pv_fp16_cuda kernel expected")
+            elif q.dtype == torch.bfloat16:
+                print(f"[SeedVR2 SA3 Diag]   BF16 mode: sageattn_qk_int8_pv_bf16_cuda kernel expected")
+        
+        # Build scatter indices for vectorized padding.
+        # For each batch element i with sequence length s_i starting at offset o_i,
+        # we compute a flat index into a (batch, max_seqlen, ...) tensor so that
+        # position j of sequence i lands at row (i * max_seqlen + j).
+        # This replaces a Python loop with a single index_copy_ call per tensor.
+        q_offsets = cu_seqlens_q[:-1]  # (batch,)
+        k_offsets = cu_seqlens_k[:-1]
+        
+        # Source indices (into the packed varlen tensor) for Q and K/V
+        src_idx_q = torch.cat([
+            torch.arange(sq, device=q.device) + q_offsets[i]
+            for i, sq in enumerate(seq_lens_q)
+        ])
+        src_idx_k = torch.cat([
+            torch.arange(sk, device=k.device) + k_offsets[i]
+            for i, sk in enumerate(seq_lens_k)
+        ])
+        
+        # Destination indices (into the padded batch tensor, flattened along batch*seq)
+        dst_idx_q = torch.cat([
+            torch.arange(sq, device=q.device) + i * max_seqlen_q
+            for i, sq in enumerate(seq_lens_q)
+        ])
+        dst_idx_k = torch.cat([
+            torch.arange(sk, device=k.device) + i * max_seqlen_k
+            for i, sk in enumerate(seq_lens_k)
+        ])
+        
+        # Allocate padded tensors and scatter valid tokens in one operation
+        q_padded = q.new_zeros((batch_size * max_seqlen_q, heads, dim))
+        k_padded = k.new_zeros((batch_size * max_seqlen_k, heads, dim))
+        v_padded = v.new_zeros((batch_size * max_seqlen_k, heads, dim))
+        
+        q_padded.index_copy_(0, dst_idx_q, q.index_select(0, src_idx_q))
+        k_padded.index_copy_(0, dst_idx_k, k.index_select(0, src_idx_k))
+        v_padded.index_copy_(0, dst_idx_k, v.index_select(0, src_idx_k))
+        
+        # Reshape to (batch, heads, seq, dim) for SA3
+        q_padded = q_padded.view(batch_size, max_seqlen_q, heads, dim).transpose(1, 2)
+        k_padded = k_padded.view(batch_size, max_seqlen_k, heads, dim).transpose(1, 2)
+        v_padded = v_padded.view(batch_size, max_seqlen_k, heads, dim).transpose(1, 2)
+        
+        out_padded = sageattn_blackwell(q_padded, k_padded, v_padded, per_block_mean=False)
+        
+        # Gather valid (non-padded) positions back into varlen layout
+        out_flat = out_padded.transpose(1, 2).reshape(batch_size * max_seqlen_q, heads, dim)
+        out = out_flat.index_select(0, dst_idx_q).contiguous()
+        
+        return out.to(out_dtype) if out.dtype != out_dtype else out
+    
+    # ── Uniform path: zero-copy reshape (fastest) ──
+    seq_len_q = int(seq_lens_q[0].item())
+    seq_len_k = int(seq_lens_k[0].item())
     
     # First-call diagnostics: log kernel selection, tensor alignment, and dtype info
     if not _sa3_diagnostics_logged:
