@@ -241,6 +241,10 @@ class VideoDiffusionInfer():
                 self._blackwell_patch_applied = True
                 apply_blackwell_tiled_decode_patch(self.vae, debug=self.debug)
 
+            # Enable TF32 for Blackwell tensor core optimization
+            if device.type == 'cuda':
+                torch.backends.cuda.matmul.allow_tf32 = True
+
             for i, latent in enumerate(latents):
                 latent = latent / scale + shift
                 latent = optimized_channels_to_second(latent)
@@ -279,8 +283,9 @@ class VideoDiffusionInfer():
                 # - MPS: explicit dtype conversion (no autocast support)
                 # - Matching dtypes: direct decode
                 if device.type == 'cuda':
-                    # Pure BF16 pipeline: cast latent to BF16, ensure contiguous, disable autocast
-                    latent = latent.to(torch.bfloat16).contiguous()
+                    # Pure BF16 pipeline: cast latent to BF16, NHWC channels_last alignment, disable autocast
+                    mem_fmt = torch.channels_last if latent.ndim == 4 else torch.channels_last_3d
+                    latent = latent.to(torch.bfloat16).contiguous(memory_format=mem_fmt)
                     with torch.amp.autocast('cuda', enabled=False):
                         sample = self.vae.decode(
                             latent,
@@ -311,6 +316,10 @@ class VideoDiffusionInfer():
                 samples = na.unpack(samples, indices)
             else:
                 samples = [sample.squeeze(0) for sample in samples]
+
+            # Synchronize GPU before returning to prevent partial data transfer corruption
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
 
         return samples
 

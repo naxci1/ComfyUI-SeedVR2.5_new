@@ -156,6 +156,14 @@ def blackwell_tiled_decode(
             category="vae", force=True, indent_level=1
         )
     
+    # Enforce force_upcast = False inside decode (regardless of global state)
+    # FP32 upcasting causes visual corruption on Blackwell (RTX 50xx) GPUs
+    if hasattr(vae_model, 'config'):
+        vae_model.config.force_upcast = False
+    decoder = getattr(vae_model, 'decoder', None)
+    if decoder is not None and hasattr(decoder, 'config'):
+        decoder.config.force_upcast = False
+    
     if latent.ndim != 5:
         latent = latent.unsqueeze(2)
     
@@ -174,7 +182,7 @@ def blackwell_tiled_decode(
     # If latent fits in a single tile, skip tiling overhead
     if H <= latent_tile_h and W <= latent_tile_w:
         with torch.no_grad(), torch.amp.autocast('cuda', enabled=False):
-            latent_bf16 = (latent.to(compute_dtype) if latent.dtype != compute_dtype else latent).contiguous()
+            latent_bf16 = (latent.to(compute_dtype) if latent.dtype != compute_dtype else latent).contiguous(memory_format=torch.channels_last_3d)
             return vae_model.slicing_decode(latent_bf16).contiguous()
     
     latent_overlap_h = max(0, min(overlap_h // scale_factor, latent_tile_h - 1))
@@ -231,8 +239,8 @@ def blackwell_tiled_decode(
                 tile_latent = latent_bf16[:, :, :, y_lat:y_lat_end, x_lat:x_lat_end]
                 
                 # Decode tile — autocast is disabled, pure BF16
-                # Ensure contiguous layout before decode (Blackwell hates channels_last)
-                decoded_tile = vae_model.slicing_decode(tile_latent.contiguous()).contiguous()
+                # NHWC (channels_last) memory alignment for stable BF16 on Blackwell SM120
+                decoded_tile = vae_model.slicing_decode(tile_latent.contiguous(memory_format=torch.channels_last_3d)).contiguous()
                 
                 # Initialize accumulation buffers on first tile
                 if result is None:
