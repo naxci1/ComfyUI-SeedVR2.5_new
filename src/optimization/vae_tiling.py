@@ -120,8 +120,8 @@ def _build_cosine_ramp(length: int, device: torch.device, dtype: torch.dtype) ->
 def blackwell_tiled_decode(
     vae_model: torch.nn.Module,
     latent: torch.Tensor,
-    tile_size: Tuple[int, int] = (512, 512),
-    tile_overlap: Tuple[int, int] = (64, 64),
+    tile_size: Tuple[int, int] = (960, 960),
+    tile_overlap: Tuple[int, int] = (128, 128),
     compute_dtype: torch.dtype = torch.bfloat16,
     debug: Optional['Debug'] = None,
 ) -> torch.Tensor:
@@ -321,8 +321,8 @@ def blackwell_tiled_decode(
 # ── Monkey-Patching: Override VideoAutoencoderKL.tiled_decode ────────────────
 
 def _patched_tiled_decode(self, z: torch.Tensor, 
-                          tile_size: Tuple[int, int] = (512, 512),
-                          tile_overlap: Tuple[int, int] = (64, 64)) -> torch.Tensor:
+                          tile_size: Tuple[int, int] = (960, 960),
+                          tile_overlap: Tuple[int, int] = (128, 128)) -> torch.Tensor:
     """
     Replacement for VideoAutoencoderKL.tiled_decode that uses pure BF16
     pipeline with user-specified tile_size and tile_overlap.
@@ -394,11 +394,15 @@ def apply_blackwell_tiled_decode_patch(vae_model: torch.nn.Module,
     # FP32 upcasting causes visual corruption on Blackwell (RTX 50xx) GPUs
     if hasattr(vae_model, 'config'):
         vae_model.config.force_upcast = False
-        if debug:
-            debug.log(
-                "force_upcast = False — pure BF16 pipeline active",
-                category="info", indent_level=1
-            )
+    # Also disable on the nested decoder config (some VAE architectures store it separately)
+    decoder = getattr(vae_model, 'decoder', None)
+    if decoder is not None and hasattr(decoder, 'config'):
+        decoder.config.force_upcast = False
+    if debug:
+        debug.log(
+            "force_upcast = False — pure BF16 pipeline active",
+            category="info", indent_level=1
+        )
     
     if debug:
         debug.log(

@@ -38,8 +38,8 @@ class VideoDiffusionInfer():
     def __init__(self, config: DictConfig, debug: 'Debug',
                  encode_tiled: bool = False, encode_tile_size: Tuple[int, int] = (512, 512), 
                  encode_tile_overlap: Tuple[int, int] = (64, 64),
-                 decode_tiled: bool = False, decode_tile_size: Tuple[int, int] = (512, 512),
-                 decode_tile_overlap: Tuple[int, int] = (64, 64),
+                 decode_tiled: bool = False, decode_tile_size: Tuple[int, int] = (960, 960),
+                 decode_tile_overlap: Tuple[int, int] = (128, 128),
                  tile_debug: str = "false"):
         self.config = config
         self.debug = debug
