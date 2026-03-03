@@ -168,7 +168,7 @@ def blackwell_tiled_decode(
     # If latent fits in a single tile, skip tiling overhead
     if H <= latent_tile_h and W <= latent_tile_w:
         with torch.no_grad(), torch.amp.autocast('cuda', enabled=False):
-            latent_bf16 = latent.to(compute_dtype).contiguous() if latent.dtype != compute_dtype else latent.contiguous()
+            latent_bf16 = (latent.to(compute_dtype) if latent.dtype != compute_dtype else latent).contiguous()
             return vae_model.slicing_decode(latent_bf16).contiguous()
     
     latent_overlap_h = max(0, min(overlap_h // scale_factor, latent_tile_h - 1))
@@ -204,7 +204,7 @@ def blackwell_tiled_decode(
     count = None
     
     # Cast latent to BF16 once upfront and ensure contiguous memory layout
-    latent_bf16 = latent.to(compute_dtype).contiguous() if latent.dtype != compute_dtype else latent.contiguous()
+    latent_bf16 = (latent.to(compute_dtype) if latent.dtype != compute_dtype else latent).contiguous()
     
     tile_id = 0
     # Wrap entire decode loop: no_grad + autocast disabled to prevent FP32 upcasting
