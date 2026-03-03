@@ -267,6 +267,11 @@ class VideoDiffusionInfer():
                             f"causes {'autocast' if uses_autocast else 'explicit cast'} overhead",
                             category="warning", indent_level=1, force=True
                         )
+                    if self.decode_tiled:
+                        self.debug.log(
+                            f"Using Tile Size: {self.decode_tile_size}, Overlap: {self.decode_tile_overlap}",
+                            category="vae", indent_level=1
+                        )
 
                 # Decode with dtype handling:
                 # - CUDA: disable autocast to prevent FP32 upcasting (causes Blackwell corruption)

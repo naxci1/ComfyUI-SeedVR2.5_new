@@ -150,6 +150,12 @@ def blackwell_tiled_decode(
     Returns:
         Decoded tensor [B, C_out, F, H_out, W_out]
     """
+    if debug:
+        debug.log(
+            f"Using Tile Size: {tile_size}, Overlap: {tile_overlap}",
+            category="vae", force=True, indent_level=1
+        )
+    
     if latent.ndim != 5:
         latent = latent.unsqueeze(2)
     
