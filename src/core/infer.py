@@ -274,14 +274,14 @@ class VideoDiffusionInfer():
                 # - MPS: explicit dtype conversion (no autocast support)
                 # - Matching dtypes: direct decode
                 if device.type == 'cuda':
-                    # Pure BF16 pipeline: cast latent to BF16, disable autocast
-                    latent = latent.to(torch.bfloat16)
-                    with torch.cuda.amp.autocast(enabled=False):
+                    # Pure BF16 pipeline: cast latent to BF16, ensure contiguous, disable autocast
+                    latent = latent.to(torch.bfloat16).contiguous()
+                    with torch.amp.autocast('cuda', enabled=False):
                         sample = self.vae.decode(
                             latent,
                             tiled=self.decode_tiled, tile_size=self.decode_tile_size,
                             tile_overlap=self.decode_tile_overlap
-                        ).sample
+                        ).sample.contiguous()
                 elif device.type == 'mps' and vae_dtype != latent.dtype:
                     # MPS: explicit dtype conversion instead of autocast
                     latent = latent.to(vae_dtype)

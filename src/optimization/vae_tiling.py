@@ -167,9 +167,9 @@ def blackwell_tiled_decode(
     
     # If latent fits in a single tile, skip tiling overhead
     if H <= latent_tile_h and W <= latent_tile_w:
-        with torch.no_grad(), torch.cuda.amp.autocast(enabled=False):
-            latent_bf16 = latent.to(compute_dtype) if latent.dtype != compute_dtype else latent
-            return vae_model.slicing_decode(latent_bf16)
+        with torch.no_grad(), torch.amp.autocast('cuda', enabled=False):
+            latent_bf16 = latent.to(compute_dtype).contiguous() if latent.dtype != compute_dtype else latent.contiguous()
+            return vae_model.slicing_decode(latent_bf16).contiguous()
     
     latent_overlap_h = max(0, min(overlap_h // scale_factor, latent_tile_h - 1))
     latent_overlap_w = max(0, min(overlap_w // scale_factor, latent_tile_w - 1))
@@ -203,12 +203,12 @@ def blackwell_tiled_decode(
     result = None
     count = None
     
-    # Cast latent to BF16 once upfront
-    latent_bf16 = latent.to(compute_dtype) if latent.dtype != compute_dtype else latent
+    # Cast latent to BF16 once upfront and ensure contiguous memory layout
+    latent_bf16 = latent.to(compute_dtype).contiguous() if latent.dtype != compute_dtype else latent.contiguous()
     
     tile_id = 0
     # Wrap entire decode loop: no_grad + autocast disabled to prevent FP32 upcasting
-    with torch.no_grad(), torch.cuda.amp.autocast(enabled=False):
+    with torch.no_grad(), torch.amp.autocast('cuda', enabled=False):
         for y_lat in range(0, H, stride_h):
             y_lat_end = min(y_lat + latent_tile_h, H)
             for x_lat in range(0, W, stride_w):
@@ -225,7 +225,8 @@ def blackwell_tiled_decode(
                 tile_latent = latent_bf16[:, :, :, y_lat:y_lat_end, x_lat:x_lat_end]
                 
                 # Decode tile — autocast is disabled, pure BF16
-                decoded_tile = vae_model.slicing_decode(tile_latent)
+                # Ensure contiguous layout before decode (Blackwell hates channels_last)
+                decoded_tile = vae_model.slicing_decode(tile_latent.contiguous()).contiguous()
                 
                 # Initialize accumulation buffers on first tile
                 if result is None:
@@ -389,14 +390,13 @@ def apply_blackwell_tiled_decode_patch(vae_model: torch.nn.Module,
     # Log backend status on first patch application
     log_tiling_backend_status(debug=debug)
     
-    # On Blackwell: disable force_upcast to prevent FP32 upcasting
-    # that causes numerical overflow / visual corruption with the BF16 pipeline
-    arch = detect_gpu_architecture()
-    if hasattr(vae_model, 'config') and hasattr(vae_model.config, 'force_upcast'):
+    # KILL-SWITCH: force_upcast = False unconditionally
+    # FP32 upcasting causes visual corruption on Blackwell (RTX 50xx) GPUs
+    if hasattr(vae_model, 'config'):
         vae_model.config.force_upcast = False
         if debug:
             debug.log(
-                "force_upcast disabled — pure BF16 pipeline active",
+                "force_upcast = False — pure BF16 pipeline active",
                 category="info", indent_level=1
             )
     

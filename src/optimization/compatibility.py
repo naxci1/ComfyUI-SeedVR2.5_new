@@ -823,7 +823,7 @@ def call_rope_with_stability(method, *args, **kwargs):
     # Only use CUDA autocast context on CUDA devices
     # MPS has no CUDA autocast to disable
     if torch.cuda.is_available():
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
             return method(*args, **kwargs)
     else:
         return method(*args, **kwargs)
