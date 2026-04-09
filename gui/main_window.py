@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QSettings
+from PyQt6.QtCore import Qt, QSettings, QUrl
 from PyQt6.QtGui import QFont, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QFileDialog,
@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSlider,
     QSpinBox,
     QSplitter,
     QTextEdit,
@@ -39,6 +40,13 @@ try:
     _CV2_AVAILABLE = True
 except ImportError:
     _CV2_AVAILABLE = False
+
+try:
+    from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+    from PyQt6.QtMultimediaWidgets import QVideoWidget
+    _MULTIMEDIA_AVAILABLE = True
+except ImportError:
+    _MULTIMEDIA_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # GPU auto-detection
@@ -109,7 +117,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("SeedVR2 Upscaler")
-        self.resize(1280, 860)
+        self.resize(1400, 960)
 
         self._thread = None
         self._worker = None
@@ -153,7 +161,7 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self._build_right_panel())
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 3)
-        splitter.setSizes([460, 560])
+        splitter.setSizes([580, 620])
 
         # ── 3. Bottom controls bar ─────────────────────────────────────
         root_layout.addWidget(self._build_bottom_bar())
@@ -162,28 +170,32 @@ class MainWindow(QMainWindow):
 
     def _build_left_panel(self) -> QWidget:
         panel = QWidget()
-        panel.setMinimumWidth(400)
+        panel.setMinimumWidth(500)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 4, 0)
         layout.setSpacing(8)
 
-        # Preview group
-        preview_group = QGroupBox("Preview")
-        pg_layout = QVBoxLayout(preview_group)
+        # ── Dual video players side-by-side ────────────────────────────
+        vid_row = QWidget()
+        vid_layout = QHBoxLayout(vid_row)
+        vid_layout.setContentsMargins(0, 0, 0, 0)
+        vid_layout.setSpacing(4)
+        vid_layout.addWidget(self._build_input_player_group())
+        vid_layout.addWidget(self._build_output_player_group())
+        layout.addWidget(vid_row)
 
-        self.preview_label = QLabel("No video selected")
-        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_label.setMinimumHeight(220)
-        self.preview_label.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
-        )
-        self.preview_label.setStyleSheet(
-            "background-color: #0d0d0d; border: 1px solid #2a2a2a; border-radius: 4px; color: #555555;"
-        )
-        pg_layout.addWidget(self.preview_label)
-        layout.addWidget(preview_group)
+        # ── Sync Play button ───────────────────────────────────────────
+        sync_row = QHBoxLayout()
+        sync_row.addStretch(1)
+        self.sync_play_btn = QPushButton("⟳  Sync Play")
+        self.sync_play_btn.setCheckable(True)
+        self.sync_play_btn.setToolTip("Synchronize playback of both players")
+        self.sync_play_btn.toggled.connect(self._on_sync_toggled)
+        sync_row.addWidget(self.sync_play_btn)
+        sync_row.addStretch(1)
+        layout.addLayout(sync_row)
 
-        # Input file
+        # ── Input / Output paths ───────────────────────────────────────
         input_box, input_form = _make_group("Input / Output")
 
         self.seedvr2_folder_edit = QLineEdit()
@@ -225,6 +237,106 @@ class MainWindow(QMainWindow):
         layout.addWidget(input_box)
         layout.addStretch(1)
         return panel
+
+    def _build_input_player_group(self) -> QGroupBox:
+        """Build the Input Preview player group."""
+        group = QGroupBox("Input Preview")
+        vbox = QVBoxLayout(group)
+        vbox.setSpacing(3)
+
+        if _MULTIMEDIA_AVAILABLE:
+            self._input_video_widget = QVideoWidget()
+            self._input_video_widget.setMinimumHeight(170)
+            self._input_player = QMediaPlayer()
+            self._input_audio_out = QAudioOutput()
+            self._input_player.setAudioOutput(self._input_audio_out)
+            self._input_player.setVideoOutput(self._input_video_widget)
+            self._input_player.durationChanged.connect(self._on_input_duration)
+            self._input_player.positionChanged.connect(self._on_input_position)
+            self._input_player.playbackStateChanged.connect(self._on_input_state)
+            vbox.addWidget(self._input_video_widget, stretch=1)
+        else:
+            self._input_video_widget = None  # type: ignore[assignment]
+            self._input_player = None  # type: ignore[assignment]
+            placeholder = QLabel("PyQt6.QtMultimedia\nnot available")
+            placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            placeholder.setMinimumHeight(170)
+            placeholder.setStyleSheet(
+                "background:#0d0d0d; border:1px solid #2a2a2a; border-radius:4px; color:#555;"
+            )
+            vbox.addWidget(placeholder, stretch=1)
+
+        self._input_seek = QSlider(Qt.Orientation.Horizontal)
+        self._input_seek.setRange(0, 0)
+        self._input_seek.sliderMoved.connect(self._seek_input)
+        vbox.addWidget(self._input_seek)
+
+        ctrl = QHBoxLayout()
+        self._input_play_btn = QPushButton("▶")
+        self._input_play_btn.setFixedWidth(32)
+        self._input_play_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
+        self._input_play_btn.clicked.connect(self._toggle_input_play)
+        self._input_stop_btn = QPushButton("⏹")
+        self._input_stop_btn.setFixedWidth(32)
+        self._input_stop_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
+        self._input_stop_btn.clicked.connect(self._stop_input)
+        ctrl.addWidget(self._input_play_btn)
+        ctrl.addWidget(self._input_stop_btn)
+        ctrl.addStretch(1)
+        vbox.addLayout(ctrl)
+        return group
+
+    def _build_output_player_group(self) -> QGroupBox:
+        """Build the Output Preview player group."""
+        group = QGroupBox("Output Preview")
+        vbox = QVBoxLayout(group)
+        vbox.setSpacing(3)
+
+        if _MULTIMEDIA_AVAILABLE:
+            self._output_video_widget = QVideoWidget()
+            self._output_video_widget.setMinimumHeight(170)
+            self._output_player = QMediaPlayer()
+            self._output_audio_out = QAudioOutput()
+            self._output_player.setAudioOutput(self._output_audio_out)
+            self._output_player.setVideoOutput(self._output_video_widget)
+            self._output_player.durationChanged.connect(self._on_output_duration)
+            self._output_player.positionChanged.connect(self._on_output_position)
+            self._output_player.playbackStateChanged.connect(self._on_output_state)
+            vbox.addWidget(self._output_video_widget, stretch=1)
+        else:
+            self._output_video_widget = None  # type: ignore[assignment]
+            self._output_player = None  # type: ignore[assignment]
+            placeholder = QLabel("PyQt6.QtMultimedia\nnot available")
+            placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            placeholder.setMinimumHeight(170)
+            placeholder.setStyleSheet(
+                "background:#0d0d0d; border:1px solid #2a2a2a; border-radius:4px; color:#555;"
+            )
+            vbox.addWidget(placeholder, stretch=1)
+
+        self._output_seek = QSlider(Qt.Orientation.Horizontal)
+        self._output_seek.setRange(0, 0)
+        self._output_seek.sliderMoved.connect(self._seek_output)
+        vbox.addWidget(self._output_seek)
+
+        ctrl = QHBoxLayout()
+        self._output_play_btn = QPushButton("▶")
+        self._output_play_btn.setFixedWidth(32)
+        self._output_play_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
+        self._output_play_btn.clicked.connect(self._toggle_output_play)
+        self._output_stop_btn = QPushButton("⏹")
+        self._output_stop_btn.setFixedWidth(32)
+        self._output_stop_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
+        self._output_stop_btn.clicked.connect(self._stop_output)
+        browse_out_vid_btn = QPushButton("Open…")
+        browse_out_vid_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
+        browse_out_vid_btn.clicked.connect(self._browse_output_video)
+        ctrl.addWidget(self._output_play_btn)
+        ctrl.addWidget(self._output_stop_btn)
+        ctrl.addStretch(1)
+        ctrl.addWidget(browse_out_vid_btn)
+        vbox.addLayout(ctrl)
+        return group
 
     # ── Right panel ────────────────────────────────────────────────────
 
@@ -565,35 +677,12 @@ class MainWindow(QMainWindow):
             self.model_dir_edit.setText(path)
 
     # ------------------------------------------------------------------
-    # Preview
+    # Preview / video loading
     # ------------------------------------------------------------------
 
     def _load_preview(self, path: str) -> None:
-        if not _CV2_AVAILABLE:
-            self.preview_label.setText("cv2 not available – no preview")
-            return
-
-        try:
-            cap = cv2.VideoCapture(path)
-            ret, frame = cap.read()
-            cap.release()
-            if not ret or frame is None:
-                self.preview_label.setText("Could not read frame")
-                return
-
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            h, w, ch = rgb.shape
-            bytes_per_line = ch * w
-            qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-            pixmap = QPixmap.fromImage(qimg)
-            pixmap = pixmap.scaled(
-                self.preview_label.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            self.preview_label.setPixmap(pixmap)
-        except Exception as exc:
-            self.preview_label.setText(f"Preview error: {exc}")
+        """Load *path* into the Input Preview player."""
+        self._load_input_video(path)
 
     # ------------------------------------------------------------------
     # Argument builder
@@ -830,6 +919,129 @@ class MainWindow(QMainWindow):
         self.status_label.setText("Aborting…")
 
     # ------------------------------------------------------------------
+    # Input player controls
+    # ------------------------------------------------------------------
+
+    def _load_input_video(self, path: str) -> None:
+        """Load *path* into the Input Preview player."""
+        if self._input_player is None:
+            return
+        self._input_player.setSource(QUrl.fromLocalFile(path))
+
+    def _toggle_input_play(self) -> None:
+        if self._input_player is None:
+            return
+        if self._input_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self._input_player.pause()
+        else:
+            self._input_player.play()
+
+    def _stop_input(self) -> None:
+        if self._input_player:
+            self._input_player.stop()
+
+    def _seek_input(self, pos: int) -> None:
+        if self._input_player:
+            self._input_player.setPosition(pos)
+
+    def _on_input_duration(self, duration: int) -> None:
+        self._input_seek.setRange(0, duration)
+
+    def _on_input_position(self, position: int) -> None:
+        if not self._input_seek.isSliderDown():
+            self._input_seek.setValue(position)
+        if self.sync_play_btn.isChecked() and self._output_player:
+            if abs(self._output_player.position() - position) > 500:
+                self._output_player.setPosition(position)
+
+    def _on_input_state(self, state) -> None:
+        if self._input_player is None:
+            return
+        playing = state == QMediaPlayer.PlaybackState.PlayingState
+        self._input_play_btn.setText("⏸" if playing else "▶")
+        if self.sync_play_btn.isChecked() and self._output_player:
+            if playing:
+                self._output_player.play()
+            else:
+                self._output_player.pause()
+
+    # ------------------------------------------------------------------
+    # Output player controls
+    # ------------------------------------------------------------------
+
+    def _load_output_video(self, path: str) -> None:
+        """Load *path* into the Output Preview player."""
+        if self._output_player is None:
+            return
+        self._output_player.setSource(QUrl.fromLocalFile(path))
+
+    def _toggle_output_play(self) -> None:
+        if self._output_player is None:
+            return
+        if self._output_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self._output_player.pause()
+        else:
+            self._output_player.play()
+
+    def _stop_output(self) -> None:
+        if self._output_player:
+            self._output_player.stop()
+
+    def _seek_output(self, pos: int) -> None:
+        if self._output_player:
+            self._output_player.setPosition(pos)
+
+    def _on_output_duration(self, duration: int) -> None:
+        self._output_seek.setRange(0, duration)
+
+    def _on_output_position(self, position: int) -> None:
+        if not self._output_seek.isSliderDown():
+            self._output_seek.setValue(position)
+
+    def _on_output_state(self, state) -> None:
+        if self._output_player is None:
+            return
+        playing = state == QMediaPlayer.PlaybackState.PlayingState
+        self._output_play_btn.setText("⏸" if playing else "▶")
+
+    def _on_sync_toggled(self, checked: bool) -> None:
+        """When Sync Play is enabled, snap the output player to the input position."""
+        if checked and self._input_player and self._output_player:
+            self._output_player.setPosition(self._input_player.position())
+
+    def _browse_output_video(self) -> None:
+        """Let the user manually pick an output video to preview."""
+        start_dir = self.output_edit.text().strip() or ""
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Output Video",
+            start_dir,
+            "Videos (*.mp4 *.avi *.mov *.mkv *.webm);;All Files (*)",
+        )
+        if path:
+            self._load_output_video(path)
+
+    def _try_auto_load_output(self) -> None:
+        """After a successful run, auto-load the newest output video."""
+        if not _MULTIMEDIA_AVAILABLE:
+            return
+        out = self.output_edit.text().strip()
+        if not out:
+            return
+        out_path = Path(out)
+        if out_path.is_file():
+            self._load_output_video(str(out_path))
+        elif out_path.is_dir():
+            video_exts = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+            candidates = sorted(
+                (f for f in out_path.iterdir() if f.suffix.lower() in video_exts),
+                key=lambda f: f.stat().st_mtime,
+                reverse=True,
+            )
+            if candidates:
+                self._load_output_video(str(candidates[0]))
+
+    # ------------------------------------------------------------------
     # Signal handlers
     # ------------------------------------------------------------------
 
@@ -848,6 +1060,7 @@ class MainWindow(QMainWindow):
         if success:
             self.progress_bar.setValue(100)
             self.status_label.setText(f"✅  {msg}")
+            self._try_auto_load_output()
         else:
             self.status_label.setText(f"⚠  {msg}")
 

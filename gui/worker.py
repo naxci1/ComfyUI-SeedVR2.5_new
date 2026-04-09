@@ -15,6 +15,14 @@ from typing import List, Optional
 
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
+# ---------------------------------------------------------------------------
+# Platform helpers
+# ---------------------------------------------------------------------------
+
+# Suppress the console window that would appear on Windows when launching
+# a subprocess from a --noconsole PyInstaller bundle or a windowed app.
+_CREATE_NO_WINDOW: int = 0x08000000 if sys.platform == "win32" else 0
+
 
 # ---------------------------------------------------------------------------
 # Python executable path
@@ -148,6 +156,7 @@ class InferenceWorker(QObject):
                 ],
                 env=env,
                 check=False,
+                creationflags=_CREATE_NO_WINDOW,
             )
         except FileNotFoundError:
             self.log_line.emit(
@@ -164,6 +173,7 @@ class InferenceWorker(QObject):
                 errors="replace",
                 bufsize=1,
                 env=env,
+                creationflags=_CREATE_NO_WINDOW,
             )
         except FileNotFoundError:
             self.log_line.emit(

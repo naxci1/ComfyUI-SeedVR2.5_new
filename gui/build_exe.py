@@ -1,30 +1,35 @@
 #!/usr/bin/env python3
 """
-build_exe.py – Build a lightweight SeedVR2_GUI.exe with PyInstaller.
+build_exe.py – Build a standalone SeedVR2_GUI.exe with PyInstaller.
 
-Strategy
---------
-The EXE is a "remote controller" that the user points at their existing
-ComfyUI / Python installation.  No Python interpreter, no PyTorch DLLs,
-and no SeedVR2 repository files are bundled.  Only the GUI code itself is
-included, making the EXE small enough to distribute easily.
+Two modes are supported
+-----------------------
+**Lightweight (default)**
+    A small "remote controller" EXE that points at the user's existing
+    ComfyUI / Python installation at runtime.  Only the GUI code is bundled.
 
-At runtime the user selects:
-  • Their Python executable (e.g. ComfyUI's python_embeded\\python.exe)
-  • The SeedVR2 folder containing inference_cli.py
-  • Their model directory
-
-Both paths are saved via QSettings so the user only needs to configure
-them once.
+**Portable (--python-embeded-dir + --seedvr2-dir)**
+    A self-contained bundle that includes the ComfyUI embedded Python
+    interpreter and the entire SeedVR2 source tree (excluding the ``models``
+    sub-folder to keep the size manageable, typically 3-4 GB).  The user
+    can run this EXE without any external Python installation.
 
 Usage
 -----
-    python gui/build_exe.py [options]
+    # Lightweight (default):
+    python gui/build_exe.py
+
+    # Portable bundle:
+    python gui/build_exe.py \\
+        --python-embeded-dir "C:\\ComfyUI-yeni\\python_embeded" \\
+        --seedvr2-dir        "C:\\ComfyUI-yeni\\custom_nodes\\seedvr2_videoupscaler"
 
 Options
 -------
-    --output-dir  PATH   Directory for the built EXE.
-                         Default: <repo_root>/dist
+    --output-dir          PATH   Directory for the built EXE.
+                                 Default: <repo_root>/dist
+    --python-embeded-dir  PATH   ComfyUI embedded Python directory to bundle.
+    --seedvr2-dir         PATH   SeedVR2 source folder (inference_cli.py parent).
 """
 
 from __future__ import annotations
@@ -48,7 +53,23 @@ def main() -> None:
         default=None,
         help="Output directory for the built EXE",
     )
+    parser.add_argument(
+        "--python-embeded-dir",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Path to the ComfyUI embedded Python directory to bundle (portable mode)",
+    )
+    parser.add_argument(
+        "--seedvr2-dir",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Path to the SeedVR2 source folder (portable mode; models/ is excluded)",
+    )
     args = parser.parse_args()
+
+    portable: bool = bool(args.python_embeded_dir or args.seedvr2_dir)
 
     gui_dir: Path = Path(__file__).resolve().parent
     repo_root: Path = gui_dir.parent
@@ -63,20 +84,53 @@ def main() -> None:
         "--name", "SeedVR2_GUI",
         "--onefile",
         "--noconsole",
-        # Bundle only the GUI stylesheet; worker/main_window are imported
-        # from the frozen package so PyInstaller discovers them automatically.
+        # Bundle the GUI stylesheet; worker/main_window are discovered automatically.
         "--add-data", f"{gui_dir / 'styles.py'}{os.pathsep}gui",
-        # Hidden imports required by PyQt6 + optional cv2 preview
+        # Core hidden imports (PyQt6 + optional cv2 preview)
         "--hidden-import", "PyQt6",
         "--hidden-import", "PyQt6.QtWidgets",
         "--hidden-import", "PyQt6.QtCore",
         "--hidden-import", "PyQt6.QtGui",
+        "--hidden-import", "PyQt6.QtMultimedia",
+        "--hidden-import", "PyQt6.QtMultimediaWidgets",
         "--hidden-import", "cv2",
+        # Collect all PyQt6 resources (multimedia codecs, plugins, etc.)
+        "--collect-all", "PyQt6",
         # Output paths
         "--distpath", str(dist_dir),
         "--workpath", str(repo_root / "build"),
         "--specpath", str(repo_root),
     ]
+
+    # ── Portable mode: bundle Python + SeedVR2 source ───────────────────
+    if args.python_embeded_dir:
+        py_dir = args.python_embeded_dir.resolve()
+        if not py_dir.is_dir():
+            print(f"❌  --python-embeded-dir not found: {py_dir}")
+            sys.exit(1)
+        # Bundle as "python_embedded" inside the bundle root
+        cmd += ["--add-data", f"{py_dir}{os.pathsep}python_embedded"]
+        print(f"  Bundling Python: {py_dir}")
+
+    if args.seedvr2_dir:
+        sv_dir = args.seedvr2_dir.resolve()
+        if not sv_dir.is_dir():
+            print(f"❌  --seedvr2-dir not found: {sv_dir}")
+            sys.exit(1)
+        # Bundle source files; exclude the models sub-folder to keep size manageable
+        models_dir = sv_dir / "models"
+        if models_dir.is_dir():
+            print(f"  Excluding models folder: {models_dir}")
+        # Copy source tree to a temp location without models, then add-data
+        import shutil, tempfile
+        tmp = Path(tempfile.mkdtemp(prefix="seedvr2_bundle_"))
+        shutil.copytree(
+            str(sv_dir),
+            str(tmp / "seedvr2_src"),
+            ignore=shutil.ignore_patterns("models", "__pycache__", "*.pyc"),
+        )
+        cmd += ["--add-data", f"{tmp / 'seedvr2_src'}{os.pathsep}seedvr2_src"]
+        print(f"  Bundling SeedVR2 source (from {sv_dir})")
 
     # Optional icon
     if icon_path.exists():
@@ -85,8 +139,9 @@ def main() -> None:
     cmd.append(entry_point)
 
     # ── Run ──────────────────────────────────────────────────────────────
+    mode_label = "portable all-in-one" if portable else "lightweight"
     print("=" * 68)
-    print("Building SeedVR2_GUI.exe (lightweight mode) …")
+    print(f"Building SeedVR2_GUI.exe ({mode_label} mode) …")
     print("Command:", " ".join(cmd))
     print("=" * 68)
 
@@ -98,12 +153,18 @@ def main() -> None:
         print("✅  Build succeeded!")
         print(f"    Output: {exe_path}")
         print()
-        print("Distribution notes:")
-        print("  1. Copy dist/SeedVR2_GUI.exe to the target Windows machine.")
-        print("  2. On first run, set:")
-        print(r"       • Python Executable  →  e.g. C:\ComfyUI-yeni\python_embeded\python.exe")
-        print(r"       • SeedVR2 Folder     →  folder containing inference_cli.py")
-        print("  3. Both paths are remembered automatically (QSettings).")
+        if portable:
+            print("Portable distribution notes:")
+            print("  1. Copy dist/SeedVR2_GUI.exe to the target Windows machine.")
+            print("  2. Run it directly – no external Python needed.")
+            print("  3. Model files are NOT included; point the GUI at your models folder.")
+        else:
+            print("Lightweight distribution notes:")
+            print("  1. Copy dist/SeedVR2_GUI.exe to the target Windows machine.")
+            print("  2. On first run, set:")
+            print(r"       • Python Executable  →  e.g. C:\ComfyUI-yeni\python_embeded\python.exe")
+            print(r"       • SeedVR2 Folder     →  folder containing inference_cli.py")
+            print("  3. Both paths are remembered automatically (QSettings).")
     else:
         print(f"❌  Build failed (exit code {result.returncode}).")
         print("    Make sure PyInstaller is installed: pip install pyinstaller")
