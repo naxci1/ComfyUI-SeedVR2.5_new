@@ -42,10 +42,10 @@ except ImportError:
 
 try:
     from gui.styles import DARK_STYLESHEET
-    from gui.worker import create_worker_thread, DEFAULT_PYTHON_EXE
+    from gui.worker import create_worker_thread, resolve_paths
 except ImportError:
     from styles import DARK_STYLESHEET  # type: ignore[no-redef]
-    from worker import create_worker_thread, DEFAULT_PYTHON_EXE  # type: ignore[no-redef]
+    from worker import create_worker_thread, resolve_paths  # type: ignore[no-redef]
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +161,15 @@ class MainWindow(QMainWindow):
 
         # Input file
         input_box, input_form = _make_group("Input / Output")
+
+        self.seedvr2_folder_edit = QLineEdit()
+        self.seedvr2_folder_edit.setPlaceholderText("Folder containing inference_cli.py…")
+        browse_seedvr2_btn = QPushButton("Browse…")
+        browse_seedvr2_btn.clicked.connect(self._browse_seedvr2_folder)
+        seedvr2_row = QHBoxLayout()
+        seedvr2_row.addWidget(self.seedvr2_folder_edit)
+        seedvr2_row.addWidget(browse_seedvr2_btn)
+        input_form.addRow("SeedVR2 Folder:", _wrap(seedvr2_row))
 
         self.input_edit = QLineEdit()
         self.input_edit.setPlaceholderText("Path to video, image, or directory…")
@@ -431,20 +440,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 4, 0, 0)
         layout.setSpacing(4)
 
-        # Row 1 – Python exe
-        py_row = QHBoxLayout()
-        py_lbl = QLabel("Python Executable:")
-        py_lbl.setMinimumWidth(140)
-        py_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.python_exe_edit = QLineEdit(DEFAULT_PYTHON_EXE)
-        browse_py_btn = QPushButton("Browse…")
-        browse_py_btn.clicked.connect(self._browse_python)
-        py_row.addWidget(py_lbl)
-        py_row.addWidget(self.python_exe_edit)
-        py_row.addWidget(browse_py_btn)
-        layout.addLayout(py_row)
-
-        # Row 2 – Progress + status
+        # Row 1 – Progress + status
         prog_row = QHBoxLayout()
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
@@ -489,6 +485,13 @@ class MainWindow(QMainWindow):
     # Browse helpers
     # ------------------------------------------------------------------
 
+    def _browse_seedvr2_folder(self) -> None:
+        path = QFileDialog.getExistingDirectory(
+            self, "Select SeedVR2 Folder (containing inference_cli.py)", ""
+        )
+        if path:
+            self.seedvr2_folder_edit.setText(path)
+
     def _browse_input(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self,
@@ -509,16 +512,6 @@ class MainWindow(QMainWindow):
         path = QFileDialog.getExistingDirectory(self, "Select Model Directory", "")
         if path:
             self.model_dir_edit.setText(path)
-
-    def _browse_python(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select Python Executable",
-            "",
-            "Executables (*.exe python python3);;All Files (*)",
-        )
-        if path:
-            self.python_exe_edit.setText(path)
 
     # ------------------------------------------------------------------
     # Preview
@@ -738,16 +731,19 @@ class MainWindow(QMainWindow):
             self._on_log("❌  Please specify an input file or directory.")
             return
 
-        python_exe = self.python_exe_edit.text().strip()
-        if not python_exe:
-            self._on_log("❌  Please specify the Python executable path.")
-            return
+        seedvr2_folder = self.seedvr2_folder_edit.text().strip()
+        python_exe, cli_script = resolve_paths(seedvr2_folder)
 
-        # Locate inference_cli.py relative to this file's package root
-        gui_dir = Path(__file__).parent
-        cli_script = str(gui_dir.parent / "inference_cli.py")
         if not os.path.isfile(cli_script):
             self._on_log(f"❌  inference_cli.py not found at: {cli_script}")
+            if not hasattr(sys, "_MEIPASS"):
+                self._on_log("    Please select your SeedVR2 installation folder.")
+            return
+
+        if not os.path.isfile(python_exe):
+            self._on_log(f"❌  Python executable not found: {python_exe}")
+            if not hasattr(sys, "_MEIPASS"):
+                self._on_log("    Please check your SeedVR2 installation folder.")
             return
 
         args = self._build_args()
