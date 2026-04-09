@@ -21,7 +21,8 @@ from PyQt6.QtCore import QObject, QThread, pyqtSignal
 # ---------------------------------------------------------------------------
 
 # Default to the ComfyUI embedded Python on Windows.
-# The user can override this in the GUI settings.
+# Note: ComfyUI historically ships its folder as "python_embeded" (single 'd') –
+# this path reflects the real on-disk name.  The user can override it in the GUI.
 DEFAULT_PYTHON_EXE = r"C:\ComfyUI-yeni\python_embeded\python.exe"
 
 
