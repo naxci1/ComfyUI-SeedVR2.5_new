@@ -128,8 +128,29 @@ class InferenceWorker(QObject):
         self.log_line.emit(f"▶  {' '.join(cmd)}\n")
 
         env = os.environ.copy()
+        # Ensure UTF-8 output from the child process on Windows
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONLEGACYWINDOWSFSENCODING"] = "1"
+        # Blackwell / performance environment variables
+        env["PYTORCH_ALLOC_CONF"] = "backend:cudaMallocAsync"
+        env["CUDA_MODULE_LOADING"] = "LAZY"
+        env["NVIDIA_TF32_OVERRIDE"] = "1"
+        env["ATTENTION_BACKEND"] = "sageattention"
         if self._env:
             env.update(self._env)
+
+        # Pre-run: set float32 matmul precision for maximum Blackwell throughput
+        try:
+            subprocess.run(
+                [
+                    self._python_exe, "-c",
+                    "import torch; torch.set_float32_matmul_precision('high')",
+                ],
+                env=env,
+                check=False,
+            )
+        except FileNotFoundError:
+            pass  # Python not found – will be caught properly below
 
         try:
             self._process = subprocess.Popen(

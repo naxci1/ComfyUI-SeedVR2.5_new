@@ -133,7 +133,7 @@ def get_basic_vram_info(device: Optional[torch.device] = None) -> Dict[str, Any]
 vram_info = get_basic_vram_info(device=None)
 if "error" not in vram_info:
     backend = "MPS" if is_mps_available() else "CUDA"
-    print(f"📊 Initial {backend} memory: {vram_info['free_gb']:.2f}GB free / {vram_info['total_gb']:.2f}GB total")
+    print(f"VRAM Info: Initial {backend} memory: {vram_info['free_gb']:.2f}GB free / {vram_info['total_gb']:.2f}GB total")
 else:
     print(f"⚠️ Memory check failed: {vram_info['error']} - No available backend!")
 

@@ -40,6 +40,26 @@ try:
 except ImportError:
     _CV2_AVAILABLE = False
 
+# ---------------------------------------------------------------------------
+# GPU auto-detection
+# ---------------------------------------------------------------------------
+
+def _detect_gpus() -> list[str]:
+    """Return a list of GPU entries suitable for a QComboBox.
+
+    Format: ``["Auto", "0: NVIDIA GeForce RTX 5070 Ti", "1: …", …]``
+    Falls back to ``["Auto"]`` when torch is unavailable or no CUDA GPUs exist.
+    """
+    entries = ["Auto"]
+    try:
+        import torch  # noqa: PLC0415
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                entries.append(f"{i}: {torch.cuda.get_device_name(i)}")
+    except Exception:  # torch not installed in GUI's Python – that's fine
+        pass
+    return entries
+
 try:
     from gui.styles import DARK_STYLESHEET
     from gui.worker import create_worker_thread, resolve_paths, DEFAULT_PYTHON_EXE
@@ -315,9 +335,9 @@ class MainWindow(QMainWindow):
 
         # ── Device Management ──────────────────────────────────────────
         g, f = _make_group("Device Management")
-        self.cuda_device_edit = QLineEdit()
-        self.cuda_device_edit.setPlaceholderText('e.g. "0"  or  "0,1,2"')
-        f.addRow("CUDA Device:", self.cuda_device_edit)
+        self.gpu_device_combo = QComboBox()
+        self.gpu_device_combo.addItems(_detect_gpus())
+        f.addRow("GPU Device:", self.gpu_device_combo)
 
         self.dit_offload_combo = QComboBox()
         self.dit_offload_combo.addItems(["none", "cpu"])
@@ -328,7 +348,7 @@ class MainWindow(QMainWindow):
         f.addRow("VAE Offload:", self.vae_offload_combo)
 
         self.tensor_offload_combo = QComboBox()
-        self.tensor_offload_combo.addItems(["cpu", "none"])
+        self.tensor_offload_combo.addItems(["none", "cpu"])
         f.addRow("Tensor Offload:", self.tensor_offload_combo)
         container_layout.addWidget(g)
 
@@ -382,6 +402,9 @@ class MainWindow(QMainWindow):
         self.attention_mode_combo.addItems([
             "sdpa", "flash_attn_2", "flash_attn_3", "sageattn_2", "sageattn_3"
         ])
+        self.attention_mode_combo.setCurrentIndex(
+            self.attention_mode_combo.findText("sageattn_3")
+        )
         f.addRow("Attention Mode:", self.attention_mode_combo)
 
         self.compile_dit_check = QCheckBox()
@@ -656,9 +679,13 @@ class MainWindow(QMainWindow):
             args += ["--color_correction", cc]
 
         # device
-        cuda_dev = self.cuda_device_edit.text().strip()
-        if cuda_dev:
-            args += ["--cuda_device", cuda_dev]
+        gpu_sel = self.gpu_device_combo.currentText()
+        if gpu_sel == "Auto":
+            cuda_dev = "0"
+        else:
+            # Format is "0: NVIDIA GeForce RTX 5070 Ti" – extract the index
+            cuda_dev = gpu_sel.split(":")[0].strip()
+        args += ["--cuda_device", cuda_dev]
 
         dit_offload = self.dit_offload_combo.currentText()
         if dit_offload != "none":
