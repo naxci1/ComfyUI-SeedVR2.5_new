@@ -21,7 +21,7 @@ from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
 # Default to the ComfyUI embedded Python on Windows.
 # The user can override this in the GUI settings.
-DEFAULT_PYTHON_EXE = r"C:\ComfyUI\python_embeded\python.exe"
+DEFAULT_PYTHON_EXE = r"C:\ComfyUI\python_embedded\python.exe"
 
 
 # ---------------------------------------------------------------------------

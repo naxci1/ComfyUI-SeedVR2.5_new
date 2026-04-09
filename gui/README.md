@@ -24,7 +24,7 @@ python gui/build_exe.py
 The .exe will be created in `dist/SeedVR2_GUI.exe`.
 
 ## Configuration
-- **Python Executable**: defaults to `C:\ComfyUI\python_embeded\python.exe`. Change this in the bottom bar if your ComfyUI is installed elsewhere.
+- **Python Executable**: defaults to `C:\ComfyUI\python_embedded\python.exe`. Change this in the bottom bar if your ComfyUI is installed elsewhere.
 - **Model Directory**: leave blank to use the default `models/SEEDVR2/` folder next to `inference_cli.py`.
 
 ## Notes
