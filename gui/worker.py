@@ -190,9 +190,6 @@ class InferenceWorker(QObject):
         self.started_signal.emit()
 
         # ── Stream output line-by-line ──────────────────────────────────
-        total_frames = 0
-        current_frame = 0
-
         for raw_line in self._process.stdout:  # type: ignore[union-attr]
             if self._abort:
                 self._process.terminate()

@@ -852,7 +852,7 @@ class MainWindow(QMainWindow):
             args += ["--vae_offload_device", vae_offload]
 
         tensor_offload = self.tensor_offload_combo.currentText()
-        if tensor_offload != "cpu":
+        if tensor_offload != "none":
             args += ["--tensor_offload_device", tensor_offload]
 
         # blockswap
@@ -1159,13 +1159,17 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _snap_batch_size(self, val: int) -> None:
-        """Snap the batch_size spinbox to the nearest 4n+1 value (1, 5, 9, …)."""
-        if val < 1:
-            snapped = 1
-        elif (val - 1) % 4 != 0:
-            snapped = max(1, 1 + 4 * ((val - 1) // 4))
-        else:
+        """Snap the batch_size spinbox to the nearest 4n+1 value (1, 5, 9, 13, …).
+
+        Rounds to nearest valid value so that incrementing (5→6) advances to 9
+        and decrementing (9→8) goes back to 5.
+        """
+        if (val - 1) % 4 == 0:
             return  # already valid
+        # Nearest lower and upper valid values
+        lower = max(1, 1 + 4 * ((val - 1) // 4))
+        upper = lower + 4
+        snapped = lower if (val - lower) <= (upper - val) else upper
         self.batch_size_spin.blockSignals(True)
         self.batch_size_spin.setValue(snapped)
         self.batch_size_spin.blockSignals(False)
