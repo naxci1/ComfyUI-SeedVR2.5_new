@@ -36,8 +36,10 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -122,7 +124,6 @@ def main() -> None:
         if models_dir.is_dir():
             print(f"  Excluding models folder: {models_dir}")
         # Copy source tree to a temp location without models, then add-data
-        import shutil, tempfile
         tmp = Path(tempfile.mkdtemp(prefix="seedvr2_bundle_"))
         shutil.copytree(
             str(sv_dir),
