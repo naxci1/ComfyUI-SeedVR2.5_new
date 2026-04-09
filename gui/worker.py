@@ -150,7 +150,9 @@ class InferenceWorker(QObject):
                 check=False,
             )
         except FileNotFoundError:
-            pass  # Python not found – will be caught properly below
+            self.log_line.emit(
+                "⚠  Pre-run matmul config skipped: Python executable not found yet.\n"
+            )
 
         try:
             self._process = subprocess.Popen(
