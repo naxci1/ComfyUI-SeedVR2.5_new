@@ -78,7 +78,7 @@ def main() -> None:
     dist_dir: Path = args.output_dir or (repo_root / "dist")
 
     entry_point = str(gui_dir / "app.py")
-    icon_path = gui_dir / "icon.ico"
+    icon_path = gui_dir / "assets" / "icon.ico"
 
     # ── PyInstaller command ──────────────────────────────────────────────
     cmd: list[str] = [
@@ -86,8 +86,10 @@ def main() -> None:
         "--name", "SeedVR2_GUI",
         "--onefile",
         "--noconsole",
-        # Bundle the GUI stylesheet; worker/main_window are discovered automatically.
+        # Bundle GUI Python modules (styles, settings window, split view)
         "--add-data", f"{gui_dir / 'styles.py'}{os.pathsep}gui",
+        "--add-data", f"{gui_dir / 'settings_window.py'}{os.pathsep}gui",
+        "--add-data", f"{gui_dir / 'split_view.py'}{os.pathsep}gui",
         # Core hidden imports (PyQt6 + multimedia for the comparison player)
         "--hidden-import", "PyQt6",
         "--hidden-import", "PyQt6.QtWidgets",
@@ -115,6 +117,11 @@ def main() -> None:
         "--workpath", str(repo_root / "build"),
         "--specpath", str(repo_root),
     ]
+
+    # ── Bundle assets directory (icons) ─────────────────────────────────
+    assets_dir = gui_dir / "assets"
+    if assets_dir.is_dir():
+        cmd += ["--add-data", f"{assets_dir}{os.pathsep}assets"]
 
     # ── Portable mode: bundle Python + SeedVR2 source ───────────────────
     if args.python_embeded_dir:

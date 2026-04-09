@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import Qt, QSettings, QUrl
-from PyQt6.QtGui import QDesktopServices, QFont
+from PyQt6.QtGui import QFont, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -45,6 +45,19 @@ try:
 except ImportError:
     _MULTIMEDIA_AVAILABLE = False
 
+if _MULTIMEDIA_AVAILABLE:
+    try:
+        from gui.split_view import SplitViewWidget
+    except ImportError:
+        from split_view import SplitViewWidget  # type: ignore[no-redef]
+else:
+    SplitViewWidget = None  # type: ignore[assignment,misc]
+
+try:
+    from gui.settings_window import SettingsWindow
+except ImportError:
+    from settings_window import SettingsWindow  # type: ignore[no-redef]
+
 # ---------------------------------------------------------------------------
 # GPU auto-detection
 # ---------------------------------------------------------------------------
@@ -71,6 +84,19 @@ try:
 except ImportError:
     from styles import DARK_STYLESHEET  # type: ignore[no-redef]
     from worker import create_worker_thread, resolve_paths, DEFAULT_PYTHON_EXE  # type: ignore[no-redef]
+
+
+# ---------------------------------------------------------------------------
+# Resource path helper
+# ---------------------------------------------------------------------------
+
+def _resource_path(relative: str) -> str:
+    """Resolve *relative* path whether running as PyInstaller bundle or from source."""
+    if hasattr(sys, "_MEIPASS"):
+        base = Path(sys._MEIPASS)
+    else:
+        base = Path(__file__).resolve().parent
+    return str(base / relative)
 
 
 # ---------------------------------------------------------------------------
@@ -113,14 +139,22 @@ class MainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("SeedVR2 Upscaler")
+        self.setWindowTitle("SeedVR2.5 Upscaler by HB2k")
         self.resize(1400, 960)
+
+        # Create settings window first – it loads saved paths in its __init__
+        self._settings_win = SettingsWindow(self)
+        self._settings_win.input_changed.connect(self._load_preview)
 
         self._thread = None
         self._worker = None
 
         self._build_ui()
-        self._load_settings()
+
+        _icon = _resource_path("assets/icon.png")
+        if os.path.isfile(_icon):
+            self.setWindowIcon(QIcon(_icon))
+
         self._set_running(False)
 
     # ------------------------------------------------------------------
@@ -136,17 +170,28 @@ class MainWindow(QMainWindow):
 
         # ── 1. Header ──────────────────────────────────────────────────
         header_widget = QWidget()
-        header_layout = QVBoxLayout(header_widget)
+        header_layout = QHBoxLayout(header_widget)
         header_layout.setContentsMargins(0, 0, 0, 0)
-        header_layout.setSpacing(2)
+        header_layout.setSpacing(8)
 
-        title_lbl = QLabel("SeedVR2 Upscaler")
+        title_col = QWidget()
+        title_vlayout = QVBoxLayout(title_col)
+        title_vlayout.setContentsMargins(0, 0, 0, 0)
+        title_vlayout.setSpacing(2)
+        title_lbl = QLabel("SeedVR2.5 Upscaler by HB2k")
         title_lbl.setObjectName("header_label")
         sub_lbl = QLabel("Powered by SeedVR2 Diffusion Models")
         sub_lbl.setObjectName("subheader_label")
+        title_vlayout.addWidget(title_lbl)
+        title_vlayout.addWidget(sub_lbl)
 
-        header_layout.addWidget(title_lbl)
-        header_layout.addWidget(sub_lbl)
+        settings_btn = QPushButton("⚙  Settings")
+        settings_btn.setToolTip("Open Paths & Configuration settings")
+        settings_btn.setMinimumWidth(110)
+        settings_btn.clicked.connect(self._open_settings)
+
+        header_layout.addWidget(title_col, stretch=1)
+        header_layout.addWidget(settings_btn)
         root_layout.addWidget(header_widget)
 
         # ── 2. Main splitter ───────────────────────────────────────────
@@ -218,19 +263,9 @@ class MainWindow(QMainWindow):
             self._solo_output_vw.setMinimumHeight(300)
             self._viewer_stack.addWidget(self._solo_output_vw)
 
-            # page 2 – Split view (QSplitter as the draggable divider)
-            split_container = QWidget()
-            split_hlayout = QHBoxLayout(split_container)
-            split_hlayout.setContentsMargins(0, 0, 0, 0)
-            split_hlayout.setSpacing(0)
-            self._split_splitter = QSplitter(Qt.Orientation.Horizontal)
-            self._split_input_vw = QVideoWidget()
-            self._split_output_vw = QVideoWidget()
-            self._split_splitter.addWidget(self._split_input_vw)
-            self._split_splitter.addWidget(self._split_output_vw)
-            self._split_splitter.setSizes([1, 1])
-            split_hlayout.addWidget(self._split_splitter)
-            self._viewer_stack.addWidget(split_container)
+            # page 2 – Overlay Split View (SplitViewWidget)
+            self._split_view = SplitViewWidget()
+            self._viewer_stack.addWidget(self._split_view)
 
             # Media players
             self._input_player = QMediaPlayer()
@@ -333,70 +368,6 @@ class MainWindow(QMainWindow):
         container_layout = QVBoxLayout(container)
         container_layout.setContentsMargins(4, 0, 0, 0)
         container_layout.setSpacing(8)
-
-        # ── Paths & Configuration ──────────────────────────────────────
-        g, f = _make_group("Paths & Configuration")
-
-        self.python_exe_edit = QLineEdit()
-        self.python_exe_edit.setPlaceholderText(DEFAULT_PYTHON_EXE)
-        browse_py_btn = QPushButton("Browse…")
-        browse_py_btn.clicked.connect(self._browse_python)
-        py_row = QHBoxLayout()
-        py_row.addWidget(self.python_exe_edit)
-        py_row.addWidget(browse_py_btn)
-        f.addRow("Python Executable:", _wrap(py_row))
-
-        self.seedvr2_folder_edit = QLineEdit()
-        self.seedvr2_folder_edit.setPlaceholderText("Folder containing inference_cli.py…")
-        browse_sv_btn = QPushButton("Browse…")
-        browse_sv_btn.clicked.connect(self._browse_seedvr2_folder)
-        sv_row = QHBoxLayout()
-        sv_row.addWidget(self.seedvr2_folder_edit)
-        sv_row.addWidget(browse_sv_btn)
-        f.addRow("SeedVR2 Folder:", _wrap(sv_row))
-
-        # Input: File / Folder toggle + path
-        self.input_mode_combo = QComboBox()
-        self.input_mode_combo.addItems(["File", "Folder"])
-        self.input_mode_combo.setMaximumWidth(72)
-        self.input_mode_combo.setToolTip("File: single video/image  |  Folder: batch-process all videos")
-        self.input_edit = QLineEdit()
-        self.input_edit.setPlaceholderText("Path to video, image, or directory…")
-        browse_input_btn = QPushButton("Browse…")
-        browse_input_btn.clicked.connect(self._browse_input)
-        input_row = QHBoxLayout()
-        input_row.addWidget(self.input_mode_combo)
-        input_row.addWidget(self.input_edit)
-        input_row.addWidget(browse_input_btn)
-        f.addRow("Input:", _wrap(input_row))
-
-        self.output_edit = QLineEdit()
-        self.output_edit.setPlaceholderText("Optional – leave blank for auto")
-        browse_out_btn = QPushButton("Browse…")
-        browse_out_btn.clicked.connect(self._browse_output)
-        out_row = QHBoxLayout()
-        out_row.addWidget(self.output_edit)
-        out_row.addWidget(browse_out_btn)
-        f.addRow("Output Path:", _wrap(out_row))
-
-        self.model_dir_edit = QLineEdit()
-        self.model_dir_edit.setPlaceholderText("Optional – defaults to models/SEEDVR2/")
-        browse_md_btn = QPushButton("Browse…")
-        browse_md_btn.clicked.connect(self._browse_model_dir)
-        fp8_btn = QPushButton("FP8/FP16")
-        fp8_btn.setToolTip("Download FP8 / FP16 models from HuggingFace")
-        fp8_btn.clicked.connect(self._open_fp8_url)
-        gguf_btn = QPushButton("GGUF")
-        gguf_btn.setToolTip("Download GGUF models from HuggingFace")
-        gguf_btn.clicked.connect(self._open_gguf_url)
-        md_row = QHBoxLayout()
-        md_row.addWidget(self.model_dir_edit)
-        md_row.addWidget(browse_md_btn)
-        md_row.addWidget(fp8_btn)
-        md_row.addWidget(gguf_btn)
-        f.addRow("Model Directory:", _wrap(md_row))
-
-        container_layout.addWidget(g)
 
         # ── AI Model ───────────────────────────────────────────────────
         g, f = _make_group("AI Model")
@@ -698,50 +669,14 @@ class MainWindow(QMainWindow):
         return bar
 
     # ------------------------------------------------------------------
-    # Browse helpers
+    # Settings window
     # ------------------------------------------------------------------
 
-    def _browse_python(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select Python Executable",
-            "",
-            "Executables (*.exe python python3);;All Files (*)",
-        )
-        if path:
-            self.python_exe_edit.setText(path)
-
-    def _browse_seedvr2_folder(self) -> None:
-        path = QFileDialog.getExistingDirectory(
-            self, "Select SeedVR2 Folder (containing inference_cli.py)", ""
-        )
-        if path:
-            self.seedvr2_folder_edit.setText(path)
-
-    def _browse_input(self) -> None:
-        if self.input_mode_combo.currentText() == "Folder":
-            path = QFileDialog.getExistingDirectory(self, "Select Input Folder", "")
-        else:
-            path, _ = QFileDialog.getOpenFileName(
-                self,
-                "Select Input File",
-                "",
-                "Videos & Images (*.mp4 *.avi *.mov *.mkv *.webm *.png *.jpg *.jpeg *.bmp *.tiff);;All Files (*)",
-            )
-        if path:
-            self.input_edit.setText(path)
-            if self.input_mode_combo.currentText() == "File":
-                self._load_preview(path)
-
-    def _browse_output(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Select Output Directory", "")
-        if path:
-            self.output_edit.setText(path)
-
-    def _browse_model_dir(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Select Model Directory", "")
-        if path:
-            self.model_dir_edit.setText(path)
+    def _open_settings(self) -> None:
+        """Show (or raise) the persistent Paths & Configuration window."""
+        self._settings_win.show()
+        self._settings_win.raise_()
+        self._settings_win.activateWindow()
 
     # ------------------------------------------------------------------
     # Preview / video loading
@@ -759,16 +694,16 @@ class MainWindow(QMainWindow):
         args: list[str] = []
 
         # positional input
-        inp = self.input_edit.text().strip()
+        inp = self._settings_win.input_edit.text().strip()
         args.append(inp)
 
         # output
-        out = self.output_edit.text().strip()
+        out = self._settings_win.output_edit.text().strip()
         if out:
             args += ["--output", out]
 
         # model dir
-        md = self.model_dir_edit.text().strip()
+        md = self._settings_win.model_dir_edit.text().strip()
         if md:
             args += ["--model_dir", md]
 
@@ -937,35 +872,35 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _run(self) -> None:
-        inp = self.input_edit.text().strip()
+        inp = self._settings_win.input_edit.text().strip()
         if not inp:
-            self._on_log("❌  Please specify an input file or directory.")
+            self._on_log("❌  Please specify an input file or directory (⚙ Settings).")
             return
 
-        python_exe = self.python_exe_edit.text().strip() or DEFAULT_PYTHON_EXE
-        seedvr2_folder = self.seedvr2_folder_edit.text().strip()
+        python_exe = self._settings_win.python_exe_edit.text().strip() or DEFAULT_PYTHON_EXE
+        seedvr2_folder = self._settings_win.seedvr2_folder_edit.text().strip()
 
         if not seedvr2_folder:
-            self._on_log("❌  Please select the SeedVR2 folder (containing inference_cli.py).")
+            self._on_log("❌  Please select the SeedVR2 folder in ⚙ Settings.")
             return
 
         cli_script = str(Path(seedvr2_folder) / "inference_cli.py")
         if not os.path.isfile(cli_script):
             self._on_log(
                 f"❌  inference_cli.py not found in: {seedvr2_folder}\n"
-                "    Please select the correct SeedVR2 installation folder."
+                "    Please select the correct SeedVR2 installation folder in ⚙ Settings."
             )
             return
 
         if not os.path.isfile(python_exe):
             self._on_log(
                 f"❌  Python executable not found: {python_exe}\n"
-                "    Please check the Python Executable path."
+                "    Please check the Python Executable path in ⚙ Settings."
             )
             return
 
-        # Persist the current paths so the user doesn't have to re-enter them
-        self._save_settings()
+        # Persist the current paths
+        self._settings_win.save_settings()
 
         args = self._build_args()
 
@@ -1009,8 +944,8 @@ class MainWindow(QMainWindow):
             self._output_player.setVideoOutput(self._solo_output_vw)
             self._viewer_stack.setCurrentIndex(1)
         else:  # split
-            self._input_player.setVideoOutput(self._split_input_vw)
-            self._output_player.setVideoOutput(self._split_output_vw)
+            self._input_player.setVideoOutput(self._split_view.input_sink)
+            self._output_player.setVideoOutput(self._split_view.output_sink)
             self._viewer_stack.setCurrentIndex(2)
 
     # ------------------------------------------------------------------
@@ -1113,7 +1048,7 @@ class MainWindow(QMainWindow):
             self._output_player.setSource(QUrl.fromLocalFile(path))
 
     def _browse_output_video(self) -> None:
-        start_dir = self.output_edit.text().strip() or ""
+        start_dir = self._settings_win.output_edit.text().strip() or ""
         path, _ = QFileDialog.getOpenFileName(
             self, "Select Output Video", start_dir,
             "Videos (*.mp4 *.avi *.mov *.mkv *.webm);;All Files (*)",
@@ -1126,7 +1061,7 @@ class MainWindow(QMainWindow):
     def _try_auto_load_output(self) -> None:
         if not _MULTIMEDIA_AVAILABLE:
             return
-        out = self.output_edit.text().strip()
+        out = self._settings_win.output_edit.text().strip()
         if not out:
             return
         out_path = Path(out)
@@ -1143,16 +1078,6 @@ class MainWindow(QMainWindow):
             if candidates:
                 self._load_output_video(str(candidates[0]))
                 self._mode_output_btn.setChecked(True)
-
-    # ------------------------------------------------------------------
-    # Resource link openers
-    # ------------------------------------------------------------------
-
-    def _open_fp8_url(self) -> None:
-        QDesktopServices.openUrl(QUrl("https://huggingface.co/numz/SeedVR2_comfyUI/tree/main"))
-
-    def _open_gguf_url(self) -> None:
-        QDesktopServices.openUrl(QUrl("https://huggingface.co/AInVFX/SeedVR2_comfyUI/tree/main"))
 
     # ------------------------------------------------------------------
     # Batch size constraint (4n+1)
@@ -1210,42 +1135,16 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"⚠  {msg}")
 
     # ------------------------------------------------------------------
-    # Settings persistence (QSettings)
+    # Settings persistence (delegated to SettingsWindow)
     # ------------------------------------------------------------------
 
     def _load_settings(self) -> None:
-        """Restore previously saved paths from persistent storage."""
-        s = QSettings(self._SETTINGS_ORG, self._SETTINGS_APP)
-        self.python_exe_edit.setText(
-            s.value("python_exe", DEFAULT_PYTHON_EXE, type=str)
-        )
-        self.seedvr2_folder_edit.setText(
-            s.value("seedvr2_folder", "", type=str)
-        )
-        self.input_edit.setText(s.value("input_path", "", type=str))
-        saved_input_mode: str = s.value("input_mode", "File", type=str)
-        idx = self.input_mode_combo.findText(saved_input_mode)
-        if idx >= 0:
-            self.input_mode_combo.setCurrentIndex(idx)
-        self.output_edit.setText(s.value("output_path", "", type=str))
-        saved_model_dir: str = s.value("model_dir", "", type=str)
-        if saved_model_dir:
-            self.model_dir_edit.setText(saved_model_dir)
-        elif self.seedvr2_folder_edit.text():
-            default_md = str(
-                Path(self.seedvr2_folder_edit.text()) / "models" / "SEEDVR2"
-            )
-            self.model_dir_edit.setPlaceholderText(default_md)
+        """Reload settings into the SettingsWindow (called on startup)."""
+        self._settings_win.load_settings()
 
     def _save_settings(self) -> None:
-        """Persist current path values to storage."""
-        s = QSettings(self._SETTINGS_ORG, self._SETTINGS_APP)
-        s.setValue("python_exe", self.python_exe_edit.text().strip())
-        s.setValue("seedvr2_folder", self.seedvr2_folder_edit.text().strip())
-        s.setValue("input_path", self.input_edit.text().strip())
-        s.setValue("input_mode", self.input_mode_combo.currentText())
-        s.setValue("output_path", self.output_edit.text().strip())
-        s.setValue("model_dir", self.model_dir_edit.text().strip())
+        """Persist current path values via SettingsWindow."""
+        self._settings_win.save_settings()
 
     # ------------------------------------------------------------------
     # State helpers
