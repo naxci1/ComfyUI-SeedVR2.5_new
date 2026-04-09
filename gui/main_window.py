@@ -15,6 +15,7 @@ from PyQt6.QtCore import Qt, QSettings, QUrl
 from PyQt6.QtGui import QFont, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
+    QAbstractSpinBox,
     QButtonGroup,
     QFileDialog,
     QGroupBox,
@@ -151,9 +152,12 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
 
-        _icon = _resource_path("assets/icon.png")
-        if os.path.isfile(_icon):
-            self.setWindowIcon(QIcon(_icon))
+        # Load window icon – try .ico first (Windows), fall back to .png
+        for _icon_rel in ("icon.ico", "assets/icon.ico", "assets/icon.png"):
+            _icon = _resource_path(_icon_rel)
+            if os.path.isfile(_icon):
+                self.setWindowIcon(QIcon(_icon))
+                break
 
         self._set_running(False)
 
@@ -272,14 +276,25 @@ class MainWindow(QMainWindow):
             self._input_audio = QAudioOutput()
             self._input_player.setAudioOutput(self._input_audio)
             self._input_player.setVideoOutput(self._solo_input_vw)
-            self._input_player.durationChanged.connect(self._on_player_duration)
-            self._input_player.positionChanged.connect(self._on_player_position)
-            self._input_player.playbackStateChanged.connect(self._on_player_state)
 
             self._output_player = QMediaPlayer()
             self._output_audio = QAudioOutput()
             self._output_player.setAudioOutput(self._output_audio)
             self._output_player.setVideoOutput(self._solo_output_vw)
+
+            # Output player is the master: drives seek bar, time label, play state.
+            self._output_player.durationChanged.connect(self._on_player_duration)
+            self._output_player.positionChanged.connect(self._on_player_position)
+            self._output_player.playbackStateChanged.connect(self._on_player_state)
+
+            # Input-only mode: also connect input player so seek/time work when
+            # no output is loaded yet.
+            self._input_player.durationChanged.connect(self._on_player_duration)
+            self._input_player.positionChanged.connect(self._on_player_position)
+            self._input_player.playbackStateChanged.connect(self._on_player_state)
+
+            # Slave input position strictly to output (master→slave sync).
+            self._output_player.positionChanged.connect(self._sync_input_to_output)
 
             # Initial volume (70 %)
             self._input_audio.setVolume(0.70)
@@ -419,13 +434,7 @@ class MainWindow(QMainWindow):
         self.max_resolution_spin.setToolTip("0 = no limit")
         f.addRow("Max Resolution:", self.max_resolution_spin)
 
-        self.batch_size_spin = QSpinBox()
-        self.batch_size_spin.setRange(1, 1001)
-        self.batch_size_spin.setValue(5)
-        self.batch_size_spin.setSingleStep(4)
-        self.batch_size_spin.setToolTip("Must be 4n+1: 1, 5, 9, 13, … (automatically snapped)")
-        self.batch_size_spin.valueChanged.connect(self._snap_batch_size)
-        f.addRow("Batch Size:", self.batch_size_spin)
+        f.addRow("Batch Size:", self._build_batch_stepper())
 
         self.uniform_batch_check = QCheckBox()
         f.addRow("Uniform Batch Size:", self.uniform_batch_check)
@@ -966,14 +975,8 @@ class MainWindow(QMainWindow):
             self._input_player.pause()
             self._output_player.pause()
         else:
-            if self._player_mode == "split":
-                self._output_player.setPosition(self._input_player.position())
-                self._input_player.play()
-                self._output_player.play()
-            elif self._player_mode == "output":
-                self._output_player.play()
-            else:
-                self._input_player.play()
+            self._output_player.play()
+            self._input_player.play()
 
     def _on_stop(self) -> None:
         if self._input_player:
@@ -982,31 +985,30 @@ class MainWindow(QMainWindow):
             self._output_player.stop()
 
     def _on_seek(self, pos: int) -> None:
-        if self._player_mode == "output":
-            if self._output_player:
-                self._output_player.setPosition(pos)
-        else:
-            if self._input_player:
-                self._input_player.setPosition(pos)
-            if self._player_mode == "split" and self._output_player:
-                self._output_player.setPosition(pos)
+        if self._input_player:
+            self._input_player.setPosition(pos)
+        if self._output_player:
+            self._output_player.setPosition(pos)
 
-    def _on_player_duration(self, duration: int) -> None:
-        self._seek_slider.setRange(0, duration)
+    def _on_player_duration(self, _duration: int) -> None:
+        p = self._active_player()
+        if p:
+            self._seek_slider.setRange(0, p.duration())
         self._update_time_label()
 
     def _on_player_position(self, position: int) -> None:
         if not self._seek_slider.isSliderDown():
             self._seek_slider.setValue(position)
         self._update_time_label()
-        # Keep output player in sync during split mode
-        if self._player_mode == "split" and self._output_player:
-            if abs(self._output_player.position() - position) > 500:
-                self._output_player.setPosition(position)
 
     def _on_player_state(self, state) -> None:
         playing = state == QMediaPlayer.PlaybackState.PlayingState
         self._play_btn.setText("\u23f8" if playing else "\u25b6")  # ⏸ / ▶
+
+    def _sync_input_to_output(self, pos: int) -> None:
+        """Slave the input player's position strictly to the output player (master)."""
+        if self._input_player and abs(self._input_player.position() - pos) > 200:
+            self._input_player.setPosition(pos)
 
     def _update_time_label(self) -> None:
         p = self._active_player()
@@ -1080,8 +1082,50 @@ class MainWindow(QMainWindow):
                 self._mode_output_btn.setChecked(True)
 
     # ------------------------------------------------------------------
-    # Batch size constraint (4n+1)
+    # Batch size constraint (4n+1) – stepper widget + snap validator
     # ------------------------------------------------------------------
+
+    def _build_batch_stepper(self) -> QWidget:
+        """Return a [−] QSpinBox [+] widget for batch size (4k+1 rule)."""
+        wrapper = QWidget()
+        row = QHBoxLayout(wrapper)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(2)
+
+        minus_btn = QPushButton("−")
+        minus_btn.setFixedWidth(28)
+        minus_btn.setToolTip("Decrease batch size by 4")
+
+        self.batch_size_spin = QSpinBox()
+        self.batch_size_spin.setRange(1, 10001)
+        self.batch_size_spin.setValue(5)
+        # NoButtons: the custom ± buttons handle ±4; manual typing snaps on commit
+        self.batch_size_spin.setButtonSymbols(
+            QAbstractSpinBox.ButtonSymbols.NoButtons
+        )
+        self.batch_size_spin.setToolTip(
+            "Must be 4k+1: 1, 5, 9, 13, … (automatically snapped when typed)"
+        )
+        self.batch_size_spin.valueChanged.connect(self._snap_batch_size)
+
+        plus_btn = QPushButton("+")
+        plus_btn.setFixedWidth(28)
+        plus_btn.setToolTip("Increase batch size by 4")
+
+        # ±4 step – result is always 4k+1 if starting from a valid value
+        minus_btn.clicked.connect(
+            lambda: self.batch_size_spin.setValue(
+                max(1, self.batch_size_spin.value() - 4)
+            )
+        )
+        plus_btn.clicked.connect(
+            lambda: self.batch_size_spin.setValue(self.batch_size_spin.value() + 4)
+        )
+
+        row.addWidget(minus_btn)
+        row.addWidget(self.batch_size_spin, stretch=1)
+        row.addWidget(plus_btn)
+        return wrapper
 
     def _snap_batch_size(self, val: int) -> None:
         """Snap the batch_size spinbox to the nearest 4n+1 value (1, 5, 9, 13, …).

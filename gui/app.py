@@ -7,10 +7,22 @@ Or as package: python -m gui.app
 
 from __future__ import annotations
 
+import platform
 import sys
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication
+
+# Windows: bind this process to a unique AppUserModelID so Windows shows the
+# correct taskbar icon instead of the generic Python interpreter icon.
+if platform.system() == "Windows":
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "SeedVR2.HB2k.Upscaler.1"
+        )
+    except Exception:
+        pass
 
 try:
     from gui.styles import DARK_STYLESHEET
