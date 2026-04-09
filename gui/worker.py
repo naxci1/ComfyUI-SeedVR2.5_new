@@ -36,12 +36,13 @@ def resolve_paths(seedvr2_folder: str = "") -> tuple[str, str]:
     Resolution order
     ----------------
     1. **PyInstaller bundle** – when ``sys._MEIPASS`` exists the entire
-       ``python_embeded`` directory and ``inference_cli.py`` were bundled
+       ``python_embedded`` directory and ``inference_cli.py`` were bundled
        inside the EXE and are available under ``sys._MEIPASS``.
     2. **User-supplied SeedVR2 folder** – the folder selected via the
        "SeedVR2 Folder" button in the GUI.  If it contains a
-       ``python_embeded\\python.exe`` that interpreter is used; otherwise
-       ``sys.executable`` (the Python that launched the GUI) is used.
+       ``python_embedded\\python.exe`` (or the legacy ``python_embeded``
+       spelling) that interpreter is used; otherwise ``sys.executable``
+       (the Python that launched the GUI) is used.
     3. **Development / editable install** – look for ``inference_cli.py``
        one level above this file (i.e. the repository root).
     4. **Hardcoded fallback** – ``DEFAULT_PYTHON_EXE`` and the repository
@@ -50,7 +51,7 @@ def resolve_paths(seedvr2_folder: str = "") -> tuple[str, str]:
     # ── 1. PyInstaller bundle ───────────────────────────────────────────
     if hasattr(sys, "_MEIPASS"):
         base = Path(sys._MEIPASS)
-        python_exe = str(base / "python_embeded" / "python.exe")
+        python_exe = str(base / "python_embedded" / "python.exe")
         cli_script = str(base / "inference_cli.py")
         return python_exe, cli_script
 
@@ -58,7 +59,10 @@ def resolve_paths(seedvr2_folder: str = "") -> tuple[str, str]:
     if seedvr2_folder:
         folder = Path(seedvr2_folder)
         cli_script = str(folder / "inference_cli.py")
-        embedded = folder / "python_embeded" / "python.exe"
+        # Accept both spellings – ComfyUI historically used the typo
+        embedded = folder / "python_embedded" / "python.exe"
+        if not embedded.exists():
+            embedded = folder / "python_embeded" / "python.exe"
         if embedded.exists():
             return str(embedded), cli_script
         return sys.executable, cli_script

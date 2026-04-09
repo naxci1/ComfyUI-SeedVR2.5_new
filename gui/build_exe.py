@@ -7,7 +7,7 @@ What gets bundled
   • GUI code (styles.py, worker.py, main_window.py, app.py)
   • SeedVR2 repository files (inference_cli.py and every .py / data file at
     the repo root, excluding the gui/ folder itself)
-  • The ComfyUI embedded Python environment (python_embeded/), including all
+  • The ComfyUI embedded Python environment (python_embedded/), including all
     PyTorch and CUDA DLLs so the EXE runs on machines with no prior setup
 
 At runtime the EXE extracts everything to a temp folder (sys._MEIPASS) and
@@ -25,7 +25,7 @@ Usage
 Options
 -------
     --embedded-python  PATH   Path to the ComfyUI embedded Python directory.
-                              Default: C:\\ComfyUI-yeni\\python_embeded
+                              Default: C:\\ComfyUI-yeni\\python_embeded  (note: original folder uses this spelling)
     --repo-root        PATH   Path to the SeedVR2 repo root (parent of gui/).
                               Default: parent of this script's directory.
     --output-dir       PATH   Directory for the built EXE.
@@ -156,15 +156,16 @@ def main() -> None:
 
     # ── Bundle the embedded Python environment ───────────────────────────
     if bundle_python:
-        # The entire python_embeded directory is placed at python_embeded/
-        # inside sys._MEIPASS so worker.py can call it as a subprocess.
-        cmd += _add_data(embedded_python, "python_embeded")
+        # The entire python_embeded source directory is bundled as
+        # python_embedded/ inside sys._MEIPASS so worker.py can call
+        # it as a subprocess.
+        cmd += _add_data(embedded_python, "python_embedded")
 
         # Collect CUDA and PyTorch DLLs from the embedded environment so
         # they are available on target machines without a GPU driver install.
         # These flags tell PyInstaller to harvest binaries from the packages
         # installed in the embedded env (requires running this script with
-        # that same Python, e.g.:  python_embeded\python.exe gui/build_exe.py)
+        # that same Python, e.g.: python_embeded\python.exe gui/build_exe.py)
         for pkg in ("torch", "torchvision", "torchaudio"):
             pkg_path = embedded_python / "Lib" / "site-packages" / pkg
             if pkg_path.exists():
