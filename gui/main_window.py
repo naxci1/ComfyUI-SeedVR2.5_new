@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QSettings
 from PyQt6.QtGui import QFont, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QFileDialog,
@@ -42,10 +42,10 @@ except ImportError:
 
 try:
     from gui.styles import DARK_STYLESHEET
-    from gui.worker import create_worker_thread, resolve_paths
+    from gui.worker import create_worker_thread, resolve_paths, DEFAULT_PYTHON_EXE
 except ImportError:
     from styles import DARK_STYLESHEET  # type: ignore[no-redef]
-    from worker import create_worker_thread, resolve_paths  # type: ignore[no-redef]
+    from worker import create_worker_thread, resolve_paths, DEFAULT_PYTHON_EXE  # type: ignore[no-redef]
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +83,9 @@ def _make_group(title: str) -> tuple[QGroupBox, QFormLayout]:
 class MainWindow(QMainWindow):
     """Main application window for SeedVR2 GUI."""
 
+    _SETTINGS_ORG = "SeedVR2GUI"
+    _SETTINGS_APP = "SeedVR2_GUI"
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("SeedVR2 Upscaler")
@@ -92,6 +95,7 @@ class MainWindow(QMainWindow):
         self._worker = None
 
         self._build_ui()
+        self._load_settings()
         self._set_running(False)
 
     # ------------------------------------------------------------------
@@ -440,7 +444,21 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 4, 0, 0)
         layout.setSpacing(4)
 
-        # Row 1 – Progress + status
+        # Row 1 – Python executable
+        py_row = QHBoxLayout()
+        py_lbl = QLabel("Python Executable:")
+        py_lbl.setMinimumWidth(140)
+        py_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.python_exe_edit = QLineEdit()
+        self.python_exe_edit.setPlaceholderText(DEFAULT_PYTHON_EXE)
+        browse_py_btn = QPushButton("Browse…")
+        browse_py_btn.clicked.connect(self._browse_python)
+        py_row.addWidget(py_lbl)
+        py_row.addWidget(self.python_exe_edit)
+        py_row.addWidget(browse_py_btn)
+        layout.addLayout(py_row)
+
+        # Row 2 – Progress + status
         prog_row = QHBoxLayout()
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
@@ -484,6 +502,16 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Browse helpers
     # ------------------------------------------------------------------
+
+    def _browse_python(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Python Executable",
+            "",
+            "Executables (*.exe python python3);;All Files (*)",
+        )
+        if path:
+            self.python_exe_edit.setText(path)
 
     def _browse_seedvr2_folder(self) -> None:
         path = QFileDialog.getExistingDirectory(
@@ -731,20 +759,30 @@ class MainWindow(QMainWindow):
             self._on_log("❌  Please specify an input file or directory.")
             return
 
+        python_exe = self.python_exe_edit.text().strip() or DEFAULT_PYTHON_EXE
         seedvr2_folder = self.seedvr2_folder_edit.text().strip()
-        python_exe, cli_script = resolve_paths(seedvr2_folder)
 
+        if not seedvr2_folder:
+            self._on_log("❌  Please select the SeedVR2 folder (containing inference_cli.py).")
+            return
+
+        cli_script = str(Path(seedvr2_folder) / "inference_cli.py")
         if not os.path.isfile(cli_script):
-            self._on_log(f"❌  inference_cli.py not found at: {cli_script}")
-            if not hasattr(sys, "_MEIPASS"):
-                self._on_log("    Please select your SeedVR2 installation folder.")
+            self._on_log(
+                f"❌  inference_cli.py not found in: {seedvr2_folder}\n"
+                "    Please select the correct SeedVR2 installation folder."
+            )
             return
 
         if not os.path.isfile(python_exe):
-            self._on_log(f"❌  Python executable not found: {python_exe}")
-            if not hasattr(sys, "_MEIPASS"):
-                self._on_log("    Please check your SeedVR2 installation folder.")
+            self._on_log(
+                f"❌  Python executable not found: {python_exe}\n"
+                "    Please check the Python Executable path."
+            )
             return
+
+        # Persist the current paths so the user doesn't have to re-enter them
+        self._save_settings()
 
         args = self._build_args()
 
@@ -785,6 +823,37 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"✅  {msg}")
         else:
             self.status_label.setText(f"⚠  {msg}")
+
+    # ------------------------------------------------------------------
+    # Settings persistence (QSettings)
+    # ------------------------------------------------------------------
+
+    def _load_settings(self) -> None:
+        """Restore previously saved paths from persistent storage."""
+        s = QSettings(self._SETTINGS_ORG, self._SETTINGS_APP)
+        self.python_exe_edit.setText(
+            s.value("python_exe", DEFAULT_PYTHON_EXE, type=str)
+        )
+        self.seedvr2_folder_edit.setText(
+            s.value("seedvr2_folder", "", type=str)
+        )
+        # Model dir defaults to models/SEEDVR2/ relative to SeedVR2 folder
+        # if not previously saved; otherwise restore the saved value.
+        saved_model_dir: str = s.value("model_dir", "", type=str)
+        if saved_model_dir:
+            self.model_dir_edit.setText(saved_model_dir)
+        elif self.seedvr2_folder_edit.text():
+            default_md = str(
+                Path(self.seedvr2_folder_edit.text()) / "models" / "SEEDVR2"
+            )
+            self.model_dir_edit.setPlaceholderText(default_md)
+
+    def _save_settings(self) -> None:
+        """Persist current path values to storage."""
+        s = QSettings(self._SETTINGS_ORG, self._SETTINGS_APP)
+        s.setValue("python_exe", self.python_exe_edit.text().strip())
+        s.setValue("seedvr2_folder", self.seedvr2_folder_edit.text().strip())
+        s.setValue("model_dir", self.model_dir_edit.text().strip())
 
     # ------------------------------------------------------------------
     # State helpers

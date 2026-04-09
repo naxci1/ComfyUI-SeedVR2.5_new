@@ -22,32 +22,32 @@ from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
 # Default to the ComfyUI embedded Python on Windows.
 # The user can override this in the GUI settings.
-DEFAULT_PYTHON_EXE = r"C:\ComfyUI\python_embedded\python.exe"
+DEFAULT_PYTHON_EXE = r"C:\ComfyUI-yeni\python_embeded\python.exe"
 
 
 # ---------------------------------------------------------------------------
 # Runtime path resolution
 # ---------------------------------------------------------------------------
 
-def resolve_paths(seedvr2_folder: str = "") -> tuple[str, str]:
+def resolve_paths(seedvr2_folder: str = "", python_exe: str = "") -> tuple[str, str]:
     """
     Resolve ``(python_exe, cli_script)`` for the current runtime context.
 
-    Resolution order
-    ----------------
-    1. **PyInstaller bundle** – when ``sys._MEIPASS`` exists the entire
-       ``python_embedded`` directory and ``inference_cli.py`` were bundled
-       inside the EXE and are available under ``sys._MEIPASS``.
-    2. **User-supplied SeedVR2 folder** – the folder selected via the
-       "SeedVR2 Folder" button in the GUI.  If it contains a
-       ``python_embedded\\python.exe`` (or the legacy ``python_embeded``
-       spelling) that interpreter is used; otherwise ``sys.executable``
-       (the Python that launched the GUI) is used.
-    3. **Development / editable install** – look for ``inference_cli.py``
-       one level above this file (i.e. the repository root).
-    4. **Hardcoded fallback** – ``DEFAULT_PYTHON_EXE`` and the repository
-       root derived from this file's location.
+    When ``python_exe`` and ``seedvr2_folder`` are both supplied (the normal
+    case when running the lightweight GUI EXE), they are used directly.
+
+    Fallback order when values are missing
+    ----------------------------------------
+    1. **PyInstaller bundle** – ``sys._MEIPASS`` present (future full-bundle mode).
+    2. **Development / editable install** – ``inference_cli.py`` adjacent to
+       this file's parent directory.
+    3. **Hardcoded defaults** – ``DEFAULT_PYTHON_EXE`` and repo root.
     """
+    # ── Explicit user-supplied values (normal GUI usage) ────────────────
+    if python_exe and seedvr2_folder:
+        cli_script = str(Path(seedvr2_folder) / "inference_cli.py")
+        return python_exe, cli_script
+
     # ── 1. PyInstaller bundle ───────────────────────────────────────────
     if hasattr(sys, "_MEIPASS"):
         base = Path(sys._MEIPASS)
@@ -55,17 +55,11 @@ def resolve_paths(seedvr2_folder: str = "") -> tuple[str, str]:
         cli_script = str(base / "inference_cli.py")
         return python_exe, cli_script
 
-    # ── 2. User-supplied SeedVR2 folder ────────────────────────────────
+    # ── 2. User-supplied SeedVR2 folder only (no explicit python_exe) ───
     if seedvr2_folder:
         folder = Path(seedvr2_folder)
         cli_script = str(folder / "inference_cli.py")
-        # Accept both spellings – ComfyUI historically used the typo
-        embedded = folder / "python_embedded" / "python.exe"
-        if not embedded.exists():
-            embedded = folder / "python_embeded" / "python.exe"
-        if embedded.exists():
-            return str(embedded), cli_script
-        return sys.executable, cli_script
+        return python_exe or sys.executable, cli_script
 
     # ── 3. Development / editable install ──────────────────────────────
     repo_root = Path(__file__).resolve().parent.parent
@@ -150,7 +144,7 @@ class InferenceWorker(QObject):
         except FileNotFoundError:
             self.log_line.emit(
                 f"❌  Python executable not found: {self._python_exe}\n"
-                "    Please select your SeedVR2 installation folder.\n"
+                "    Please check the Python Executable path in the settings.\n"
             )
             self.finished.emit(False, "Python executable not found.")
             return
