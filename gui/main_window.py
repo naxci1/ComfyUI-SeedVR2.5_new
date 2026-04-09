@@ -12,8 +12,10 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import Qt, QSettings, QUrl
-from PyQt6.QtGui import QFont, QImage, QPixmap
+from PyQt6.QtGui import QDesktopServices, QFont
 from PyQt6.QtWidgets import (
+    QApplication,
+    QButtonGroup,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
@@ -30,16 +32,11 @@ from PyQt6.QtWidgets import (
     QSlider,
     QSpinBox,
     QSplitter,
+    QStackedWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
-
-try:
-    import cv2
-    _CV2_AVAILABLE = True
-except ImportError:
-    _CV2_AVAILABLE = False
 
 try:
     from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -166,177 +163,163 @@ class MainWindow(QMainWindow):
         # ── 3. Bottom controls bar ─────────────────────────────────────
         root_layout.addWidget(self._build_bottom_bar())
 
-    # ── Left panel ─────────────────────────────────────────────────────
+    # ── Left panel (comparison player) ────────────────────────────────
 
     def _build_left_panel(self) -> QWidget:
         panel = QWidget()
-        panel.setMinimumWidth(500)
+        panel.setMinimumWidth(520)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 4, 0)
-        layout.setSpacing(8)
+        layout.setSpacing(6)
 
-        # ── Dual video players side-by-side ────────────────────────────
-        vid_row = QWidget()
-        vid_layout = QHBoxLayout(vid_row)
-        vid_layout.setContentsMargins(0, 0, 0, 0)
-        vid_layout.setSpacing(4)
-        vid_layout.addWidget(self._build_input_player_group())
-        vid_layout.addWidget(self._build_output_player_group())
-        layout.addWidget(vid_row)
+        # ── Mode selector buttons ──────────────────────────────────────
+        mode_bar_w = QWidget()
+        mode_bar = QHBoxLayout(mode_bar_w)
+        mode_bar.setContentsMargins(0, 0, 0, 0)
+        mode_bar.setSpacing(4)
 
-        # ── Sync Play button ───────────────────────────────────────────
-        sync_row = QHBoxLayout()
-        sync_row.addStretch(1)
-        self.sync_play_btn = QPushButton("⟳  Sync Play")
-        self.sync_play_btn.setCheckable(True)
-        self.sync_play_btn.setToolTip("Synchronize playback of both players")
-        self.sync_play_btn.toggled.connect(self._on_sync_toggled)
-        sync_row.addWidget(self.sync_play_btn)
-        sync_row.addStretch(1)
-        layout.addLayout(sync_row)
+        self._mode_input_btn = QPushButton("Input")
+        self._mode_input_btn.setCheckable(True)
+        self._mode_input_btn.setChecked(True)
+        self._mode_output_btn = QPushButton("Output")
+        self._mode_output_btn.setCheckable(True)
+        self._mode_split_btn = QPushButton("⊢  Split View")
+        self._mode_split_btn.setCheckable(True)
 
-        # ── Input / Output paths ───────────────────────────────────────
-        input_box, input_form = _make_group("Input / Output")
+        for btn in (self._mode_input_btn, self._mode_output_btn, self._mode_split_btn):
+            btn.setEnabled(_MULTIMEDIA_AVAILABLE)
+            btn.setMinimumWidth(80)
 
-        self.seedvr2_folder_edit = QLineEdit()
-        self.seedvr2_folder_edit.setPlaceholderText("Folder containing inference_cli.py…")
-        browse_seedvr2_btn = QPushButton("Browse…")
-        browse_seedvr2_btn.clicked.connect(self._browse_seedvr2_folder)
-        seedvr2_row = QHBoxLayout()
-        seedvr2_row.addWidget(self.seedvr2_folder_edit)
-        seedvr2_row.addWidget(browse_seedvr2_btn)
-        input_form.addRow("SeedVR2 Folder:", _wrap(seedvr2_row))
+        self._mode_btn_group = QButtonGroup(panel)
+        self._mode_btn_group.setExclusive(True)
+        self._mode_btn_group.addButton(self._mode_input_btn, 0)
+        self._mode_btn_group.addButton(self._mode_output_btn, 1)
+        self._mode_btn_group.addButton(self._mode_split_btn, 2)
+        self._mode_btn_group.idToggled.connect(self._on_mode_button)
 
-        self.input_edit = QLineEdit()
-        self.input_edit.setPlaceholderText("Path to video, image, or directory…")
-        browse_input_btn = QPushButton("Browse…")
-        browse_input_btn.clicked.connect(self._browse_input)
-        input_row = QHBoxLayout()
-        input_row.addWidget(self.input_edit)
-        input_row.addWidget(browse_input_btn)
-        input_form.addRow("Input File:", _wrap(input_row))
+        mode_bar.addWidget(self._mode_input_btn)
+        mode_bar.addWidget(self._mode_output_btn)
+        mode_bar.addWidget(self._mode_split_btn)
+        mode_bar.addStretch(1)
+        layout.addWidget(mode_bar_w)
 
-        self.output_edit = QLineEdit()
-        self.output_edit.setPlaceholderText("Optional – leave blank for auto")
-        browse_output_btn = QPushButton("Browse…")
-        browse_output_btn.clicked.connect(self._browse_output)
-        output_row = QHBoxLayout()
-        output_row.addWidget(self.output_edit)
-        output_row.addWidget(browse_output_btn)
-        input_form.addRow("Output Path:", _wrap(output_row))
-
-        self.model_dir_edit = QLineEdit()
-        self.model_dir_edit.setPlaceholderText("Optional – defaults to models/SEEDVR2/")
-        browse_model_dir_btn = QPushButton("Browse…")
-        browse_model_dir_btn.clicked.connect(self._browse_model_dir)
-        model_dir_row = QHBoxLayout()
-        model_dir_row.addWidget(self.model_dir_edit)
-        model_dir_row.addWidget(browse_model_dir_btn)
-        input_form.addRow("Model Directory:", _wrap(model_dir_row))
-
-        layout.addWidget(input_box)
-        layout.addStretch(1)
-        return panel
-
-    def _build_input_player_group(self) -> QGroupBox:
-        """Build the Input Preview player group."""
-        group = QGroupBox("Input Preview")
-        vbox = QVBoxLayout(group)
-        vbox.setSpacing(3)
+        # ── Viewer stack ───────────────────────────────────────────────
+        self._viewer_stack = QStackedWidget()
+        self._player_mode = "input"
 
         if _MULTIMEDIA_AVAILABLE:
-            self._input_video_widget = QVideoWidget()
-            self._input_video_widget.setMinimumHeight(170)
+            # page 0 – Input solo
+            self._solo_input_vw = QVideoWidget()
+            self._solo_input_vw.setMinimumHeight(300)
+            self._viewer_stack.addWidget(self._solo_input_vw)
+
+            # page 1 – Output solo
+            self._solo_output_vw = QVideoWidget()
+            self._solo_output_vw.setMinimumHeight(300)
+            self._viewer_stack.addWidget(self._solo_output_vw)
+
+            # page 2 – Split view (QSplitter as the draggable divider)
+            split_container = QWidget()
+            split_hlayout = QHBoxLayout(split_container)
+            split_hlayout.setContentsMargins(0, 0, 0, 0)
+            split_hlayout.setSpacing(0)
+            self._split_splitter = QSplitter(Qt.Orientation.Horizontal)
+            self._split_input_vw = QVideoWidget()
+            self._split_output_vw = QVideoWidget()
+            self._split_splitter.addWidget(self._split_input_vw)
+            self._split_splitter.addWidget(self._split_output_vw)
+            self._split_splitter.setSizes([1, 1])
+            split_hlayout.addWidget(self._split_splitter)
+            self._viewer_stack.addWidget(split_container)
+
+            # Media players
             self._input_player = QMediaPlayer()
-            self._input_audio_out = QAudioOutput()
-            self._input_player.setAudioOutput(self._input_audio_out)
-            self._input_player.setVideoOutput(self._input_video_widget)
-            self._input_player.durationChanged.connect(self._on_input_duration)
-            self._input_player.positionChanged.connect(self._on_input_position)
-            self._input_player.playbackStateChanged.connect(self._on_input_state)
-            vbox.addWidget(self._input_video_widget, stretch=1)
-        else:
-            self._input_video_widget = None  # type: ignore[assignment]
-            self._input_player = None  # type: ignore[assignment]
-            placeholder = QLabel("PyQt6.QtMultimedia\nnot available")
-            placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            placeholder.setMinimumHeight(170)
-            placeholder.setStyleSheet(
-                "background:#0d0d0d; border:1px solid #2a2a2a; border-radius:4px; color:#555;"
-            )
-            vbox.addWidget(placeholder, stretch=1)
+            self._input_audio = QAudioOutput()
+            self._input_player.setAudioOutput(self._input_audio)
+            self._input_player.setVideoOutput(self._solo_input_vw)
+            self._input_player.durationChanged.connect(self._on_player_duration)
+            self._input_player.positionChanged.connect(self._on_player_position)
+            self._input_player.playbackStateChanged.connect(self._on_player_state)
 
-        self._input_seek = QSlider(Qt.Orientation.Horizontal)
-        self._input_seek.setRange(0, 0)
-        self._input_seek.sliderMoved.connect(self._seek_input)
-        vbox.addWidget(self._input_seek)
-
-        ctrl = QHBoxLayout()
-        self._input_play_btn = QPushButton("▶")
-        self._input_play_btn.setFixedWidth(32)
-        self._input_play_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
-        self._input_play_btn.clicked.connect(self._toggle_input_play)
-        self._input_stop_btn = QPushButton("⏹")
-        self._input_stop_btn.setFixedWidth(32)
-        self._input_stop_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
-        self._input_stop_btn.clicked.connect(self._stop_input)
-        ctrl.addWidget(self._input_play_btn)
-        ctrl.addWidget(self._input_stop_btn)
-        ctrl.addStretch(1)
-        vbox.addLayout(ctrl)
-        return group
-
-    def _build_output_player_group(self) -> QGroupBox:
-        """Build the Output Preview player group."""
-        group = QGroupBox("Output Preview")
-        vbox = QVBoxLayout(group)
-        vbox.setSpacing(3)
-
-        if _MULTIMEDIA_AVAILABLE:
-            self._output_video_widget = QVideoWidget()
-            self._output_video_widget.setMinimumHeight(170)
             self._output_player = QMediaPlayer()
-            self._output_audio_out = QAudioOutput()
-            self._output_player.setAudioOutput(self._output_audio_out)
-            self._output_player.setVideoOutput(self._output_video_widget)
-            self._output_player.durationChanged.connect(self._on_output_duration)
-            self._output_player.positionChanged.connect(self._on_output_position)
-            self._output_player.playbackStateChanged.connect(self._on_output_state)
-            vbox.addWidget(self._output_video_widget, stretch=1)
+            self._output_audio = QAudioOutput()
+            self._output_player.setAudioOutput(self._output_audio)
+            self._output_player.setVideoOutput(self._solo_output_vw)
+
+            # Initial volume (70 %)
+            self._input_audio.setVolume(0.70)
+            self._output_audio.setVolume(0.70)
         else:
-            self._output_video_widget = None  # type: ignore[assignment]
+            self._input_player = None   # type: ignore[assignment]
             self._output_player = None  # type: ignore[assignment]
-            placeholder = QLabel("PyQt6.QtMultimedia\nnot available")
-            placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            placeholder.setMinimumHeight(170)
-            placeholder.setStyleSheet(
-                "background:#0d0d0d; border:1px solid #2a2a2a; border-radius:4px; color:#555;"
+            self._input_audio = None    # type: ignore[assignment]
+            self._output_audio = None   # type: ignore[assignment]
+            placeholder = QLabel(
+                "PyQt6.QtMultimedia not available\n\n"
+                "Video preview is disabled.\n"
+                "Install PyQt6-Qt6-Multimedia to enable it."
             )
-            vbox.addWidget(placeholder, stretch=1)
+            placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            placeholder.setMinimumHeight(300)
+            placeholder.setStyleSheet(
+                "background:#0d0d0d; border:1px solid #2a2a2a;"
+                " border-radius:4px; color:#555;"
+            )
+            self._viewer_stack.addWidget(placeholder)
 
-        self._output_seek = QSlider(Qt.Orientation.Horizontal)
-        self._output_seek.setRange(0, 0)
-        self._output_seek.sliderMoved.connect(self._seek_output)
-        vbox.addWidget(self._output_seek)
+        layout.addWidget(self._viewer_stack, stretch=1)
 
+        # ── Seek slider ────────────────────────────────────────────────
+        self._seek_slider = QSlider(Qt.Orientation.Horizontal)
+        self._seek_slider.setRange(0, 0)
+        self._seek_slider.setEnabled(_MULTIMEDIA_AVAILABLE)
+        self._seek_slider.sliderMoved.connect(self._on_seek)
+        layout.addWidget(self._seek_slider)
+
+        # ── Control bar ────────────────────────────────────────────────
         ctrl = QHBoxLayout()
-        self._output_play_btn = QPushButton("▶")
-        self._output_play_btn.setFixedWidth(32)
-        self._output_play_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
-        self._output_play_btn.clicked.connect(self._toggle_output_play)
-        self._output_stop_btn = QPushButton("⏹")
-        self._output_stop_btn.setFixedWidth(32)
-        self._output_stop_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
-        self._output_stop_btn.clicked.connect(self._stop_output)
-        browse_out_vid_btn = QPushButton("Open…")
-        browse_out_vid_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
-        browse_out_vid_btn.clicked.connect(self._browse_output_video)
-        ctrl.addWidget(self._output_play_btn)
-        ctrl.addWidget(self._output_stop_btn)
+
+        self._play_btn = QPushButton("▶")
+        self._play_btn.setFixedWidth(36)
+        self._play_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
+        self._play_btn.clicked.connect(self._on_play_pause)
+
+        self._stop_btn = QPushButton("⏹")
+        self._stop_btn.setFixedWidth(36)
+        self._stop_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
+        self._stop_btn.clicked.connect(self._on_stop)
+
+        self._time_lbl = QLabel("0:00 / 0:00")
+        self._time_lbl.setMinimumWidth(100)
+        self._time_lbl.setStyleSheet("color:#888; font-size:11px;")
+
+        self._mute_btn = QPushButton("\U0001f50a")  # 🔊
+        self._mute_btn.setFixedWidth(36)
+        self._mute_btn.setCheckable(True)
+        self._mute_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
+        self._mute_btn.toggled.connect(self._on_mute_toggled)
+
+        self._volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self._volume_slider.setRange(0, 100)
+        self._volume_slider.setValue(70)
+        self._volume_slider.setMaximumWidth(100)
+        self._volume_slider.setEnabled(_MULTIMEDIA_AVAILABLE)
+        self._volume_slider.valueChanged.connect(self._on_volume_changed)
+
+        self._open_output_btn = QPushButton("Open Output…")
+        self._open_output_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
+        self._open_output_btn.clicked.connect(self._browse_output_video)
+
+        ctrl.addWidget(self._play_btn)
+        ctrl.addWidget(self._stop_btn)
+        ctrl.addWidget(self._time_lbl)
         ctrl.addStretch(1)
-        ctrl.addWidget(browse_out_vid_btn)
-        vbox.addLayout(ctrl)
-        return group
+        ctrl.addWidget(self._mute_btn)
+        ctrl.addWidget(self._volume_slider)
+        ctrl.addWidget(self._open_output_btn)
+        layout.addLayout(ctrl)
+
+        return panel
 
     # ── Right panel ────────────────────────────────────────────────────
 
@@ -350,6 +333,70 @@ class MainWindow(QMainWindow):
         container_layout = QVBoxLayout(container)
         container_layout.setContentsMargins(4, 0, 0, 0)
         container_layout.setSpacing(8)
+
+        # ── Paths & Configuration ──────────────────────────────────────
+        g, f = _make_group("Paths & Configuration")
+
+        self.python_exe_edit = QLineEdit()
+        self.python_exe_edit.setPlaceholderText(DEFAULT_PYTHON_EXE)
+        browse_py_btn = QPushButton("Browse…")
+        browse_py_btn.clicked.connect(self._browse_python)
+        py_row = QHBoxLayout()
+        py_row.addWidget(self.python_exe_edit)
+        py_row.addWidget(browse_py_btn)
+        f.addRow("Python Executable:", _wrap(py_row))
+
+        self.seedvr2_folder_edit = QLineEdit()
+        self.seedvr2_folder_edit.setPlaceholderText("Folder containing inference_cli.py…")
+        browse_sv_btn = QPushButton("Browse…")
+        browse_sv_btn.clicked.connect(self._browse_seedvr2_folder)
+        sv_row = QHBoxLayout()
+        sv_row.addWidget(self.seedvr2_folder_edit)
+        sv_row.addWidget(browse_sv_btn)
+        f.addRow("SeedVR2 Folder:", _wrap(sv_row))
+
+        # Input: File / Folder toggle + path
+        self.input_mode_combo = QComboBox()
+        self.input_mode_combo.addItems(["File", "Folder"])
+        self.input_mode_combo.setMaximumWidth(72)
+        self.input_mode_combo.setToolTip("File: single video/image  |  Folder: batch-process all videos")
+        self.input_edit = QLineEdit()
+        self.input_edit.setPlaceholderText("Path to video, image, or directory…")
+        browse_input_btn = QPushButton("Browse…")
+        browse_input_btn.clicked.connect(self._browse_input)
+        input_row = QHBoxLayout()
+        input_row.addWidget(self.input_mode_combo)
+        input_row.addWidget(self.input_edit)
+        input_row.addWidget(browse_input_btn)
+        f.addRow("Input:", _wrap(input_row))
+
+        self.output_edit = QLineEdit()
+        self.output_edit.setPlaceholderText("Optional – leave blank for auto")
+        browse_out_btn = QPushButton("Browse…")
+        browse_out_btn.clicked.connect(self._browse_output)
+        out_row = QHBoxLayout()
+        out_row.addWidget(self.output_edit)
+        out_row.addWidget(browse_out_btn)
+        f.addRow("Output Path:", _wrap(out_row))
+
+        self.model_dir_edit = QLineEdit()
+        self.model_dir_edit.setPlaceholderText("Optional – defaults to models/SEEDVR2/")
+        browse_md_btn = QPushButton("Browse…")
+        browse_md_btn.clicked.connect(self._browse_model_dir)
+        fp8_btn = QPushButton("FP8/FP16")
+        fp8_btn.setToolTip("Download FP8 / FP16 models from HuggingFace")
+        fp8_btn.clicked.connect(self._open_fp8_url)
+        gguf_btn = QPushButton("GGUF")
+        gguf_btn.setToolTip("Download GGUF models from HuggingFace")
+        gguf_btn.clicked.connect(self._open_gguf_url)
+        md_row = QHBoxLayout()
+        md_row.addWidget(self.model_dir_edit)
+        md_row.addWidget(browse_md_btn)
+        md_row.addWidget(fp8_btn)
+        md_row.addWidget(gguf_btn)
+        f.addRow("Model Directory:", _wrap(md_row))
+
+        container_layout.addWidget(g)
 
         # ── AI Model ───────────────────────────────────────────────────
         g, f = _make_group("AI Model")
@@ -402,8 +449,11 @@ class MainWindow(QMainWindow):
         f.addRow("Max Resolution:", self.max_resolution_spin)
 
         self.batch_size_spin = QSpinBox()
-        self.batch_size_spin.setRange(1, 1000)
+        self.batch_size_spin.setRange(1, 1001)
         self.batch_size_spin.setValue(5)
+        self.batch_size_spin.setSingleStep(4)
+        self.batch_size_spin.setToolTip("Must be 4n+1: 1, 5, 9, 13, … (automatically snapped)")
+        self.batch_size_spin.valueChanged.connect(self._snap_batch_size)
         f.addRow("Batch Size:", self.batch_size_spin)
 
         self.uniform_batch_check = QCheckBox()
@@ -579,32 +629,40 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 4, 0, 0)
         layout.setSpacing(4)
 
-        # Row 1 – Python executable
-        py_row = QHBoxLayout()
-        py_lbl = QLabel("Python Executable:")
-        py_lbl.setMinimumWidth(140)
-        py_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.python_exe_edit = QLineEdit()
-        self.python_exe_edit.setPlaceholderText(DEFAULT_PYTHON_EXE)
-        browse_py_btn = QPushButton("Browse…")
-        browse_py_btn.clicked.connect(self._browse_python)
-        py_row.addWidget(py_lbl)
-        py_row.addWidget(self.python_exe_edit)
-        py_row.addWidget(browse_py_btn)
-        layout.addLayout(py_row)
+        # Row 1 – Batch progress (current segment)
+        batch_row = QHBoxLayout()
+        batch_lbl = QLabel("Batch:")
+        batch_lbl.setMinimumWidth(50)
+        batch_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        batch_lbl.setStyleSheet("color:#888; font-size:11px;")
+        self.batch_progress_bar = QProgressBar()
+        self.batch_progress_bar.setRange(0, 100)
+        self.batch_progress_bar.setValue(0)
+        self.batch_progress_bar.setMaximumHeight(14)
+        self.batch_progress_bar.setToolTip("Current batch / segment progress")
+        batch_row.addWidget(batch_lbl)
+        batch_row.addWidget(self.batch_progress_bar, stretch=1)
+        layout.addLayout(batch_row)
 
-        # Row 2 – Progress + status
+        # Row 2 – Total progress + status
         prog_row = QHBoxLayout()
+        total_lbl = QLabel("Total:")
+        total_lbl.setMinimumWidth(50)
+        total_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        total_lbl.setStyleSheet("color:#888; font-size:11px;")
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
+        self.progress_bar.setMaximumHeight(14)
+        self.progress_bar.setToolTip("Total video / folder progress")
         self.status_label = QLabel("Ready")
         self.status_label.setMinimumWidth(200)
+        prog_row.addWidget(total_lbl)
         prog_row.addWidget(self.progress_bar, stretch=1)
         prog_row.addWidget(self.status_label)
         layout.addLayout(prog_row)
 
-        # Row 3 – Run / Abort / Clear
+        # Row 3 – Run / Abort / Copy All / Clear
         btn_row = QHBoxLayout()
         self.run_btn = QPushButton("▶  Run")
         self.run_btn.setObjectName("primary_button")
@@ -614,12 +672,17 @@ class MainWindow(QMainWindow):
         self.abort_btn.setObjectName("danger_button")
         self.abort_btn.clicked.connect(self._abort)
 
+        self.copy_log_btn = QPushButton("Copy All")
+        self.copy_log_btn.setToolTip("Copy all log output to clipboard")
+        self.copy_log_btn.clicked.connect(self._copy_log)
+
         self.clear_log_btn = QPushButton("Clear Log")
         self.clear_log_btn.clicked.connect(lambda: self.console.clear())
 
         btn_row.addWidget(self.run_btn)
         btn_row.addWidget(self.abort_btn)
         btn_row.addStretch(1)
+        btn_row.addWidget(self.copy_log_btn)
         btn_row.addWidget(self.clear_log_btn)
         layout.addLayout(btn_row)
 
@@ -656,15 +719,19 @@ class MainWindow(QMainWindow):
             self.seedvr2_folder_edit.setText(path)
 
     def _browse_input(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select Input File",
-            "",
-            "Videos & Images (*.mp4 *.avi *.mov *.mkv *.webm *.png *.jpg *.jpeg *.bmp *.tiff);;All Files (*)",
-        )
+        if self.input_mode_combo.currentText() == "Folder":
+            path = QFileDialog.getExistingDirectory(self, "Select Input Folder", "")
+        else:
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select Input File",
+                "",
+                "Videos & Images (*.mp4 *.avi *.mov *.mkv *.webm *.png *.jpg *.jpeg *.bmp *.tiff);;All Files (*)",
+            )
         if path:
             self.input_edit.setText(path)
-            self._load_preview(path)
+            if self.input_mode_combo.currentText() == "File":
+                self._load_preview(path)
 
     def _browse_output(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Select Output Directory", "")
@@ -905,11 +972,13 @@ class MainWindow(QMainWindow):
         self._thread, self._worker = create_worker_thread(cli_script, args, python_exe)
         self._worker.log_line.connect(self._on_log)
         self._worker.progress_update.connect(self._on_progress)
+        self._worker.batch_progress_update.connect(self._on_batch_progress)
         self._worker.finished.connect(self._on_finished)
         self._worker.started_signal.connect(lambda: self._set_running(True))
 
         self._set_running(True)
         self.progress_bar.setValue(0)
+        self.batch_progress_bar.setValue(0)
         self.status_label.setText("Starting…")
         self._thread.start()
 
@@ -919,110 +988,142 @@ class MainWindow(QMainWindow):
         self.status_label.setText("Aborting…")
 
     # ------------------------------------------------------------------
-    # Input player controls
+    # Player – mode switching
     # ------------------------------------------------------------------
 
-    def _load_input_video(self, path: str) -> None:
-        """Load *path* into the Input Preview player."""
-        if self._input_player is None:
+    def _on_mode_button(self, btn_id: int, checked: bool) -> None:
+        """Switch the viewer stack page and reassign video outputs."""
+        if not checked or not _MULTIMEDIA_AVAILABLE:
             return
-        self._input_player.setSource(QUrl.fromLocalFile(path))
+        modes = ["input", "output", "split"]
+        if btn_id >= len(modes):
+            return
+        new_mode = modes[btn_id]
+        if new_mode == self._player_mode:
+            return
+        self._player_mode = new_mode
+        if new_mode == "input":
+            self._input_player.setVideoOutput(self._solo_input_vw)
+            self._viewer_stack.setCurrentIndex(0)
+        elif new_mode == "output":
+            self._output_player.setVideoOutput(self._solo_output_vw)
+            self._viewer_stack.setCurrentIndex(1)
+        else:  # split
+            self._input_player.setVideoOutput(self._split_input_vw)
+            self._output_player.setVideoOutput(self._split_output_vw)
+            self._viewer_stack.setCurrentIndex(2)
 
-    def _toggle_input_play(self) -> None:
-        if self._input_player is None:
+    # ------------------------------------------------------------------
+    # Player – unified controls
+    # ------------------------------------------------------------------
+
+    def _active_player(self):
+        """Return the primary player driving the seek slider."""
+        if not _MULTIMEDIA_AVAILABLE:
+            return None
+        return self._output_player if self._player_mode == "output" else self._input_player
+
+    def _on_play_pause(self) -> None:
+        p = self._active_player()
+        if not p:
             return
-        if self._input_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+        if p.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self._input_player.pause()
-        else:
-            self._input_player.play()
-
-    def _stop_input(self) -> None:
-        if self._input_player:
-            self._input_player.stop()
-
-    def _seek_input(self, pos: int) -> None:
-        if self._input_player:
-            self._input_player.setPosition(pos)
-
-    def _on_input_duration(self, duration: int) -> None:
-        self._input_seek.setRange(0, duration)
-
-    def _on_input_position(self, position: int) -> None:
-        if not self._input_seek.isSliderDown():
-            self._input_seek.setValue(position)
-        if self.sync_play_btn.isChecked() and self._output_player:
-            if abs(self._output_player.position() - position) > 500:
-                self._output_player.setPosition(position)
-
-    def _on_input_state(self, state) -> None:
-        if self._input_player is None:
-            return
-        playing = state == QMediaPlayer.PlaybackState.PlayingState
-        self._input_play_btn.setText("⏸" if playing else "▶")
-        if self.sync_play_btn.isChecked() and self._output_player:
-            if playing:
-                self._output_player.play()
-            else:
-                self._output_player.pause()
-
-    # ------------------------------------------------------------------
-    # Output player controls
-    # ------------------------------------------------------------------
-
-    def _load_output_video(self, path: str) -> None:
-        """Load *path* into the Output Preview player."""
-        if self._output_player is None:
-            return
-        self._output_player.setSource(QUrl.fromLocalFile(path))
-
-    def _toggle_output_play(self) -> None:
-        if self._output_player is None:
-            return
-        if self._output_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self._output_player.pause()
         else:
-            self._output_player.play()
+            if self._player_mode == "split":
+                self._output_player.setPosition(self._input_player.position())
+                self._input_player.play()
+                self._output_player.play()
+            elif self._player_mode == "output":
+                self._output_player.play()
+            else:
+                self._input_player.play()
 
-    def _stop_output(self) -> None:
+    def _on_stop(self) -> None:
+        if self._input_player:
+            self._input_player.stop()
         if self._output_player:
             self._output_player.stop()
 
-    def _seek_output(self, pos: int) -> None:
-        if self._output_player:
-            self._output_player.setPosition(pos)
+    def _on_seek(self, pos: int) -> None:
+        if self._player_mode == "output":
+            if self._output_player:
+                self._output_player.setPosition(pos)
+        else:
+            if self._input_player:
+                self._input_player.setPosition(pos)
+            if self._player_mode == "split" and self._output_player:
+                self._output_player.setPosition(pos)
 
-    def _on_output_duration(self, duration: int) -> None:
-        self._output_seek.setRange(0, duration)
+    def _on_player_duration(self, duration: int) -> None:
+        self._seek_slider.setRange(0, duration)
+        self._update_time_label()
 
-    def _on_output_position(self, position: int) -> None:
-        if not self._output_seek.isSliderDown():
-            self._output_seek.setValue(position)
+    def _on_player_position(self, position: int) -> None:
+        if not self._seek_slider.isSliderDown():
+            self._seek_slider.setValue(position)
+        self._update_time_label()
+        # Keep output player in sync during split mode
+        if self._player_mode == "split" and self._output_player:
+            if abs(self._output_player.position() - position) > 500:
+                self._output_player.setPosition(position)
 
-    def _on_output_state(self, state) -> None:
-        if self._output_player is None:
-            return
+    def _on_player_state(self, state) -> None:
         playing = state == QMediaPlayer.PlaybackState.PlayingState
-        self._output_play_btn.setText("⏸" if playing else "▶")
+        self._play_btn.setText("\u23f8" if playing else "\u25b6")  # ⏸ / ▶
 
-    def _on_sync_toggled(self, checked: bool) -> None:
-        """When Sync Play is enabled, snap the output player to the input position."""
-        if checked and self._input_player and self._output_player:
-            self._output_player.setPosition(self._input_player.position())
+    def _update_time_label(self) -> None:
+        p = self._active_player()
+        if not p:
+            return
+        def _fmt(ms: int) -> str:
+            s = ms // 1000
+            return f"{s // 60}:{s % 60:02d}"
+        self._time_lbl.setText(f"{_fmt(p.position())} / {_fmt(p.duration())}")
+
+    # ------------------------------------------------------------------
+    # Player – volume / mute
+    # ------------------------------------------------------------------
+
+    def _on_volume_changed(self, val: int) -> None:
+        v = val / 100.0
+        if self._input_audio:
+            self._input_audio.setVolume(v)
+        if self._output_audio:
+            self._output_audio.setVolume(v)
+
+    def _on_mute_toggled(self, muted: bool) -> None:
+        self._mute_btn.setText("\U0001f507" if muted else "\U0001f50a")  # 🔇 / 🔊
+        if self._input_audio:
+            self._input_audio.setMuted(muted)
+        if self._output_audio:
+            self._output_audio.setMuted(muted)
+
+    # ------------------------------------------------------------------
+    # Video source loading
+    # ------------------------------------------------------------------
+
+    def _load_input_video(self, path: str) -> None:
+        if self._input_player:
+            self._input_player.setSource(QUrl.fromLocalFile(path))
+
+    def _load_output_video(self, path: str) -> None:
+        if self._output_player:
+            self._output_player.setSource(QUrl.fromLocalFile(path))
 
     def _browse_output_video(self) -> None:
-        """Let the user manually pick an output video to preview."""
         start_dir = self.output_edit.text().strip() or ""
         path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select Output Video",
-            start_dir,
+            self, "Select Output Video", start_dir,
             "Videos (*.mp4 *.avi *.mov *.mkv *.webm);;All Files (*)",
         )
         if path:
             self._load_output_video(path)
+            # Switch to output view automatically
+            self._mode_output_btn.setChecked(True)
 
     def _try_auto_load_output(self) -> None:
-        """After a successful run, auto-load the newest output video."""
         if not _MULTIMEDIA_AVAILABLE:
             return
         out = self.output_edit.text().strip()
@@ -1031,6 +1132,7 @@ class MainWindow(QMainWindow):
         out_path = Path(out)
         if out_path.is_file():
             self._load_output_video(str(out_path))
+            self._mode_output_btn.setChecked(True)
         elif out_path.is_dir():
             video_exts = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
             candidates = sorted(
@@ -1040,6 +1142,41 @@ class MainWindow(QMainWindow):
             )
             if candidates:
                 self._load_output_video(str(candidates[0]))
+                self._mode_output_btn.setChecked(True)
+
+    # ------------------------------------------------------------------
+    # Resource link openers
+    # ------------------------------------------------------------------
+
+    def _open_fp8_url(self) -> None:
+        QDesktopServices.openUrl(QUrl("https://huggingface.co/numz/SeedVR2_comfyUI/tree/main"))
+
+    def _open_gguf_url(self) -> None:
+        QDesktopServices.openUrl(QUrl("https://huggingface.co/AInVFX/SeedVR2_comfyUI/tree/main"))
+
+    # ------------------------------------------------------------------
+    # Batch size constraint (4n+1)
+    # ------------------------------------------------------------------
+
+    def _snap_batch_size(self, val: int) -> None:
+        """Snap the batch_size spinbox to the nearest 4n+1 value (1, 5, 9, …)."""
+        if val < 1:
+            snapped = 1
+        elif (val - 1) % 4 != 0:
+            snapped = max(1, 1 + 4 * ((val - 1) // 4))
+        else:
+            return  # already valid
+        self.batch_size_spin.blockSignals(True)
+        self.batch_size_spin.setValue(snapped)
+        self.batch_size_spin.blockSignals(False)
+
+    # ------------------------------------------------------------------
+    # Log helpers
+    # ------------------------------------------------------------------
+
+    def _copy_log(self) -> None:
+        """Copy all console output to the system clipboard."""
+        QApplication.clipboard().setText(self.console.toPlainText())
 
     # ------------------------------------------------------------------
     # Signal handlers
@@ -1054,6 +1191,10 @@ class MainWindow(QMainWindow):
             pct = int(cur / tot * 100)
             self.progress_bar.setValue(pct)
             self.status_label.setText(f"Processing {cur}/{tot}")
+
+    def _on_batch_progress(self, cur: int, tot: int) -> None:
+        if tot > 0:
+            self.batch_progress_bar.setValue(int(cur / tot * 100))
 
     def _on_finished(self, success: bool, msg: str) -> None:
         self._set_running(False)
@@ -1077,8 +1218,12 @@ class MainWindow(QMainWindow):
         self.seedvr2_folder_edit.setText(
             s.value("seedvr2_folder", "", type=str)
         )
-        # Model dir defaults to models/SEEDVR2/ relative to SeedVR2 folder
-        # if not previously saved; otherwise restore the saved value.
+        self.input_edit.setText(s.value("input_path", "", type=str))
+        saved_input_mode: str = s.value("input_mode", "File", type=str)
+        idx = self.input_mode_combo.findText(saved_input_mode)
+        if idx >= 0:
+            self.input_mode_combo.setCurrentIndex(idx)
+        self.output_edit.setText(s.value("output_path", "", type=str))
         saved_model_dir: str = s.value("model_dir", "", type=str)
         if saved_model_dir:
             self.model_dir_edit.setText(saved_model_dir)
@@ -1093,6 +1238,9 @@ class MainWindow(QMainWindow):
         s = QSettings(self._SETTINGS_ORG, self._SETTINGS_APP)
         s.setValue("python_exe", self.python_exe_edit.text().strip())
         s.setValue("seedvr2_folder", self.seedvr2_folder_edit.text().strip())
+        s.setValue("input_path", self.input_edit.text().strip())
+        s.setValue("input_mode", self.input_mode_combo.currentText())
+        s.setValue("output_path", self.output_edit.text().strip())
         s.setValue("model_dir", self.model_dir_edit.text().strip())
 
     # ------------------------------------------------------------------

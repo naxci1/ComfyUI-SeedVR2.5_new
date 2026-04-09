@@ -88,16 +88,28 @@ def main() -> None:
         "--noconsole",
         # Bundle the GUI stylesheet; worker/main_window are discovered automatically.
         "--add-data", f"{gui_dir / 'styles.py'}{os.pathsep}gui",
-        # Core hidden imports (PyQt6 + optional cv2 preview)
+        # Core hidden imports (PyQt6 + multimedia for the comparison player)
         "--hidden-import", "PyQt6",
         "--hidden-import", "PyQt6.QtWidgets",
         "--hidden-import", "PyQt6.QtCore",
         "--hidden-import", "PyQt6.QtGui",
         "--hidden-import", "PyQt6.QtMultimedia",
         "--hidden-import", "PyQt6.QtMultimediaWidgets",
-        "--hidden-import", "cv2",
-        # Collect all PyQt6 resources (multimedia codecs, plugins, etc.)
-        "--collect-all", "PyQt6",
+        # Exclude heavy ML / AI libraries – they live in the user's python_embeded
+        "--exclude-module", "torch",
+        "--exclude-module", "torchvision",
+        "--exclude-module", "torchaudio",
+        "--exclude-module", "numpy",
+        "--exclude-module", "cv2",
+        "--exclude-module", "onnxruntime",
+        "--exclude-module", "transformers",
+        "--exclude-module", "safetensors",
+        "--exclude-module", "diffusers",
+        "--exclude-module", "accelerate",
+        "--exclude-module", "PIL",
+        "--exclude-module", "scipy",
+        "--exclude-module", "sklearn",
+        "--exclude-module", "matplotlib",
         # Output paths
         "--distpath", str(dist_dir),
         "--workpath", str(repo_root / "build"),

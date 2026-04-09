@@ -102,13 +102,17 @@ class InferenceWorker(QObject):
     """
 
     log_line = pyqtSignal(str)
+    # progress_update  → global/total progress  (frame or chunk token)
+    # batch_progress_update → per-batch progress (batch token)
     progress_update = pyqtSignal(int, int)
+    batch_progress_update = pyqtSignal(int, int)
     finished = pyqtSignal(bool, str)
     started_signal = pyqtSignal()
 
     # Tokens that SeedVR2 prints which carry frame-progress information.
-    # Example:  "Processing batch 3/12 …"  or  "Frame 45/300"
-    _PROGRESS_TOKENS = ("batch ", "frame ", "chunk ")
+    # "batch N/M" → batch-level; "frame N/M" / "chunk N/M" → global.
+    _BATCH_TOKENS = ("batch ",)
+    _GLOBAL_TOKENS = ("frame ", "chunk ")
 
     def __init__(
         self,
@@ -199,16 +203,21 @@ class InferenceWorker(QObject):
 
             # ── Parse progress tokens ───────────────────────────────────
             lower = line.lower()
-            for token in self._PROGRESS_TOKENS:
+            for token, is_batch in (
+                *((t, True) for t in self._BATCH_TOKENS),
+                *((t, False) for t in self._GLOBAL_TOKENS),
+            ):
                 if token in lower:
                     idx = lower.find(token) + len(token)
                     rest = lower[idx:].split()[0]  # e.g. "3/12"
                     if "/" in rest:
                         try:
                             cur, tot = rest.split("/")
-                            current_frame = int(cur)
-                            total_frames = int(tot)
-                            self.progress_update.emit(current_frame, total_frames)
+                            c, t = int(cur), int(tot)
+                            if is_batch:
+                                self.batch_progress_update.emit(c, t)
+                            else:
+                                self.progress_update.emit(c, t)
                         except ValueError:
                             pass
                     break
