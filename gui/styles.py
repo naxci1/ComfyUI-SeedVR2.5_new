@@ -4,14 +4,14 @@ Dark Mode Stylesheet – Topaz Video AI inspired theme for SeedVR2 GUI.
 
 DARK_STYLESHEET = """
 QWidget {
-    background-color: #1a1a1a;
+    background-color: #111111;
     color: #e0e0e0;
-    font-family: "Segoe UI", Arial, sans-serif;
+    font-family: "Inter", "Segoe UI", Arial, sans-serif;
     font-size: 13px;
 }
 
 QMainWindow {
-    background-color: #141414;
+    background-color: #0d0d0d;
 }
 
 /* ── Menu bar ──────────────────────────────────────────────────────────── */
@@ -67,13 +67,13 @@ QScrollArea {
     background-color: transparent;
 }
 QScrollBar:vertical {
-    background-color: #1a1a1a;
-    width: 12px;
-    border-radius: 6px;
+    background-color: #111111;
+    width: 14px;
+    border-radius: 7px;
 }
 QScrollBar::handle:vertical {
-    background-color: #666666;
-    border-radius: 6px;
+    background-color: #888888;
+    border-radius: 7px;
     min-height: 40px;
 }
 QScrollBar::handle:vertical:hover {
@@ -83,13 +83,13 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
     height: 0;
 }
 QScrollBar:horizontal {
-    background-color: #1a1a1a;
-    height: 12px;
-    border-radius: 6px;
+    background-color: #111111;
+    height: 14px;
+    border-radius: 7px;
 }
 QScrollBar::handle:horizontal {
-    background-color: #666666;
-    border-radius: 6px;
+    background-color: #888888;
+    border-radius: 7px;
     min-width: 40px;
 }
 QScrollBar::handle:horizontal:hover {

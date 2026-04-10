@@ -170,7 +170,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("SeedVR2.5 Upscaler by HB2k")
+        self.setWindowTitle("SeedVR2.5 Upscaler by HB2k v.1.3 beta")
         self.resize(1400, 960)
 
         # Create settings window first – it loads saved paths in its __init__
@@ -216,7 +216,7 @@ class MainWindow(QMainWindow):
         title_vlayout = QVBoxLayout(title_col)
         title_vlayout.setContentsMargins(0, 0, 0, 0)
         title_vlayout.setSpacing(2)
-        title_lbl = QLabel("SeedVR2.5 Upscaler by HB2k")
+        title_lbl = QLabel("SeedVR2.5 Upscaler by HB2k v.1.3 beta")
         title_lbl.setObjectName("header_label")
         sub_lbl = QLabel("Powered by SeedVR2 Diffusion Models")
         sub_lbl.setObjectName("subheader_label")
@@ -284,6 +284,14 @@ class MainWindow(QMainWindow):
         mode_bar.addWidget(self._mode_output_btn)
         mode_bar.addWidget(self._mode_split_btn)
         mode_bar.addStretch(1)
+
+        # "📂 Open" – quick input-file picker aligned to the far right of the mode bar
+        self._open_input_btn = QPushButton("📂 Open")
+        self._open_input_btn.setToolTip("Open an input video or image file")
+        self._open_input_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
+        self._open_input_btn.clicked.connect(self._browse_input_for_player)
+        mode_bar.addWidget(self._open_input_btn)
+
         layout.addWidget(mode_bar_w)
 
         # ── Viewer stack ───────────────────────────────────────────────
@@ -1131,6 +1139,20 @@ class MainWindow(QMainWindow):
             # Switch to output view automatically
             self._mode_output_btn.setChecked(True)
 
+    def _browse_input_for_player(self) -> None:
+        """Open a file picker from the mode bar; sets the input path and loads the preview."""
+        start_dir = self._settings_win.input_edit.text().strip() or ""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Input File", start_dir,
+            "Videos & Images "
+            "(*.mp4 *.avi *.mov *.mkv *.webm *.png *.jpg *.jpeg *.bmp *.tiff)"
+            ";;All Files (*)",
+        )
+        if path:
+            self._settings_win.input_edit.setText(path)
+            self._load_preview(path)
+            self._mode_input_btn.setChecked(True)
+
     def _try_auto_load_output(self) -> None:
         if not _MULTIMEDIA_AVAILABLE:
             return
@@ -1171,6 +1193,11 @@ class MainWindow(QMainWindow):
         minus_btn.setFixedWidth(34)
         minus_btn.setFont(_btn_font)
         minus_btn.setToolTip("Decrease batch size by 4")
+        minus_btn.setStyleSheet(
+            "QPushButton { background-color: #222222; border: 1px solid #444; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #2e2e2e; }"
+            "QPushButton:pressed { background-color: #1a1a1a; }"
+        )
 
         self.batch_size_spin = QSpinBox()
         self.batch_size_spin.setRange(1, 10001)
@@ -1188,6 +1215,11 @@ class MainWindow(QMainWindow):
         plus_btn.setFixedWidth(34)
         plus_btn.setFont(_btn_font)
         plus_btn.setToolTip("Increase batch size by 4")
+        plus_btn.setStyleSheet(
+            "QPushButton { background-color: #222222; border: 1px solid #444; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #2e2e2e; }"
+            "QPushButton:pressed { background-color: #1a1a1a; }"
+        )
 
         # ±4 step – result is always 4k+1 if starting from a valid value
         minus_btn.clicked.connect(
