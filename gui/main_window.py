@@ -64,6 +64,10 @@ except ImportError:
 # GPU auto-detection
 # ---------------------------------------------------------------------------
 
+# Win32 flag that prevents a console window from flashing when spawning child
+# processes.  Equals 0 on non-Windows so the constant is always safe to use.
+_CREATE_NO_WINDOW: int = 0x08000000 if sys.platform == "win32" else 0
+
 # Populated by _detect_gpus(); read by MainWindow to emit a startup console note.
 _GPU_INIT_MSG: str = ""
 
@@ -94,7 +98,7 @@ def _detect_gpus() -> list[str]:
 
     # ── Primary: wmic (Windows-native) ─────────────────────────────────────
     try:
-        flags = 0x08000000 if sys.platform == "win32" else 0  # CREATE_NO_WINDOW
+        flags = _CREATE_NO_WINDOW
         raw = subprocess.check_output(
             "wmic path win32_VideoController get name",
             shell=True,
@@ -1052,7 +1056,10 @@ class MainWindow(QMainWindow):
                     # "GPU 0: NVIDIA GeForce …" → split on ":" → "GPU 0" → last token
                     indices.append(sel.split(":")[0].split()[-1].strip())
                 except (IndexError, ValueError):
-                    pass
+                    print(
+                        f"[SeedVR2] Warning: could not parse GPU index from {sel!r}",
+                        flush=True,
+                    )
             cuda_dev = ",".join(indices) if indices else "0"
         args += ["--cuda_device", cuda_dev]
 
