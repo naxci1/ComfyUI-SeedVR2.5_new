@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QRectF, QSettings, QUrl, QEvent
+from PyQt6.QtCore import Qt, QRectF, QSettings, QUrl, QEvent, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QIcon, QImageReader, QPixmap, QPainter, QPen, QStandardItem, QStandardItemModel, QWheelEvent
 from PyQt6.QtWidgets import (
     QApplication,
@@ -258,18 +258,50 @@ def _make_group(title: str) -> tuple[QGroupBox, QFormLayout]:
 # ---------------------------------------------------------------------------
 
 class _FullscreenWindow(QWidget):
-    """A top-level window that holds a cloned/replicated view for fullscreen comparison."""
+    """A top-level window that shows a fullscreen comparison view.
 
-    def __init__(self, split_view: "SplitViewWidget", parent=None) -> None:
+    For image inputs a *copy* SplitViewWidget is created (no re-parenting of
+    the live widget so the main window keeps working while fullscreen is open).
+    For video inputs the live split_view is re-parented here temporarily; it
+    is returned to the caller via the ``restore_widget`` signal on close.
+    """
+
+    restore_widget = pyqtSignal()
+
+    def __init__(
+        self,
+        split_view: "SplitViewWidget",
+        *,
+        image_mode: bool = False,
+        parent=None,
+    ) -> None:
         super().__init__(parent, Qt.WindowType.Window)
-        self.setWindowTitle("Split View – Full Screen")
+        self.setWindowTitle("Full Screen  –  ESC to exit")
         self.setStyleSheet("background:#0d0d0d;")
 
-        # Embed the split_view widget (reparent temporarily)
-        self._split_view = split_view
+        self._owned_view: Optional["SplitViewWidget"] = None  # lives here; destroyed on close
+        self._borrowed_view: Optional["SplitViewWidget"] = None  # returned on close
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(split_view)
+        layout.setSpacing(0)
+
+        if image_mode:
+            # Create a fresh SplitViewWidget and mirror the current images.
+            copy_view = SplitViewWidget(self)
+            if split_view._input_image and not split_view._input_image.isNull():
+                copy_view.set_input_image(split_view._input_image)
+            if split_view._output_image and not split_view._output_image.isNull():
+                copy_view.set_output_image(split_view._output_image)
+            copy_view._split_ratio = split_view._split_ratio
+            copy_view._zoom = split_view._zoom
+            copy_view._pan_offset = split_view._pan_offset
+            self._owned_view = copy_view
+            layout.addWidget(copy_view)
+        else:
+            # Video mode: re-parent the live split_view temporarily.
+            self._borrowed_view = split_view
+            layout.addWidget(split_view)
 
         close_btn = QPushButton("✕  Exit Full Screen  (ESC)")
         close_btn.setFixedHeight(32)
@@ -287,9 +319,11 @@ class _FullscreenWindow(QWidget):
             super().keyPressEvent(event)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
-        # Re-parent the split_view back to its original parent
-        if self._split_view:
-            self._split_view.setParent(None)  # type: ignore[call-overload]
+        if self._borrowed_view is not None:
+            # Remove from our layout WITHOUT destroying – the main window will re-adopt it.
+            self.layout().removeWidget(self._borrowed_view)
+            self._borrowed_view = None
+            self.restore_widget.emit()
         super().closeEvent(event)
 
 
@@ -476,7 +510,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
 
         # Load window icon – try .ico first (Windows), fall back to .png
-        for _icon_rel in ("icon.ico", "assets/icon.ico", "assets/icon.png"):
+        for _icon_rel in ("icon.png", "icon.ico", "assets/icon.ico", "assets/icon.png"):
             _icon = _resource_path(_icon_rel)
             if os.path.isfile(_icon):
                 self.setWindowIcon(QIcon(_icon))
@@ -1451,23 +1485,31 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _open_fullscreen(self) -> None:
-        """Open the Split-View in a dedicated fullscreen window."""
-        if not _MULTIMEDIA_AVAILABLE or self._split_view is None:
+        """Open the current view in a dedicated fullscreen window."""
+        if self._split_view is None:
             return
-        # Ensure we're in split mode first
-        if self._player_mode != "split":
-            self._mode_split_btn.setChecked(True)
-            self._on_mode_button(2, True)
-        self._fs_window = _FullscreenWindow(self._split_view)
-        self._fs_window.destroyed.connect(self._on_fullscreen_closed)
+        is_img = self._current_input_is_image
+
+        if not is_img:
+            # Video mode: ensure split view is active before re-parenting it.
+            if not _MULTIMEDIA_AVAILABLE:
+                return
+            if self._player_mode != "split":
+                self._mode_split_btn.setChecked(True)
+                self._on_mode_button(2, True)
+
+        self._fs_window = _FullscreenWindow(
+            self._split_view, image_mode=is_img
+        )
+        if not is_img:
+            # Video mode: the live split_view was borrowed; restore it when closed.
+            self._fs_window.restore_widget.connect(self._on_fullscreen_closed)
         self._fs_window.showFullScreen()
 
     def _on_fullscreen_closed(self) -> None:
-        """Re-insert split_view back into the viewer stack after fullscreen exits."""
+        """Re-insert split_view back into the viewer stack after video-fullscreen exits."""
         if self._split_view is None:
             return
-        # The split view was reparented out; re-add it at index 2
-        # (QStackedWidget accepts widgets back via insertWidget)
         self._viewer_stack.insertWidget(2, self._split_view)
         self._viewer_stack.setCurrentIndex(2)
 
@@ -1653,6 +1695,13 @@ class MainWindow(QMainWindow):
                 img = QPixmap(str(result))
                 if not img.isNull():
                     self._split_view.set_output_image(img.toImage())
+                    # Update metadata label with output file dimensions
+                    reader = QImageReader(str(result))
+                    size = reader.size()
+                    if size.isValid():
+                        self._meta_label.setText(
+                            f"Output: {size.width()}×{size.height()} px"
+                        )
                     self._mode_split_btn.setChecked(True)
                     self._on_mode_button(2, True)
             return
