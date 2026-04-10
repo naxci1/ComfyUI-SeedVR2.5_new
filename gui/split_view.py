@@ -164,3 +164,19 @@ class SplitViewWidget(QWidget):
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
         self._dragging = False
         self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    # ------------------------------------------------------------------
+    # Static image comparison (used when input is an image, not a video)
+    # ------------------------------------------------------------------
+
+    def set_input_image(self, img: QImage) -> None:
+        """Display a static QImage as the input (left/before) side."""
+        if not img.isNull():
+            self._input_image = _to_renderable(img)
+            self.update()
+
+    def set_output_image(self, img: QImage) -> None:
+        """Display a static QImage as the output (right/after) side."""
+        if not img.isNull():
+            self._output_image = _to_renderable(img)
+            self.update()

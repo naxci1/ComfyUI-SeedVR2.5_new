@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import Qt, QRectF, QSettings, QUrl, QEvent
-from PyQt6.QtGui import QFont, QIcon, QPixmap, QStandardItem, QStandardItemModel, QWheelEvent
+from PyQt6.QtGui import QColor, QFont, QIcon, QImageReader, QPixmap, QPainter, QPen, QStandardItem, QStandardItemModel, QWheelEvent
 from PyQt6.QtWidgets import (
     QApplication,
     QAbstractSpinBox,
@@ -37,6 +37,7 @@ from PyQt6.QtWidgets import (
     QSlider,
     QSpinBox,
     QSplitter,
+    QSplitterHandle,
     QStackedWidget,
     QTextEdit,
     QVBoxLayout,
@@ -44,7 +45,7 @@ from PyQt6.QtWidgets import (
 )
 
 try:
-    from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+    from PyQt6.QtMultimedia import QAudioOutput, QMediaMetaData, QMediaPlayer
     from PyQt6.QtMultimediaWidgets import QVideoWidget
     _MULTIMEDIA_AVAILABLE = True
 except ImportError:
@@ -209,6 +210,36 @@ def _form_row(label_text: str, widget: QWidget) -> QHBoxLayout:
 
 
 
+# ---------------------------------------------------------------------------
+# Styled splitter handle – thick, coloured, with a ⇔ arrow indicator
+# ---------------------------------------------------------------------------
+
+class _StyledSplitterHandle(QSplitterHandle):
+    """A 9 px wide splitter handle painted in #11abda with a centred ⇔ icon."""
+
+    def paintEvent(self, _event) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # Background
+        painter.fillRect(self.rect(), QColor("#11abda"))
+        # Arrow label
+        painter.setPen(QPen(QColor("white"), 1))
+        painter.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "⇔")
+        painter.end()
+
+
+class _StyledSplitter(QSplitter):
+    """QSplitter that returns a coloured, thicker handle."""
+
+    def createHandle(self) -> QSplitterHandle:  # type: ignore[override]
+        return _StyledSplitterHandle(Qt.Orientation.Horizontal, self)
+
+
+# ---------------------------------------------------------------------------
+# Group-box / form-layout factory
+# ---------------------------------------------------------------------------
+
 def _make_group(title: str) -> tuple[QGroupBox, QFormLayout]:
     """Create a titled QGroupBox with an inner QFormLayout."""
     box = QGroupBox(title)
@@ -218,7 +249,7 @@ def _make_group(title: str) -> tuple[QGroupBox, QFormLayout]:
     layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
     layout.setHorizontalSpacing(12)
     layout.setVerticalSpacing(6)
-    layout.setContentsMargins(10, 10, 10, 10)
+    layout.setContentsMargins(5, 10, 5, 10)
     box.setLayout(layout)
     return box, layout
 
@@ -460,14 +491,15 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(header_widget)
 
         # ── 2. Main splitter ───────────────────────────────────────────
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setChildrenCollapsible(False)
+        splitter = _StyledSplitter(Qt.Orientation.Horizontal)
+        splitter.setHandleWidth(9)
+        splitter.setChildrenCollapsible(True)
         root_layout.addWidget(splitter, stretch=1)
 
         splitter.addWidget(self._build_left_panel())
         splitter.addWidget(self._build_right_panel())
         splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 0)
+        splitter.setStretchFactor(1, 1)
 
         # ── 3. Bottom controls bar ─────────────────────────────────────
         root_layout.addWidget(self._build_bottom_bar())
@@ -569,6 +601,10 @@ class MainWindow(QMainWindow):
             # Slave input position strictly to output (master→slave sync).
             self._output_player.positionChanged.connect(self._sync_input_to_output)
 
+            # Metadata signal – update the file-info label after source loads.
+            self._input_player.metaDataChanged.connect(self._on_input_meta_changed)
+            self._input_player.durationChanged.connect(self._on_input_meta_changed)
+
             # Initial volume (70 %)
             self._input_audio.setVolume(0.70)
             self._output_audio.setVolume(0.70)
@@ -591,6 +627,13 @@ class MainWindow(QMainWindow):
             self._viewer_stack.addWidget(placeholder)
 
         layout.addWidget(self._viewer_stack, stretch=1)
+
+        # ── File metadata label ────────────────────────────────────────
+        self._current_input_is_image: bool = False
+        self._meta_label = QLabel("")
+        self._meta_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._meta_label.setStyleSheet("color:#888; font-size:11px; padding:2px 0;")
+        layout.addWidget(self._meta_label)
 
         # ── Seek slider ────────────────────────────────────────────────
         self._seek_slider = QSlider(Qt.Orientation.Horizontal)
@@ -648,7 +691,7 @@ class MainWindow(QMainWindow):
 
     def _build_right_panel(self) -> QWidget:
         scroll = QScrollArea()
-        scroll.setMinimumWidth(250)
+        scroll.setMinimumWidth(150)
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
@@ -997,22 +1040,67 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _load_preview(self, path: str) -> None:
-        """Load *path* into the preview area.
+        """Load *path* into the preview area and update the metadata label.
 
-        Image files (jpg/png/bmp/tiff/webp) are shown in the zoomable image view
-        (page 3 of the viewer stack).  Video files are fed to the input player
-        (page 0).
+        Image files are shown in the zoomable image view (page 3) and also
+        pre-loaded into the SplitViewWidget for image comparison.
+        Video files are fed to the input player (page 0).
         """
         _IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp", ".gif"}
         suffix = Path(path).suffix.lower()
         if suffix in _IMAGE_SUFFIXES:
+            self._current_input_is_image = True
+            # Dimensions via QImageReader (no full decode needed)
+            reader = QImageReader(path)
+            size = reader.size()
+            if size.isValid():
+                self._meta_label.setText(f"{size.width()}×{size.height()} px")
+            else:
+                self._meta_label.setText("")
             pix = QPixmap(path)
             if not pix.isNull():
                 self._image_view.set_pixmap(pix)
+                if _MULTIMEDIA_AVAILABLE and self._split_view is not None:
+                    self._split_view.set_input_image(pix.toImage())
             self._viewer_stack.setCurrentIndex(3)
         else:
+            self._current_input_is_image = False
+            self._meta_label.setText("Loading…")
             self._load_input_video(path)
             self._viewer_stack.setCurrentIndex(0)
+
+    # ------------------------------------------------------------------
+    # Metadata update for video sources
+    # ------------------------------------------------------------------
+
+    def _on_input_meta_changed(self) -> None:
+        """Update the metadata label from QMediaPlayer metadata + duration."""
+        if not _MULTIMEDIA_AVAILABLE or not self._input_player:
+            return
+        if self._current_input_is_image:
+            return  # image meta already set in _load_preview
+        parts: list[str] = []
+        try:
+            meta = self._input_player.metaData()
+            res = meta.value(QMediaMetaData.Key.Resolution)
+            if res is not None:
+                parts.append(f"{res.width()}×{res.height()} px")
+            fps = meta.value(QMediaMetaData.Key.VideoFrameRate)
+            if fps is not None:
+                try:
+                    parts.append(f"{float(fps):.0f} fps")
+                except (TypeError, ValueError):
+                    pass
+        except Exception:
+            pass
+        dur_ms = self._input_player.duration()
+        if dur_ms > 0:
+            secs = dur_ms // 1000
+            parts.append(f"{secs // 60:02d}:{secs % 60:02d} min")
+        if parts:
+            self._meta_label.setText(", ".join(parts))
+        elif self._meta_label.text() == "Loading…":
+            pass  # keep "Loading…" until metadata arrives
 
     # ------------------------------------------------------------------
     # Argument builder
@@ -1301,7 +1389,15 @@ class MainWindow(QMainWindow):
             self._output_player.setVideoOutput(self._solo_output_vw)
             self._viewer_stack.setCurrentIndex(1)
         else:  # split
-            self._input_player.setVideoOutput(self._split_view.input_sink)
+            if self._current_input_is_image:
+                # Image input: feed directly into SplitViewWidget; no video sink needed.
+                inp_path = self._settings_win.input_edit.text().strip()
+                if inp_path:
+                    pix = QPixmap(inp_path)
+                    if not pix.isNull():
+                        self._split_view.set_input_image(pix.toImage())
+            else:
+                self._input_player.setVideoOutput(self._split_view.input_sink)
             self._output_player.setVideoOutput(self._split_view.output_sink)
             self._viewer_stack.setCurrentIndex(2)
 
