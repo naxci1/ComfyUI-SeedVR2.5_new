@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import ctypes
 import os
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import subprocess
 import sys
 import tempfile
@@ -498,17 +500,17 @@ class MainWindow(QMainWindow):
     _SETTINGS_APP = "SeedVR2_GUI"
 
     def __init__(self) -> None:
-        super().__init__()
-        self.setWindowTitle("SeedVR2.5 Upscaler by HB2k v.1.3 beta")
-        self.resize(1100, 900)
-
         # Windows: set AppUserModelID so taskbar icon matches the window icon
         try:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                "naxci1.seedvr.upscaler.25"
+                "naxci1.seedvr.upscaler.1.4"
             )
         except Exception:
             pass
+
+        super().__init__()
+        self.setWindowTitle("SeedVR2 v.1.4 beta")
+        self.resize(1100, 900)
 
         # Create settings window first – it loads saved paths in its __init__
         self._settings_win = SettingsWindow(self)
@@ -522,17 +524,8 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
 
-        # Load window icon – prefer favicon.ico, then fall back to other common names
-        _icon_found = False
-        for _icon_rel in ("favicon.ico", "icon.ico", "icon.png", "assets/icon.ico", "assets/icon.png"):
-            _icon = _resource_path(_icon_rel)
-            if os.path.isfile(_icon):
-                self.setWindowIcon(QIcon(_icon))
-                _icon_found = True
-                break
-        if not _icon_found:
-            # Try relative path as last resort (for frozen/bundled builds)
-            self.setWindowIcon(QIcon("favicon.ico"))
+        # Load window icon from gui/favicon.ico
+        self.setWindowIcon(QIcon(os.path.join("gui", "favicon.ico")))
 
         self._set_running(False)
 
@@ -561,7 +554,7 @@ class MainWindow(QMainWindow):
         title_vlayout = QVBoxLayout(title_col)
         title_vlayout.setContentsMargins(0, 0, 0, 0)
         title_vlayout.setSpacing(2)
-        title_lbl = QLabel("SeedVR2.5 Upscaler by HB2k v.1.3 beta")
+        title_lbl = QLabel("SeedVR2 v.1.4 beta")
         title_lbl.setObjectName("header_label")
         sub_lbl = QLabel("Powered by SeedVR2 Diffusion Models")
         sub_lbl.setObjectName("subheader_label")
