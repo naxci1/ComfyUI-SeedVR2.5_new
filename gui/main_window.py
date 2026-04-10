@@ -12,13 +12,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QSettings, QUrl, QEvent
-from PyQt6.QtGui import QFont, QIcon, QPixmap, QStandardItem, QStandardItemModel
+from PyQt6.QtCore import Qt, QRectF, QSettings, QUrl, QEvent
+from PyQt6.QtGui import QFont, QIcon, QPixmap, QStandardItem, QStandardItemModel, QWheelEvent
 from PyQt6.QtWidgets import (
     QApplication,
     QAbstractSpinBox,
     QButtonGroup,
     QFileDialog,
+    QGraphicsPixmapItem,
+    QGraphicsScene,
+    QGraphicsView,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -205,6 +208,7 @@ def _form_row(label_text: str, widget: QWidget) -> QHBoxLayout:
     return row
 
 
+
 def _make_group(title: str) -> tuple[QGroupBox, QFormLayout]:
     """Create a titled QGroupBox with an inner QFormLayout."""
     box = QGroupBox(title)
@@ -216,6 +220,40 @@ def _make_group(title: str) -> tuple[QGroupBox, QFormLayout]:
     layout.setContentsMargins(10, 20, 10, 10)
     box.setLayout(layout)
     return box, layout
+
+
+# ---------------------------------------------------------------------------
+# Zoomable image preview widget (QGraphicsView-based)
+# ---------------------------------------------------------------------------
+
+class _ZoomableImageView(QGraphicsView):
+    """QGraphicsView that shows a static image and supports mouse-wheel zoom."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._scene = QGraphicsScene(self)
+        self.setScene(self._scene)
+        self._pix_item: Optional[QGraphicsPixmapItem] = None
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setMinimumHeight(300)
+        self.setStyleSheet(
+            "background:#0d0d0d; border:1px solid #2a2a2a; border-radius:4px;"
+        )
+
+    def set_pixmap(self, pix: QPixmap) -> None:
+        self._scene.clear()
+        self._pix_item = self._scene.addPixmap(pix)
+        self._scene.setSceneRect(QRectF(pix.rect()))
+        self.resetTransform()
+        self.fitInView(self._pix_item, Qt.AspectRatioMode.KeepAspectRatio)
+
+    def wheelEvent(self, event: QWheelEvent) -> None:  # type: ignore[override]
+        if event.angleDelta().y() > 0:
+            self.scale(1.15, 1.15)
+        elif event.angleDelta().y() < 0:
+            self.scale(0.85, 0.85)
 
 
 # ---------------------------------------------------------------------------
@@ -326,14 +364,16 @@ class CheckableComboBox(QComboBox):
             return
         txt = item.text().strip()
         if txt in ("Auto", "CPU"):
-            for i in range(model.rowCount()):
-                if i != row:
-                    model.item(i).setCheckState(Qt.CheckState.Unchecked)
+            if item.checkState() == Qt.CheckState.Checked:
+                for i in range(model.rowCount()):
+                    if i != row:
+                        model.item(i).setCheckState(Qt.CheckState.Unchecked)
         else:
-            for i in range(model.rowCount()):
-                it_txt = model.item(i).text().strip()
-                if it_txt in ("Auto", "CPU"):
-                    model.item(i).setCheckState(Qt.CheckState.Unchecked)
+            if item.checkState() == Qt.CheckState.Checked:
+                for i in range(model.rowCount()):
+                    it_txt = model.item(i).text().strip()
+                    if it_txt in ("Auto", "CPU"):
+                        model.item(i).setCheckState(Qt.CheckState.Unchecked)
 
     def _refresh_label(self) -> None:
         sel = self.checkedTexts()
@@ -426,8 +466,8 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self._build_left_panel())
         splitter.addWidget(self._build_right_panel())
         splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([500, 500])
+        splitter.setStretchFactor(1, 0)
+        splitter.setSizes([780, 320])
 
         # ── 3. Bottom controls bar ─────────────────────────────────────
         root_layout.addWidget(self._build_bottom_bar())
@@ -500,13 +540,9 @@ class MainWindow(QMainWindow):
             self._viewer_stack.addWidget(self._split_view)
 
             # page 3 – Static image preview (for image inputs)
-            self._image_label = QLabel()
-            self._image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self._image_label.setMinimumHeight(300)
-            self._image_label.setStyleSheet(
-                "background:#0d0d0d; border:1px solid #2a2a2a; border-radius:4px;"
-            )
-            self._viewer_stack.addWidget(self._image_label)
+            # page 3 – Zoomable static image preview
+            self._image_view = _ZoomableImageView()
+            self._viewer_stack.addWidget(self._image_view)
 
             # Media players
             self._input_player = QMediaPlayer()
@@ -612,13 +648,13 @@ class MainWindow(QMainWindow):
 
     def _build_right_panel(self) -> QWidget:
         scroll = QScrollArea()
-        scroll.setMinimumWidth(250)
+        scroll.setFixedWidth(320)
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         container = QWidget()
         container_layout = QVBoxLayout(container)
-        container_layout.setContentsMargins(10, 10, 50, 10)
+        container_layout.setContentsMargins(10, 10, 20, 10)
         container_layout.setSpacing(8)
 
         # ── AI Model ───────────────────────────────────────────────────
@@ -860,6 +896,12 @@ class MainWindow(QMainWindow):
         container_layout.addWidget(g)
 
         container_layout.addStretch(1)
+
+        # Apply max-width to all ComboBox / SpinBox / LineEdit in the right panel
+        # to prevent them stretching beyond 180 px in the constrained sidebar.
+        for _cw in container.findChildren((QComboBox, QSpinBox, QLineEdit)):
+            _cw.setMaximumWidth(180)
+
         scroll.setWidget(container)
         return scroll
 
@@ -953,7 +995,7 @@ class MainWindow(QMainWindow):
     def _load_preview(self, path: str) -> None:
         """Load *path* into the preview area.
 
-        Image files (jpg/png/bmp/tiff/webp) are shown on the static image label
+        Image files (jpg/png/bmp/tiff/webp) are shown in the zoomable image view
         (page 3 of the viewer stack).  Video files are fed to the input player
         (page 0).
         """
@@ -962,13 +1004,7 @@ class MainWindow(QMainWindow):
         if suffix in _IMAGE_SUFFIXES:
             pix = QPixmap(path)
             if not pix.isNull():
-                self._image_label.setPixmap(
-                    pix.scaled(
-                        self._image_label.size().expandedTo(pix.size()),
-                        Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation,
-                    )
-                )
+                self._image_view.set_pixmap(pix)
             self._viewer_stack.setCurrentIndex(3)
         else:
             self._load_input_video(path)
