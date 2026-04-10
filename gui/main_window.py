@@ -1400,24 +1400,34 @@ class MainWindow(QMainWindow):
         if btn_id >= len(modes):
             return
         new_mode = modes[btn_id]
-        if new_mode == self._player_mode:
+        # For video modes skip redundant switches; always allow image-tab refresh.
+        if new_mode == self._player_mode and not self._current_input_is_image:
             return
         self._player_mode = new_mode
         if new_mode == "input":
             if self._current_input_is_image:
-                # Show standalone zoomable image view for image inputs
+                # Always re-load input pixmap so the tab shows the original image even
+                # if the previous tab had swapped _image_view to display the output.
+                inp_path = self._settings_win.input_edit.text().strip()
+                if inp_path:
+                    pix = QPixmap(inp_path)
+                    if not pix.isNull():
+                        self._image_view.set_pixmap(pix)
                 self._viewer_stack.setCurrentIndex(3)
             else:
                 self._input_player.setVideoOutput(self._solo_input_vw)
                 self._viewer_stack.setCurrentIndex(0)
         elif new_mode == "output":
             if self._current_input_is_image:
-                # Try to show the upscaled output image if it exists
-                self._try_auto_load_output()
-                # If an output image was loaded into split view, show image_view with it
-                out_pix = self._split_view._output_image if self._split_view else None
-                if out_pix and not out_pix.isNull():
-                    self._image_view.set_pixmap(QPixmap.fromImage(out_pix))
+                # Use whatever output image is already held by the split view – it was
+                # populated by _try_auto_load_output() when upscaling finished.
+                # Do NOT call _try_auto_load_output() here: that function calls
+                # _on_mode_button(split) internally which would corrupt _player_mode.
+                out_img = self._split_view._output_image if self._split_view else None
+                if out_img and not out_img.isNull():
+                    self._image_view.set_pixmap(QPixmap.fromImage(out_img))
+                # Always show the image-view page (output image if available, else
+                # the viewer remains blank with the dark background).
                 self._viewer_stack.setCurrentIndex(3)
             else:
                 self._output_player.setVideoOutput(self._solo_output_vw)
