@@ -1,6 +1,147 @@
-# ComfyUI-SeedVR2_VideoUpscaler
+# 🎬 SeedVR2.5 GUI by HB2k — v.1.4 beta
 
-[![View Code](https://img.shields.io/badge/📂_View_Code-GitHub-181717?style=for-the-badge&logo=github)](https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler)
+[![GitHub](https://img.shields.io/badge/📂_View_Code-GitHub-181717?style=for-the-badge&logo=github)](https://github.com/naxci1/ComfyUI-SeedVR2.5_new)
+[![Version](https://img.shields.io/badge/version-v1.4_beta-blue?style=for-the-badge)](https://github.com/naxci1/ComfyUI-SeedVR2.5_new)
+[![Platform](https://img.shields.io/badge/platform-Windows-0078d7?style=for-the-badge&logo=windows)](https://github.com/naxci1/ComfyUI-SeedVR2.5_new)
+
+> **A professional, high-end AI Video & Image Upscaling GUI for SeedVR2** — no command line needed.  
+> Instantly upscale footage up to 4×, preview quality before committing, and compare results side-by-side in full screen.
+
+---
+
+## 📋 Table of Contents
+
+- [✨ What's New in v1.4 Beta](#-whats-new-in-v14-beta)
+- [🚀 Installation & Setup](#-installation--setup)
+- [🎮 Usage](#-usage)
+- [💻 System Requirements](#-system-requirements)
+- [🙏 Credits & Links](#-credits--links)
+
+---
+
+## ✨ What's New in v1.4 Beta
+
+### 📊 Dual Status Metadata
+Real-time display of **both Input and Output** file information simultaneously in the status bar. Instantly see resolution, codec, duration, and size for both the source and the upscaled result — no need to switch views.
+
+### 🖼️ Advanced Preview System
+One-click **frame capture from video** to instantly test upscale quality with **Batch Size 1**:
+- Pause the video at any frame using the built-in player
+- Click **"📸 Preview Frame"** to extract that exact frame
+- The GUI automatically runs a single-frame upscale so you can judge quality before committing to a full render
+
+### 🖥️ Full Screen Comparison (Split View)
+Professional **Topaz-style side-by-side comparison** now available in dedicated full-screen mode:
+- Toggle between **Input**, **Output**, and **Split View** from the control bar
+- Full-screen mode maximizes the comparison area for detailed quality inspection
+- Drag the split divider to reveal more of either the original or upscaled feed
+
+### 🪟 Enhanced Windows Integration
+- **Custom taskbar icon** — the app now pins to the Windows taskbar with the correct branding icon, using `AppUserModelID = 'naxci1.seedvr.upscaler.2.5'`
+- **High-DPI scaling fixes** — crisp rendering on 4K and high-resolution displays
+- PyInstaller-compatible icon loading via `get_resource_path()` helper (works both in dev mode and packaged `.exe`)
+
+### ⚡ VRAM Optimization
+`expandable_segments` is automatically enabled for **NVIDIA RTX 30/40/50 series** GPUs, delivering:
+- Reduced VRAM fragmentation during long encode/decode runs
+- More stable memory usage across multiple upscale batches
+- Better performance on GPUs with ≥ 8 GB VRAM (e.g. RTX 5070 Ti, 4090, 3090)
+
+### 🔗 GitHub Link
+A dedicated **"GitHub"** button inside the GUI provides direct one-click access to this repository for updates, issues, and discussions.
+
+---
+
+## 🚀 Installation & Setup
+
+> **No Python environment setup required if you use the packaged `.exe`.**
+
+### Step 1 — Download the GUI
+Download **`SeedVR2_GUI.exe`** from the [`dist/`](https://github.com/naxci1/ComfyUI-SeedVR2.5_new/tree/main/dist) folder in this repository.
+
+### Step 2 — Select your Python interpreter
+On first launch, click **"Browse…"** next to the **Python** field and point it to your `python.exe`. Both options are supported:
+- **Embedded Python** (recommended): the standalone Python bundled alongside SeedVR2
+- **System Python**: any Python 3.12+ installation on your machine
+
+### Step 3 — Point to the SeedVR2 core folder
+Click **"Browse…"** next to the **SeedVR2 Folder** field and select the directory that contains `inference_cli.py`. This is the core SeedVR2 engine the GUI drives.
+
+### Step 4 — Done! Settings are saved automatically
+All paths and preferences are persisted via **Qt QSettings** — just launch the `.exe` next time and you're ready to go.
+
+---
+
+## 🎮 Usage
+
+### Recommended Workflow
+
+```
+📂 Load File  →  📸 Preview Frame  →  ⚙️ Adjust Settings  →  ▶️ Run Full Upscale
+```
+
+| Step | Action | Description |
+|------|--------|-------------|
+| **1** | 📂 **Open** | Click the folder icon in the player bar or use **Settings → Input** to load a video or image |
+| **2** | ⏯️ **Seek** | Scrub to a representative frame using the playback controls |
+| **3** | 📸 **Preview Frame** | Click the preview button — the GUI captures the frame and runs a Batch Size 1 upscale |
+| **4** | 🔍 **Split View** | Switch to **Split View** mode to compare input vs output at full resolution |
+| **5** | ⚙️ **Adjust** | Tune upscale factor, resolution cap, DiT quantisation, VAE offload, and output format |
+| **6** | ▶️ **Run** | Click **Start** to upscale the full file — dual progress bars show per-batch and overall progress |
+
+### 🔍 Split View Comparison
+- Use the **\[Input\] \[Output\] \[Split View\]** buttons in the control bar to switch modes
+- In **Split View**, drag the divider left/right for a live before/after comparison
+- Click **⛶ Full Screen** to enter full-screen comparison mode
+
+### 🎛️ Key Settings
+| Setting | Default | Notes |
+|---------|---------|-------|
+| **Resolution** | 720p | Output height cap |
+| **Batch Size** | 1 | Frames per inference step (increase for speed, decrease for VRAM) |
+| **DiT Quantisation** | Q8_0 | Balances quality and VRAM |
+| **GPU Device** | Auto | Multi-GPU selection supported |
+| **Output Format** | Auto-detect | H.264 / H.265 / AV1 / PNG / JPG / WEBP / TIFF |
+
+---
+
+## 💻 System Requirements
+
+| Component | Minimum | Recommended |
+|-----------|---------|-------------|
+| **GPU** | NVIDIA RTX 20 series, 8 GB VRAM | RTX 5070 Ti / 4090 (Blackwell / Ada Lovelace) |
+| **VRAM** | 8 GB | 16 GB+ |
+| **Python** | 3.12 | 3.12 (embedded environment preferred) |
+| **OS** | Windows 10 64-bit | Windows 11 64-bit |
+| **CUDA** | 11.8+ | 12.x |
+| **RAM** | 16 GB | 32 GB+ |
+
+> ⚠️ **Note:** AMD / CPU / MPS inference is possible via the underlying SeedVR2 CLI but the GUI is optimised for NVIDIA hardware.
+
+---
+
+## 🙏 Credits & Links
+
+| | |
+|---|---|
+| 🔗 **Repository** | [https://github.com/naxci1/ComfyUI-SeedVR2.5_new](https://github.com/naxci1/ComfyUI-SeedVR2.5_new) |
+| 👤 **GUI Author** | **HB2k** — GUI design, Windows integration, preview system, split-view comparison |
+| 🏗️ **Core Engine** | [SeedVR2 by ByteDance Seed Team](https://github.com/ByteDance-Seed/SeedVR) |
+| 🔌 **ComfyUI Node** | [ComfyUI-SeedVR2_VideoUpscaler by numz](https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler) |
+
+Special thanks to the original SeedVR research and engineering team at ByteDance for releasing SeedVR2 and enabling community-built tools like this GUI.
+
+---
+
+*Built with ❤️ on top of SeedVR2 — the state-of-the-art open-source video restoration model.*
+
+---
+
+## 📖 Original ComfyUI Node Documentation
+
+> The sections below document the original ComfyUI node integration that this repository is forked from.
+
+---
 
 Official release of [SeedVR2](https://github.com/ByteDance-Seed/SeedVR) for ComfyUI that enables high-quality video and image upscaling.
 
