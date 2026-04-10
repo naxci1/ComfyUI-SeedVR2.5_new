@@ -315,19 +315,25 @@ class CheckableComboBox(QComboBox):
         self._refresh_label()
 
     def _enforce_exclusion(self, changed: QStandardItem) -> None:
-        """Apply mutual-exclusion rules when *changed* has just been checked."""
+        """Apply mutual-exclusion rules when *changed* has just been checked.
+
+        Rule A: "Auto" checked  → uncheck EVERYTHING else.
+        Rule B: "CPU" checked   → uncheck EVERYTHING else.
+        Rule C: "GPU X" checked → uncheck "Auto" and "CPU" only.
+        Rule D: Multiple "GPU X" items may be checked simultaneously.
+        """
         text = changed.text()
-        is_exclusive = text in ("Auto", "CPU")
         for i in range(self._model.rowCount()):
             it = self._item(i)
             if it is changed:
                 continue
-            if is_exclusive:
-                # Auto / CPU: uncheck everything else
+            if text in ("Auto", "CPU"):
+                # Rules A & B: exclusive items clear everything else
                 it.setCheckState(Qt.CheckState.Unchecked)
-            elif it.text() in ("Auto", "CPU"):
-                # Any GPU checked: uncheck Auto and CPU
-                it.setCheckState(Qt.CheckState.Unchecked)
+            else:
+                # Rule C: any GPU clears Auto and CPU, leaves other GPUs alone
+                if it.text() in ("Auto", "CPU"):
+                    it.setCheckState(Qt.CheckState.Unchecked)
 
     def _refresh_label(self) -> None:
         sel = self.checkedTexts()
@@ -419,9 +425,9 @@ class MainWindow(QMainWindow):
 
         splitter.addWidget(self._build_left_panel())
         splitter.addWidget(self._build_right_panel())
-        splitter.setStretchFactor(0, 7)
-        splitter.setStretchFactor(1, 3)
-        splitter.setSizes([700, 300])
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([500, 500])
 
         # ── 3. Bottom controls bar ─────────────────────────────────────
         root_layout.addWidget(self._build_bottom_bar())
@@ -603,7 +609,7 @@ class MainWindow(QMainWindow):
 
         container = QWidget()
         container_layout = QVBoxLayout(container)
-        container_layout.setContentsMargins(4, 0, 15, 0)
+        container_layout.setContentsMargins(10, 10, 25, 10)
         container_layout.setSpacing(8)
 
         # ── AI Model ───────────────────────────────────────────────────
@@ -856,8 +862,8 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 4, 0, 0)
         layout.setSpacing(4)
 
-        # Row 1 – Batch progress (current segment)
-        batch_row = QHBoxLayout()
+        # Single row – Batch + Total progress side by side
+        prog_row = QHBoxLayout()
         batch_lbl = QLabel("Batch:")
         batch_lbl.setMinimumWidth(50)
         batch_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -867,12 +873,6 @@ class MainWindow(QMainWindow):
         self.batch_progress_bar.setValue(0)
         self.batch_progress_bar.setMaximumHeight(14)
         self.batch_progress_bar.setToolTip("Current batch / segment progress")
-        batch_row.addWidget(batch_lbl)
-        batch_row.addWidget(self.batch_progress_bar, stretch=1)
-        layout.addLayout(batch_row)
-
-        # Row 2 – Total progress + status
-        prog_row = QHBoxLayout()
         total_lbl = QLabel("Total:")
         total_lbl.setMinimumWidth(50)
         total_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -884,6 +884,9 @@ class MainWindow(QMainWindow):
         self.progress_bar.setToolTip("Total video / folder progress")
         self.status_label = QLabel("Ready")
         self.status_label.setMinimumWidth(200)
+        prog_row.addWidget(batch_lbl)
+        prog_row.addWidget(self.batch_progress_bar, stretch=1)
+        prog_row.addSpacing(12)
         prog_row.addWidget(total_lbl)
         prog_row.addWidget(self.progress_bar, stretch=1)
         prog_row.addWidget(self.status_label)
