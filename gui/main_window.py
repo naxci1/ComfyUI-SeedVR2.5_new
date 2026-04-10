@@ -68,6 +68,18 @@ except ImportError:
     from settings_window import SettingsWindow  # type: ignore[no-redef]
 
 # ---------------------------------------------------------------------------
+# Resource path helper (PyInstaller-compatible)
+# ---------------------------------------------------------------------------
+
+def get_resource_path(relative_path: str) -> str:
+    """Return absolute path to *relative_path*, working both in development
+    and when frozen with PyInstaller (where data files land in sys._MEIPASS)."""
+    if hasattr(sys, "_MEIPASS"):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.dirname(os.path.dirname(__file__)), "gui", relative_path)
+
+
+# ---------------------------------------------------------------------------
 # GPU auto-detection
 # ---------------------------------------------------------------------------
 
@@ -523,9 +535,8 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
 
-        # Load window icon from gui/icon.ico
-        _icon_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "gui", "icon.ico")
-        self.setWindowIcon(QIcon(_icon_path))
+        # Load window icon (PyInstaller-compatible path)
+        self.setWindowIcon(QIcon(get_resource_path("icon.ico")))
 
         self._set_running(False)
 
