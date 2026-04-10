@@ -1511,22 +1511,33 @@ class MainWindow(QMainWindow):
             inp_path = Path(inp)
             inp_stem = inp_path.stem
 
+            # Determine the expected output extension from the UI combo.
+            _FMT_EXT: dict[str, str] = {
+                "PNG": ".png", "JPG": ".jpg", "WEBP": ".webp", "TIFF": ".tiff",
+            }
+            _fmt_sel = self.output_format_combo.currentText()
+            _preferred_ext: Optional[str] = _FMT_EXT.get(_fmt_sel)  # None for Auto/video
+
             def _find_image_output() -> Optional[Path]:
-                # --- Direct path construction (matches inference_cli.generate_output_path logic) ---
-                # For image input the CLI always writes a .png file.
+                # Build ordered list of extensions to try: preferred ext first, then all others.
+                _all_img_exts = [".png", ".jpg", ".jpeg", ".webp", ".tiff", ".tif", ".bmp"]
+                if _preferred_ext:
+                    ordered_exts = [_preferred_ext] + [
+                        e for e in _all_img_exts if e != _preferred_ext
+                    ]
+                else:
+                    ordered_exts = _all_img_exts
+
+                # --- Direct path construction (mirrors inference_cli.generate_output_path) ---
                 if out_path.is_dir():
-                    # User specified output dir: <output_dir>/<stem>.png (no _upscaled suffix)
-                    candidate = out_path / f"{inp_stem}.png"
-                    if candidate.is_file():
-                        return candidate
-                    # Also try common image extensions in case a format override was applied
-                    for ext in (".jpg", ".jpeg", ".webp", ".tiff", ".tif", ".bmp"):
+                    # User specified output dir: <output_dir>/<stem><ext> (no _upscaled suffix)
+                    for ext in ordered_exts:
                         candidate = out_path / f"{inp_stem}{ext}"
                         if candidate.is_file():
                             return candidate
                 elif not out_path.exists():
                     # No output dir set → same dir as input with _upscaled suffix
-                    for ext in (".png", ".jpg", ".jpeg", ".webp", ".tiff", ".tif", ".bmp"):
+                    for ext in ordered_exts:
                         candidate = inp_path.parent / f"{inp_stem}_upscaled{ext}"
                         if candidate.is_file():
                             return candidate
