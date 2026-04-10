@@ -66,7 +66,7 @@ except ImportError:
 def _detect_gpus() -> list[str]:
     """Return a list of GPU entries suitable for a QComboBox.
 
-    Format: ``["Auto", "CPU", "0: NVIDIA GeForce RTX 5070 Ti", "1: …", …]``
+    Format: ``["Auto", "CPU", "GPU 0: NVIDIA GeForce RTX 5070 Ti", "GPU 1: …", …]``
     Falls back to ``["Auto", "CPU"]`` when torch is unavailable or no CUDA GPUs exist.
     """
     entries = ["Auto", "CPU"]
@@ -74,7 +74,7 @@ def _detect_gpus() -> list[str]:
         import torch  # noqa: PLC0415
         if torch.cuda.is_available():
             for i in range(torch.cuda.device_count()):
-                entries.append(f"{i}: {torch.cuda.get_device_name(i)}")
+                entries.append(f"GPU {i}: {torch.cuda.get_device_name(i)}")
     except Exception:  # torch not installed in GUI's Python – that's fine
         pass
     return entries
@@ -140,7 +140,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("SeedVR2.5 Upscaler by HB2k")
+        self.setWindowTitle("SeedVR2.5 Upscaler by HB2k v.1b")
         self.resize(1400, 960)
 
         # Create settings window first – it loads saved paths in its __init__
@@ -182,7 +182,7 @@ class MainWindow(QMainWindow):
         title_vlayout = QVBoxLayout(title_col)
         title_vlayout.setContentsMargins(0, 0, 0, 0)
         title_vlayout.setSpacing(2)
-        title_lbl = QLabel("SeedVR2.5 Upscaler by HB2k")
+        title_lbl = QLabel("SeedVR2.5 Upscaler by HB2k v.1b")
         title_lbl.setObjectName("header_label")
         sub_lbl = QLabel("Powered by SeedVR2 Diffusion Models")
         sub_lbl.setObjectName("subheader_label")
@@ -251,6 +251,14 @@ class MainWindow(QMainWindow):
         mode_bar.addWidget(self._mode_split_btn)
         mode_bar.addStretch(1)
         layout.addWidget(mode_bar_w)
+
+        # ── Quick input file access ────────────────────────────────────
+        open_input_btn = QPushButton("📂  Open Input File…")
+        open_input_btn.setToolTip(
+            "Browse for a video file, load it in the preview, and set it as the input path"
+        )
+        open_input_btn.clicked.connect(self._browse_input_file)
+        layout.addWidget(open_input_btn)
 
         # ── Viewer stack ───────────────────────────────────────────────
         self._viewer_stack = QStackedWidget()
@@ -408,7 +416,22 @@ class MainWindow(QMainWindow):
         # ── Output Settings ────────────────────────────────────────────
         g, f = _make_group("Output Settings")
         self.output_format_combo = QComboBox()
-        self.output_format_combo.addItems(["Auto-detect", "mp4", "png"])
+        self.output_format_combo.addItems([
+            "Auto-detect",
+            # ── Video codecs ──────────────────────
+            "H.264 / mp4 (AVC)",
+            "H.265 / mp4 (HEVC)",
+            "AV1 / mp4",
+            # ── Image sequences ───────────────────
+            "PNG",
+            "JPG",
+            "WEBP",
+            "TIFF",
+        ])
+        self.output_format_combo.setToolTip(
+            "H.265 automatically enables the --10bit flag for x265 encoding.\n"
+            "JPG / WEBP / TIFF map to 'png' container in the current CLI."
+        )
         f.addRow("Output Format:", self.output_format_combo)
 
         self.video_backend_combo = QComboBox()
@@ -720,10 +743,24 @@ class MainWindow(QMainWindow):
         if md:
             args += ["--model_dir", md]
 
-        # output format
-        fmt = self.output_format_combo.currentText()
-        if fmt != "Auto-detect":
-            args += ["--output_format", fmt]
+        # output format + codec mapping
+        # Maps UI display name → (--output_format value, force_10bit)
+        # JPG/WEBP/TIFF map to "png" because the current CLI only accepts "mp4"/"png".
+        _FMT_MAP: dict[str, tuple[str, bool]] = {
+            "Auto-detect":       ("",    False),
+            "H.264 / mp4 (AVC)": ("mp4", False),
+            "H.265 / mp4 (HEVC)": ("mp4", True),   # force --10bit for x265
+            "AV1 / mp4":         ("mp4", False),
+            "PNG":               ("png", False),
+            "JPG":               ("png", False),
+            "WEBP":              ("png", False),
+            "TIFF":              ("png", False),
+        }
+        fmt_val, fmt_10bit = _FMT_MAP.get(self.output_format_combo.currentText(), ("", False))
+        if fmt_val:
+            args += ["--output_format", fmt_val]
+        if fmt_10bit and not self.use_10bit_check.isChecked():
+            args.append("--10bit")
 
         # video backend
         vb = self.video_backend_combo.currentText()
@@ -788,8 +825,9 @@ class MainWindow(QMainWindow):
         elif gpu_sel == "Auto":
             cuda_dev = "0"
         else:
-            # Format is "0: NVIDIA GeForce RTX 5070 Ti" – extract the index
-            cuda_dev = gpu_sel.split(":")[0].strip()
+            # Format is "GPU 0: NVIDIA GeForce RTX 5070 Ti" – extract the numeric index
+            # "GPU 0" is before the colon; split on space to get "0"
+            cuda_dev = gpu_sel.split(":")[0].split()[-1].strip()
         args += ["--cuda_device", cuda_dev]
 
         dit_offload = self.dit_offload_combo.currentText()
@@ -1054,6 +1092,18 @@ class MainWindow(QMainWindow):
         if self._output_player:
             self._output_player.setSource(QUrl.fromLocalFile(path))
 
+    def _browse_input_file(self) -> None:
+        """Open a file dialog, load the selected video into the preview, and set the input path."""
+        start_dir = self._settings_win.input_edit.text().strip() or ""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Input File", start_dir,
+            "Videos (*.mp4 *.avi *.mov *.mkv *.webm *.gif);;All Files (*)",
+        )
+        if path:
+            self._settings_win.input_edit.setText(path)
+            self._load_input_video(path)
+            self._mode_input_btn.setChecked(True)
+
     def _browse_output_video(self) -> None:
         start_dir = self._settings_win.output_edit.text().strip() or ""
         path, _ = QFileDialog.getOpenFileName(
@@ -1097,8 +1147,13 @@ class MainWindow(QMainWindow):
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(2)
 
-        minus_btn = QPushButton("−")
-        minus_btn.setFixedWidth(28)
+        _btn_font = QFont()
+        _btn_font.setBold(True)
+        _btn_font.setPointSize(12)
+
+        minus_btn = QPushButton("-")
+        minus_btn.setFixedWidth(34)
+        minus_btn.setFont(_btn_font)
         minus_btn.setToolTip("Decrease batch size by 4")
 
         self.batch_size_spin = QSpinBox()
@@ -1114,7 +1169,8 @@ class MainWindow(QMainWindow):
         self.batch_size_spin.valueChanged.connect(self._snap_batch_size)
 
         plus_btn = QPushButton("+")
-        plus_btn.setFixedWidth(28)
+        plus_btn.setFixedWidth(34)
+        plus_btn.setFont(_btn_font)
         plus_btn.setToolTip("Increase batch size by 4")
 
         # ±4 step – result is always 4k+1 if starting from a valid value

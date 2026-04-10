@@ -19,7 +19,7 @@ if platform.system() == "Windows":
     try:
         import ctypes
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-            "SeedVR2.HB2k.Upscaler.1"
+            "hb2k.seedvr2.v25"
         )
     except Exception:
         pass
@@ -39,7 +39,7 @@ def main() -> int:
     )
 
     app = QApplication(sys.argv)
-    app.setApplicationName("SeedVR2.5 Upscaler by HB2k")
+    app.setApplicationName("SeedVR2.5 Upscaler by HB2k v.1b")
     app.setOrganizationName("SeedVR2")
     app.setStyleSheet(DARK_STYLESHEET)
 
