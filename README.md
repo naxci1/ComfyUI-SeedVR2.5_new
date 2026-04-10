@@ -36,10 +36,6 @@ Professional **Topaz-style side-by-side comparison** now available in dedicated 
 - Full-screen mode maximizes the comparison area for detailed quality inspection
 - Drag the split divider to reveal more of either the original or upscaled feed
 
-### 🪟 Enhanced Windows Integration
-- **Custom taskbar icon** — the app now pins to the Windows taskbar with the correct branding icon, using `AppUserModelID = 'naxci1.seedvr.upscaler.2.5'`
-- **High-DPI scaling fixes** — crisp rendering on 4K and high-resolution displays
-- PyInstaller-compatible icon loading via `get_resource_path()` helper (works both in dev mode and packaged `.exe`)
 
 ### ⚡ VRAM Optimization
 `expandable_segments` is automatically enabled for **NVIDIA RTX 30/40/50 series** GPUs, delivering:
