@@ -5,15 +5,17 @@ Topaz-style dark-mode wrapper around inference_cli.py.
 
 from __future__ import annotations
 
+import ctypes
 import os
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import Qt, QRectF, QSettings, QUrl, QEvent, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QIcon, QImageReader, QPixmap, QPainter, QPen, QStandardItem, QStandardItemModel, QWheelEvent
+from PyQt6.QtGui import QColor, QDesktopServices, QFont, QIcon, QImageReader, QPixmap, QPainter, QPen, QStandardItem, QStandardItemModel, QWheelEvent
 from PyQt6.QtWidgets import (
     QApplication,
     QAbstractSpinBox,
@@ -500,12 +502,22 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("SeedVR2.5 Upscaler by HB2k v.1.3 beta")
         self.resize(1100, 900)
 
+        # Windows: set AppUserModelID so taskbar icon matches the window icon
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "SeedVR2.HB2k.Upscaler.1.3"
+            )
+        except Exception:
+            pass
+
         # Create settings window first – it loads saved paths in its __init__
         self._settings_win = SettingsWindow(self)
         self._settings_win.input_changed.connect(self._load_preview)
 
         self._thread = None
         self._worker = None
+        self._input_meta_text: str = ""   # last "Input: …" string for dual metadata
+        self._preview_temp_path: Optional[str] = None  # temp file for Preview runs
 
         self._build_ui()
 
@@ -555,7 +567,15 @@ class MainWindow(QMainWindow):
         settings_btn.setMinimumWidth(110)
         settings_btn.clicked.connect(self._open_settings)
 
+        github_btn = QPushButton("GitHub")
+        github_btn.setToolTip("Open project on GitHub")
+        github_btn.setMinimumWidth(80)
+        github_btn.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl("https://github.com/naxci1/ComfyUI-SeedVR2.5_new"))
+        )
+
         header_layout.addWidget(title_col, stretch=1)
+        header_layout.addWidget(github_btn)
         header_layout.addWidget(settings_btn)
         root_layout.addWidget(header_widget)
 
@@ -619,10 +639,10 @@ class MainWindow(QMainWindow):
         self._open_input_btn.clicked.connect(self._browse_input_for_player)
         mode_bar.addWidget(self._open_input_btn)
 
-        # "⛶ Full Screen" – opens split view fullscreen
-        self._fullscreen_btn = QPushButton("⛶")
+        # "Full" – opens split view fullscreen
+        self._fullscreen_btn = QPushButton("Full")
         self._fullscreen_btn.setToolTip("Open Split View in full screen (ESC to exit)")
-        self._fullscreen_btn.setFixedWidth(36)
+        self._fullscreen_btn.setFixedWidth(48)
         self._fullscreen_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
         self._fullscreen_btn.clicked.connect(self._open_fullscreen)
         mode_bar.addWidget(self._fullscreen_btn)
@@ -1045,6 +1065,13 @@ class MainWindow(QMainWindow):
         self.run_btn.setObjectName("primary_button")
         self.run_btn.clicked.connect(self._run)
 
+        self.preview_btn = QPushButton("⚡ Preview")
+        self.preview_btn.setToolTip(
+            "Upscale the current video frame as a single-image preview.\n"
+            "Batch size will be set to 1 automatically."
+        )
+        self.preview_btn.clicked.connect(self._preview_run)
+
         self.abort_btn = QPushButton("⏹  Abort")
         self.abort_btn.setObjectName("danger_button")
         self.abort_btn.clicked.connect(self._abort)
@@ -1059,6 +1086,7 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self.status_label)
         btn_row.addStretch(1)
         btn_row.addWidget(self.run_btn)
+        btn_row.addWidget(self.preview_btn)
         btn_row.addWidget(self.abort_btn)
         btn_row.addSpacing(12)
         btn_row.addWidget(self.copy_log_btn)
@@ -1107,8 +1135,10 @@ class MainWindow(QMainWindow):
             reader = QImageReader(path)
             size = reader.size()
             if size.isValid():
-                self._meta_label.setText(f"{size.width()}×{size.height()} px")
+                self._input_meta_text = f"Input: {size.width()}×{size.height()} px"
+                self._meta_label.setText(self._input_meta_text)
             else:
+                self._input_meta_text = ""
                 self._meta_label.setText("")
             pix = QPixmap(path)
             if not pix.isNull():
@@ -1156,13 +1186,37 @@ class MainWindow(QMainWindow):
             secs = dur_ms // 1000
             parts.append(f"{secs // 60:02d}:{secs % 60:02d} min")
         if parts:
-            self._meta_label.setText(", ".join(parts))
+            self._input_meta_text = "Input: " + ", ".join(parts)
+            self._meta_label.setText(self._input_meta_text)
         elif self._meta_label.text() == "Loading…":
             pass  # keep "Loading…" until metadata arrives
 
-    # ------------------------------------------------------------------
-    # Argument builder
-    # ------------------------------------------------------------------
+    def _on_output_meta_changed(self) -> None:
+        """Update the metadata label with output video info (combined with input)."""
+        if not _MULTIMEDIA_AVAILABLE or not self._output_player:
+            return
+        parts: list[str] = []
+        try:
+            meta = self._output_player.metaData()
+            res = meta.value(QMediaMetaData.Key.Resolution)
+            if res is not None:
+                parts.append(f"{res.width()}×{res.height()} px")
+            fps = meta.value(QMediaMetaData.Key.VideoFrameRate)
+            if fps is not None:
+                try:
+                    parts.append(f"{float(fps):.0f} fps")
+                except (TypeError, ValueError):
+                    pass
+        except Exception:
+            pass
+        dur_ms = self._output_player.duration()
+        if dur_ms > 0:
+            secs = dur_ms // 1000
+            parts.append(f"{secs // 60:02d}:{secs % 60:02d} min")
+        if parts:
+            out_info = "Output: " + ", ".join(parts)
+            combined = f"{self._input_meta_text}  |  {out_info}" if self._input_meta_text else out_info
+            self._meta_label.setText(combined)
 
     def _build_args(self) -> list[str]:
         args: list[str] = []
@@ -1422,6 +1476,59 @@ class MainWindow(QMainWindow):
             self._worker.request_abort()
         self.status_label.setText("Aborting…")
 
+    def _preview_run(self) -> None:
+        """Capture the currently displayed video frame, save to a temp PNG,
+        set batch size=1 and input to that file, then start an upscale run."""
+        # Try to grab a frame from the video players
+        frame_pix: Optional[QPixmap] = None
+        if _MULTIMEDIA_AVAILABLE:
+            # Check output player first (user might be reviewing output)
+            for player_widget in (
+                getattr(self, "_solo_output_vw", None),
+                getattr(self, "_solo_input_vw", None),
+            ):
+                if player_widget is not None:
+                    frame_pix = player_widget.grab()
+                    if not frame_pix.isNull() and frame_pix.width() > 4:
+                        break
+
+        if frame_pix is None or frame_pix.isNull():
+            # Fall back to whatever the image view is showing
+            img_view = getattr(self, "_image_view", None)
+            if img_view is not None:
+                pix = getattr(img_view, "_pixmap", None)
+                if pix is not None and not pix.isNull():
+                    frame_pix = pix
+
+        if frame_pix is None or frame_pix.isNull():
+            self._on_log("⚠  Preview: no frame available – play a video first.")
+            return
+
+        # Save to a temporary PNG file (persist across the upscale run)
+        if self._preview_temp_path and os.path.isfile(self._preview_temp_path):
+            try:
+                os.remove(self._preview_temp_path)
+            except OSError:
+                pass
+        tmp = tempfile.NamedTemporaryFile(suffix="_preview.png", delete=False)
+        tmp.close()
+        self._preview_temp_path = tmp.name
+        if not frame_pix.save(self._preview_temp_path, "PNG"):
+            self._on_log(f"⚠  Preview: could not save temp frame to {self._preview_temp_path}")
+            return
+
+        self._on_log(f"ℹ  Preview: using captured frame → {self._preview_temp_path}")
+
+        # Point input to the temp file and set batch size to 1
+        self._settings_win.input_edit.setText(self._preview_temp_path)
+        self.batch_size_spin.setValue(1)
+
+        # Refresh the preview display with the captured frame
+        self._load_preview(self._preview_temp_path)
+
+        # Now launch the normal run
+        self._run()
+
     # ------------------------------------------------------------------
     # Player – mode switching
     # ------------------------------------------------------------------
@@ -1604,6 +1711,12 @@ class MainWindow(QMainWindow):
     def _load_output_video(self, path: str) -> None:
         if self._output_player:
             self._output_player.setSource(QUrl.fromLocalFile(path))
+            # Connect metadata update so we can show "Input … | Output …" once ready
+            try:
+                self._output_player.metaDataChanged.disconnect(self._on_output_meta_changed)
+            except Exception:
+                pass
+            self._output_player.metaDataChanged.connect(self._on_output_meta_changed)
 
     def _browse_output_video(self) -> None:
         start_dir = self._settings_win.output_edit.text().strip() or ""
@@ -1695,13 +1808,13 @@ class MainWindow(QMainWindow):
                 img = QPixmap(str(result))
                 if not img.isNull():
                     self._split_view.set_output_image(img.toImage())
-                    # Update metadata label with output file dimensions
+                    # Update metadata label with combined input | output info
                     reader = QImageReader(str(result))
                     size = reader.size()
                     if size.isValid():
-                        self._meta_label.setText(
-                            f"Output: {size.width()}×{size.height()} px"
-                        )
+                        out_info = f"Output: {size.width()}×{size.height()} px"
+                        combined = f"{self._input_meta_text}  |  {out_info}" if self._input_meta_text else out_info
+                        self._meta_label.setText(combined)
                     self._mode_split_btn.setChecked(True)
                     self._on_mode_button(2, True)
             return
@@ -1844,6 +1957,7 @@ class MainWindow(QMainWindow):
 
     def _set_running(self, running: bool) -> None:
         self.run_btn.setEnabled(not running)
+        self.preview_btn.setEnabled(not running)
         self.abort_btn.setEnabled(running)
 
 
