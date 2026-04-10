@@ -257,6 +257,42 @@ def _make_group(title: str) -> tuple[QGroupBox, QFormLayout]:
 # Zoomable image preview widget (QGraphicsView-based)
 # ---------------------------------------------------------------------------
 
+class _FullscreenWindow(QWidget):
+    """A top-level window that holds a cloned/replicated view for fullscreen comparison."""
+
+    def __init__(self, split_view: "SplitViewWidget", parent=None) -> None:
+        super().__init__(parent, Qt.WindowType.Window)
+        self.setWindowTitle("Split View – Full Screen")
+        self.setStyleSheet("background:#0d0d0d;")
+
+        # Embed the split_view widget (reparent temporarily)
+        self._split_view = split_view
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(split_view)
+
+        close_btn = QPushButton("✕  Exit Full Screen  (ESC)")
+        close_btn.setFixedHeight(32)
+        close_btn.setStyleSheet(
+            "background:#1a1a1a; color:#ccc; border:none; font-size:12px;"
+            "border-top:1px solid #333;"
+        )
+        close_btn.clicked.connect(self.close)
+        layout.addWidget(close_btn)
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if event.key() == Qt.Key.Key_Escape:
+            self.close()
+        else:
+            super().keyPressEvent(event)
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        # Re-parent the split_view back to its original parent
+        if self._split_view:
+            self._split_view.setParent(None)  # type: ignore[call-overload]
+        super().closeEvent(event)
+
+
 class _ZoomableImageView(QGraphicsView):
     """QGraphicsView that shows a static image and supports mouse-wheel zoom."""
 
@@ -548,6 +584,14 @@ class MainWindow(QMainWindow):
         self._open_input_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
         self._open_input_btn.clicked.connect(self._browse_input_for_player)
         mode_bar.addWidget(self._open_input_btn)
+
+        # "⛶ Full Screen" – opens split view fullscreen
+        self._fullscreen_btn = QPushButton("⛶")
+        self._fullscreen_btn.setToolTip("Open Split View in full screen (ESC to exit)")
+        self._fullscreen_btn.setFixedWidth(36)
+        self._fullscreen_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
+        self._fullscreen_btn.clicked.connect(self._open_fullscreen)
+        mode_bar.addWidget(self._fullscreen_btn)
 
         layout.addWidget(mode_bar_w)
 
@@ -1023,6 +1067,8 @@ class MainWindow(QMainWindow):
         suffix = Path(path).suffix.lower()
         if suffix in _IMAGE_SUFFIXES:
             self._current_input_is_image = True
+            # Auto-set batch size to 1 for single image inputs
+            self.batch_size_spin.setValue(1)
             # Dimensions via QImageReader (no full decode needed)
             reader = QImageReader(path)
             size = reader.size()
@@ -1358,11 +1404,24 @@ class MainWindow(QMainWindow):
             return
         self._player_mode = new_mode
         if new_mode == "input":
-            self._input_player.setVideoOutput(self._solo_input_vw)
-            self._viewer_stack.setCurrentIndex(0)
+            if self._current_input_is_image:
+                # Show standalone zoomable image view for image inputs
+                self._viewer_stack.setCurrentIndex(3)
+            else:
+                self._input_player.setVideoOutput(self._solo_input_vw)
+                self._viewer_stack.setCurrentIndex(0)
         elif new_mode == "output":
-            self._output_player.setVideoOutput(self._solo_output_vw)
-            self._viewer_stack.setCurrentIndex(1)
+            if self._current_input_is_image:
+                # Try to show the upscaled output image if it exists
+                self._try_auto_load_output()
+                # If an output image was loaded into split view, show image_view with it
+                out_pix = self._split_view._output_image if self._split_view else None
+                if out_pix and not out_pix.isNull():
+                    self._image_view.set_pixmap(QPixmap.fromImage(out_pix))
+                self._viewer_stack.setCurrentIndex(3)
+            else:
+                self._output_player.setVideoOutput(self._solo_output_vw)
+                self._viewer_stack.setCurrentIndex(1)
         else:  # split
             if self._current_input_is_image:
                 # Image input: feed directly into SplitViewWidget; no video sink needed.
@@ -1376,6 +1435,31 @@ class MainWindow(QMainWindow):
                 self._input_player.setVideoOutput(self._split_view.input_sink)
                 self._output_player.setVideoOutput(self._split_view.output_sink)
             self._viewer_stack.setCurrentIndex(2)
+
+    # ------------------------------------------------------------------
+    # Fullscreen
+    # ------------------------------------------------------------------
+
+    def _open_fullscreen(self) -> None:
+        """Open the Split-View in a dedicated fullscreen window."""
+        if not _MULTIMEDIA_AVAILABLE or self._split_view is None:
+            return
+        # Ensure we're in split mode first
+        if self._player_mode != "split":
+            self._mode_split_btn.setChecked(True)
+            self._on_mode_button(2, True)
+        self._fs_window = _FullscreenWindow(self._split_view)
+        self._fs_window.destroyed.connect(self._on_fullscreen_closed)
+        self._fs_window.showFullScreen()
+
+    def _on_fullscreen_closed(self) -> None:
+        """Re-insert split_view back into the viewer stack after fullscreen exits."""
+        if self._split_view is None:
+            return
+        # The split view was reparented out; re-add it at index 2
+        # (QStackedWidget accepts widgets back via insertWidget)
+        self._viewer_stack.insertWidget(2, self._split_view)
+        self._viewer_stack.setCurrentIndex(2)
 
     # ------------------------------------------------------------------
     # Player – unified controls

@@ -325,8 +325,12 @@ def extract_frames_from_image(image_path: str) -> Tuple[torch.Tensor, float]:
     if frame is None:
         raise ValueError(f"Cannot open image file: {image_path}")
     
+    # Handle grayscale images (2D shape has no channel dimension)
+    if len(frame.shape) == 2:
+        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+        debug.log(f"Detected grayscale image, converted to RGB", category="file")
     # Convert BGR(A) to RGB(A) based on channel count
-    if frame.shape[2] == 4:
+    elif frame.shape[2] == 4:
         frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGBA)
         debug.log(f"Detected RGBA image (alpha channel preserved)", category="file")
     else:

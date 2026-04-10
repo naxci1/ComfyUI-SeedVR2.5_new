@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QPoint, QPointF, Qt
 from PyQt6.QtGui import QBrush, QColor, QFont, QImage, QPainter, QPen
 from PyQt6.QtMultimedia import QVideoFrame, QVideoSink
 from PyQt6.QtWidgets import QWidget
@@ -54,6 +54,13 @@ class SplitViewWidget(QWidget):
         self._input_image: Optional[QImage] = None
         self._output_image: Optional[QImage] = None
 
+        # Zoom / pan state
+        self._zoom: float = 1.0          # 1.0 = fit-to-widget
+        self._pan_offset: QPointF = QPointF(0.0, 0.0)
+        self._panning: bool = False
+        self._pan_start: QPoint = QPoint()
+        self._pan_offset_start: QPointF = QPointF(0.0, 0.0)
+
         self.input_sink = QVideoSink(self)
         self.output_sink = QVideoSink(self)
         self.input_sink.videoFrameChanged.connect(self._on_input_frame)
@@ -84,6 +91,24 @@ class SplitViewWidget(QWidget):
     # Painting
     # ------------------------------------------------------------------
 
+    def _image_rect(self, img: QImage, w: int, h: int):
+        """Return (scaled_img, x_off, y_off) applying zoom & pan."""
+        # Fit to widget at zoom=1.0
+        fit_w = w / img.width()
+        fit_h = h / img.height()
+        base_scale = min(fit_w, fit_h)
+        scale = base_scale * self._zoom
+        sw = int(img.width() * scale)
+        sh = int(img.height() * scale)
+        x_off = int((w - sw) / 2 + self._pan_offset.x())
+        y_off = int((h - sh) / 2 + self._pan_offset.y())
+        scaled = img.scaled(
+            sw, sh,
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        return scaled, x_off, y_off
+
     def paintEvent(self, _event) -> None:  # type: ignore[override]
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
@@ -95,16 +120,14 @@ class SplitViewWidget(QWidget):
         # Background
         painter.fillRect(0, 0, w, h, QColor("#0d0d0d"))
 
-        def _draw(img: QImage) -> None:
-            """Scale *img* to fit the widget while keeping aspect ratio (letterbox)."""
-            scaled = img.scaled(
-                w, h,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            x_off = (w - scaled.width()) // 2
-            y_off = (h - scaled.height()) // 2
+        def _draw(img: QImage, clip_rect=None) -> None:
+            scaled, x_off, y_off = self._image_rect(img, w, h)
+            if clip_rect is not None:
+                painter.save()
+                painter.setClipRect(*clip_rect)
             painter.drawImage(x_off, y_off, scaled)
+            if clip_rect is not None:
+                painter.restore()
 
         # Output – base layer (full frame)
         if self._output_image and not self._output_image.isNull():
@@ -112,10 +135,7 @@ class SplitViewWidget(QWidget):
 
         # Input – top layer, clipped to left of divider
         if self._input_image and not self._input_image.isNull() and split_x > 0:
-            painter.save()
-            painter.setClipRect(0, 0, split_x, h)
-            _draw(self._input_image)
-            painter.restore()
+            _draw(self._input_image, clip_rect=(0, 0, split_x, h))
 
         # Divider line
         painter.setPen(QPen(QColor("#00b4d8"), 2))
@@ -140,30 +160,55 @@ class SplitViewWidget(QWidget):
         painter.end()
 
     # ------------------------------------------------------------------
-    # Mouse interaction (drag the divider)
+    # Mouse interaction (drag the divider OR pan)
     # ------------------------------------------------------------------
 
     def _near_handle(self, x: float) -> bool:
         return abs(x - self.width() * self._split_ratio) < self._HANDLE_HIT_MARGIN
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
-        if self._near_handle(event.position().x()):
-            self._dragging = True
-            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self._near_handle(event.position().x()):
+                self._dragging = True
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+            else:
+                self._panning = True
+                self._pan_start = event.pos()
+                self._pan_offset_start = QPointF(self._pan_offset)
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
         if self._dragging:
             ratio = event.position().x() / max(1, self.width())
             self._split_ratio = max(0.0, min(1.0, ratio))
             self.update()
+        elif self._panning:
+            delta = event.pos() - self._pan_start
+            self._pan_offset = self._pan_offset_start + QPointF(delta)
+            self.update()
         elif self._near_handle(event.position().x()):
             self.setCursor(Qt.CursorShape.SizeHorCursor)
         else:
-            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
         self._dragging = False
+        self._panning = False
         self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def wheelEvent(self, event) -> None:  # type: ignore[override]
+        """Zoom in/out keeping the image centred under the cursor."""
+        factor = 1.15 if event.angleDelta().y() > 0 else 0.85
+        new_zoom = max(0.1, min(20.0, self._zoom * factor))
+        # Adjust pan so the pixel under cursor stays put
+        cx = event.position().x() - self.width() / 2
+        cy = event.position().y() - self.height() / 2
+        self._pan_offset = QPointF(
+            cx + (self._pan_offset.x() - cx) * (new_zoom / self._zoom),
+            cy + (self._pan_offset.y() - cy) * (new_zoom / self._zoom),
+        )
+        self._zoom = new_zoom
+        self.update()
 
     # ------------------------------------------------------------------
     # Static image comparison (used when input is an image, not a video)
