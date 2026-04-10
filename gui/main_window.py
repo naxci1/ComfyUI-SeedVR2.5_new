@@ -213,8 +213,9 @@ def _make_group(title: str) -> tuple[QGroupBox, QFormLayout]:
     """Create a titled QGroupBox with an inner QFormLayout."""
     box = QGroupBox(title)
     layout = QFormLayout()
-    layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+    layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
     layout.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+    layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
     layout.setHorizontalSpacing(12)
     layout.setVerticalSpacing(6)
     layout.setContentsMargins(10, 20, 10, 10)
@@ -466,8 +467,7 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self._build_left_panel())
         splitter.addWidget(self._build_right_panel())
         splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 0)
-        splitter.setSizes([780, 320])
+        splitter.setStretchFactor(1, 1)
 
         # ── 3. Bottom controls bar ─────────────────────────────────────
         root_layout.addWidget(self._build_bottom_bar())
@@ -648,13 +648,13 @@ class MainWindow(QMainWindow):
 
     def _build_right_panel(self) -> QWidget:
         scroll = QScrollArea()
-        scroll.setFixedWidth(320)
+        scroll.setMinimumWidth(250)
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         container = QWidget()
         container_layout = QVBoxLayout(container)
-        container_layout.setContentsMargins(10, 10, 20, 10)
+        container_layout.setContentsMargins(10, 10, 30, 10)
         container_layout.setSpacing(8)
 
         # ── AI Model ───────────────────────────────────────────────────
@@ -897,10 +897,13 @@ class MainWindow(QMainWindow):
 
         container_layout.addStretch(1)
 
-        # Apply max-width to all ComboBox / SpinBox / LineEdit in the right panel
-        # to prevent them stretching beyond 180 px in the constrained sidebar.
+        # Constrain input widgets and set flexible size policy to prevent overflow
+        container.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.MinimumExpanding
+        )
         for _cw in container.findChildren((QComboBox, QSpinBox, QLineEdit)):
-            _cw.setMaximumWidth(180)
+            _cw.setMaximumWidth(150)
+            _cw.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
 
         scroll.setWidget(container)
         return scroll
