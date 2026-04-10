@@ -419,8 +419,8 @@ class MainWindow(QMainWindow):
 
         splitter.addWidget(self._build_left_panel())
         splitter.addWidget(self._build_right_panel())
-        splitter.setStretchFactor(0, 4)
-        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(0, 7)
+        splitter.setStretchFactor(1, 3)
         splitter.setSizes([700, 300])
 
         # ── 3. Bottom controls bar ─────────────────────────────────────
@@ -597,8 +597,7 @@ class MainWindow(QMainWindow):
 
     def _build_right_panel(self) -> QWidget:
         scroll = QScrollArea()
-        scroll.setMinimumWidth(280)
-        scroll.setMaximumWidth(400)
+        scroll.setMinimumWidth(250)
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
