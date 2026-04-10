@@ -110,9 +110,10 @@ class InferenceWorker(QObject):
     started_signal = pyqtSignal()
 
     # Tokens that SeedVR2 prints which carry frame-progress information.
-    # "batch N/M" → batch-level; "frame N/M" / "chunk N/M" → global.
-    _BATCH_TOKENS = ("batch ",)
-    _GLOBAL_TOKENS = ("frame ", "chunk ")
+    # "step N/M" / "steps N/M" → per-step within a batch → batch bar (inner)
+    # "batch N/M" / "frame N/M" / "chunk N/M" → overall batches → total bar (outer)
+    _BATCH_TOKENS = ("step ", "steps: ", "steps ")
+    _GLOBAL_TOKENS = ("batch ", "frame ", "chunk ")
 
     def __init__(
         self,

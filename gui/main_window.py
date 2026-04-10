@@ -66,10 +66,10 @@ except ImportError:
 def _detect_gpus() -> list[str]:
     """Return a list of GPU entries suitable for a QComboBox.
 
-    Format: ``["Auto", "0: NVIDIA GeForce RTX 5070 Ti", "1: …", …]``
-    Falls back to ``["Auto"]`` when torch is unavailable or no CUDA GPUs exist.
+    Format: ``["Auto", "CPU", "0: NVIDIA GeForce RTX 5070 Ti", "1: …", …]``
+    Falls back to ``["Auto", "CPU"]`` when torch is unavailable or no CUDA GPUs exist.
     """
-    entries = ["Auto"]
+    entries = ["Auto", "CPU"]
     try:
         import torch  # noqa: PLC0415
         if torch.cuda.is_available():
@@ -399,7 +399,9 @@ class MainWindow(QMainWindow):
             "seedvr2_ema_7b_sharp_fp8_e4m3fn_mixed_block35_fp16.safetensors",
             "seedvr2_ema_7b_sharp_fp16.safetensors",
         ])
-        self.dit_model_combo.setCurrentIndex(0)
+        self.dit_model_combo.setCurrentIndex(
+            self.dit_model_combo.findText("seedvr2_ema_3b-Q8_0.gguf")
+        )
         f.addRow("DiT Model:", self.dit_model_combo)
         container_layout.addWidget(g)
 
@@ -425,7 +427,7 @@ class MainWindow(QMainWindow):
         g, f = _make_group("Enhancement (Upscaling)")
         self.resolution_spin = QSpinBox()
         self.resolution_spin.setRange(128, 7680)
-        self.resolution_spin.setValue(1080)
+        self.resolution_spin.setValue(720)
         f.addRow("Resolution:", self.resolution_spin)
 
         self.max_resolution_spin = QSpinBox()
@@ -454,7 +456,7 @@ class MainWindow(QMainWindow):
         g, f = _make_group("Processing")
         self.seed_spin = QSpinBox()
         self.seed_spin.setRange(0, 2147483647)
-        self.seed_spin.setValue(42)
+        self.seed_spin.setValue(313)
         f.addRow("Seed:", self.seed_spin)
 
         self.skip_first_frames_spin = QSpinBox()
@@ -483,10 +485,12 @@ class MainWindow(QMainWindow):
 
         self.dit_offload_combo = QComboBox()
         self.dit_offload_combo.addItems(["none", "cpu"])
+        self.dit_offload_combo.setCurrentText("cpu")
         f.addRow("DiT Offload:", self.dit_offload_combo)
 
         self.vae_offload_combo = QComboBox()
         self.vae_offload_combo.addItems(["none", "cpu"])
+        self.vae_offload_combo.setCurrentText("cpu")
         f.addRow("VAE Offload:", self.vae_offload_combo)
 
         self.tensor_offload_combo = QComboBox()
@@ -733,10 +737,9 @@ class MainWindow(QMainWindow):
         # dit model
         args += ["--dit_model", self.dit_model_combo.currentText()]
 
-        # resolution
+        # resolution – always emit so the CLI uses the GUI value regardless of its own default
         res = self.resolution_spin.value()
-        if res != 1080:
-            args += ["--resolution", str(res)]
+        args += ["--resolution", str(res)]
 
         max_res = self.max_resolution_spin.value()
         if max_res != 0:
@@ -749,9 +752,9 @@ class MainWindow(QMainWindow):
         if self.uniform_batch_check.isChecked():
             args.append("--uniform_batch_size")
 
+        # seed – always emit so the CLI uses the GUI value regardless of its own default
         seed = self.seed_spin.value()
-        if seed != 42:
-            args += ["--seed", str(seed)]
+        args += ["--seed", str(seed)]
 
         skip = self.skip_first_frames_spin.value()
         if skip:
@@ -780,7 +783,9 @@ class MainWindow(QMainWindow):
 
         # device
         gpu_sel = self.gpu_device_combo.currentText()
-        if gpu_sel == "Auto":
+        if gpu_sel == "CPU":
+            cuda_dev = "cpu"
+        elif gpu_sel == "Auto":
             cuda_dev = "0"
         else:
             # Format is "0: NVIDIA GeForce RTX 5070 Ti" – extract the index

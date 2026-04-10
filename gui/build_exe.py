@@ -89,6 +89,7 @@ def main() -> None:
         "--name", "SeedVR2_GUI",
         "--onefile",
         "--noconsole",
+        "--noupx",  # disable UPX compression – avoids "This app can't run on your PC"
         # Bundle GUI Python modules (styles, settings window, split view)
         "--add-data", f"{gui_dir / 'styles.py'}{os.pathsep}gui",
         "--add-data", f"{gui_dir / 'settings_window.py'}{os.pathsep}gui",
