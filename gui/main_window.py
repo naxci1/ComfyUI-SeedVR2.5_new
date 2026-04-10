@@ -214,7 +214,7 @@ def _form_row(label_text: str, widget: QWidget) -> QHBoxLayout:
 # ---------------------------------------------------------------------------
 
 class _StyledSplitterHandle(QSplitterHandle):
-    """A 9 px wide splitter handle painted in #11abda with a centred ⇔ icon."""
+    """A 10 px wide splitter handle painted in #11abda with a centred ⇔ icon."""
 
     def paintEvent(self, _event) -> None:  # type: ignore[override]
         painter = QPainter(self)
@@ -491,7 +491,7 @@ class MainWindow(QMainWindow):
 
         # ── 2. Main splitter ───────────────────────────────────────────
         splitter = _StyledSplitter(Qt.Orientation.Horizontal)
-        splitter.setHandleWidth(9)
+        splitter.setHandleWidth(10)
         splitter.setChildrenCollapsible(True)
         root_layout.addWidget(splitter, stretch=1)
 
@@ -1035,7 +1035,12 @@ class MainWindow(QMainWindow):
                 self._image_view.set_pixmap(pix)
                 if _MULTIMEDIA_AVAILABLE and self._split_view is not None:
                     self._split_view.set_input_image(pix.toImage())
-            self._viewer_stack.setCurrentIndex(3)
+            # Stay in split view if the user is already there; otherwise show the
+            # standalone image viewer.
+            if self._player_mode == "split" and self._split_view is not None:
+                self._viewer_stack.setCurrentIndex(2)
+            else:
+                self._viewer_stack.setCurrentIndex(3)
         else:
             self._current_input_is_image = False
             self._meta_label.setText("Loading…")
@@ -1498,41 +1503,51 @@ class MainWindow(QMainWindow):
         _image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
         _video_exts = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 
-        # ── Image input: look for an upscaled image in the output folder ──
+        # ── Image input: construct output path directly (mirrors inference_cli.generate_output_path) ──
         if self._current_input_is_image and self._split_view is not None:
             inp = self._settings_win.input_edit.text().strip()
-            inp_stem = Path(inp).stem if inp else ""
+            if not inp:
+                return
+            inp_path = Path(inp)
+            inp_stem = inp_path.stem
 
-            # Determine search path
-            search_dir: Optional[Path] = None
-            direct_file: Optional[Path] = None
-            if out_path.is_file() and out_path.suffix.lower() in _image_exts:
-                direct_file = out_path
-            elif out_path.is_dir():
-                search_dir = out_path
+            def _find_image_output() -> Optional[Path]:
+                # --- Direct path construction (matches inference_cli.generate_output_path logic) ---
+                # For image input the CLI always writes a .png file.
+                if out_path.is_dir():
+                    # User specified output dir: <output_dir>/<stem>.png (no _upscaled suffix)
+                    candidate = out_path / f"{inp_stem}.png"
+                    if candidate.is_file():
+                        return candidate
+                    # Also try common image extensions in case a format override was applied
+                    for ext in (".jpg", ".jpeg", ".webp", ".tiff", ".tif", ".bmp"):
+                        candidate = out_path / f"{inp_stem}{ext}"
+                        if candidate.is_file():
+                            return candidate
+                elif not out_path.exists():
+                    # No output dir set → same dir as input with _upscaled suffix
+                    for ext in (".png", ".jpg", ".jpeg", ".webp", ".tiff", ".tif", ".bmp"):
+                        candidate = inp_path.parent / f"{inp_stem}_upscaled{ext}"
+                        if candidate.is_file():
+                            return candidate
 
-            def _pick_output_image(folder: Path) -> Optional[Path]:
-                # Prefer files whose stem starts with the input stem (upscaled suffix)
+                # --- Fallback: newest image in folder matching input stem ---
+                search_dir = out_path if out_path.is_dir() else inp_path.parent
                 candidates = sorted(
-                    (f for f in folder.iterdir() if f.suffix.lower() in _image_exts),
+                    (f for f in search_dir.iterdir() if f.suffix.lower() in _image_exts),
                     key=lambda f: f.stat().st_mtime,
                     reverse=True,
                 )
-                if inp_stem:
-                    preferred = [f for f in candidates if f.stem.startswith(inp_stem)]
-                    if preferred:
-                        return preferred[0]
+                preferred = [f for f in candidates if f.stem.startswith(inp_stem)]
+                if preferred:
+                    return preferred[0]
                 return candidates[0] if candidates else None
 
-            result: Optional[Path] = direct_file
-            if result is None and search_dir is not None:
-                result = _pick_output_image(search_dir)
-
+            result = _find_image_output()
             if result is not None:
                 img = QPixmap(str(result))
                 if not img.isNull():
                     self._split_view.set_output_image(img.toImage())
-                    # Switch to split view so the comparison is visible
                     self._mode_split_btn.setChecked(True)
                     self._on_mode_button(2, True)
             return
