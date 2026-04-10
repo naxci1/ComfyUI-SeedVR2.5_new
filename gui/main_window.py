@@ -218,7 +218,7 @@ def _make_group(title: str) -> tuple[QGroupBox, QFormLayout]:
     layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
     layout.setHorizontalSpacing(12)
     layout.setVerticalSpacing(6)
-    layout.setContentsMargins(10, 10, 5, 10)
+    layout.setContentsMargins(10, 10, 10, 10)
     box.setLayout(layout)
     return box, layout
 
@@ -467,7 +467,7 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self._build_left_panel())
         splitter.addWidget(self._build_right_panel())
         splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(1, 0)
 
         # ── 3. Bottom controls bar ─────────────────────────────────────
         root_layout.addWidget(self._build_bottom_bar())
