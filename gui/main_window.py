@@ -218,7 +218,7 @@ def _make_group(title: str) -> tuple[QGroupBox, QFormLayout]:
     layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
     layout.setHorizontalSpacing(12)
     layout.setVerticalSpacing(6)
-    layout.setContentsMargins(10, 20, 10, 10)
+    layout.setContentsMargins(10, 10, 5, 10)
     box.setLayout(layout)
     return box, layout
 
@@ -654,7 +654,7 @@ class MainWindow(QMainWindow):
 
         container = QWidget()
         container_layout = QVBoxLayout(container)
-        container_layout.setContentsMargins(10, 10, 30, 10)
+        container_layout.setContentsMargins(10, 10, 10, 10)
         container_layout.setSpacing(8)
 
         # ── AI Model ───────────────────────────────────────────────────
@@ -901,9 +901,10 @@ class MainWindow(QMainWindow):
         container.setSizePolicy(
             QSizePolicy.Policy.Preferred, QSizePolicy.Policy.MinimumExpanding
         )
+        # Make input widgets fill the available horizontal space
         for _cw in container.findChildren((QComboBox, QSpinBox, QLineEdit)):
-            _cw.setMaximumWidth(150)
-            _cw.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+            _cw.setMaximumWidth(16777215)  # Qt default – no cap
+            _cw.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         scroll.setWidget(container)
         return scroll
