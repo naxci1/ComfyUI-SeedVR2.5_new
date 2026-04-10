@@ -6,6 +6,7 @@ Topaz-style dark-mode wrapper around inference_cli.py.
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -67,15 +68,77 @@ except ImportError:
 _GPU_INIT_MSG: str = ""
 
 
+def _detect_gpus_wmic() -> tuple[list[str], str]:
+    """Windows-native GPU detection via ``wmic path win32_VideoController get name``.
+
+    Returns a ``(gpu_entries, message)`` tuple.  ``gpu_entries`` uses the same
+    ``"GPU N: <name>"`` format as the torch path so ``_build_args()`` parsing is
+    unchanged.  Only NVIDIA adapters are assigned CUDA indices; other adapters are
+    skipped (they are not CUDA-capable).
+    """
+    entries: list[str] = []
+    msg = ""
+    try:
+        # CREATE_NO_WINDOW (0x08000000) prevents a console flash on Windows.
+        flags = 0x08000000 if sys.platform == "win32" else 0
+        result = subprocess.run(
+            ["wmic", "path", "win32_VideoController", "get", "name"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            creationflags=flags,
+        )
+        names = [
+            line.strip()
+            for line in result.stdout.splitlines()
+            if line.strip() and line.strip().lower() != "name"
+        ]
+        if names:
+            cuda_idx = 0
+            for name in names:
+                if "nvidia" in name.lower():
+                    entries.append(f"GPU {cuda_idx}: {name}")
+                    cuda_idx += 1
+                # Non-NVIDIA adapters (Intel, AMD, etc.) are skipped – they have
+                # no CUDA index and the backend would reject them.
+            if entries:
+                msg = (
+                    f"✅  Detected {len(entries)} CUDA-capable GPU(s) via wmic "
+                    f"(all adapters: {', '.join(names)})."
+                )
+            else:
+                msg = (
+                    f"⚠  wmic found adapter(s) ({', '.join(names)}) "
+                    "but none are NVIDIA/CUDA-capable."
+                )
+        else:
+            msg = "⚠  wmic returned no video controller names."
+    except FileNotFoundError:
+        msg = "ℹ  wmic not available (non-Windows system or PATH issue)."
+    except Exception as exc:  # noqa: BLE001
+        msg = f"⚠  wmic GPU scan error: {exc}"
+        print(f"[SeedVR2 GPU] {msg}", flush=True)
+    return entries, msg
+
+
 def _detect_gpus() -> list[str]:
     """Return a list of GPU entries suitable for a QComboBox.
 
     Format: ``["Auto", "CPU", "GPU 0: NVIDIA GeForce RTX 5070 Ti", "GPU 1: …", …]``
-    Falls back to ``["Auto", "CPU"]`` when torch is unavailable or no CUDA GPUs exist.
+
+    Strategy:
+    1. Try ``torch.cuda`` first (most accurate, uses the inference runtime).
+    2. If torch is unavailable or reports no GPUs, fall back to the Windows-native
+       ``wmic path win32_VideoController get name`` command so the combo is
+       populated even when the GUI Python has no torch installed.
+
     Side-effect: sets the module-level ``_GPU_INIT_MSG`` for console display.
     """
     global _GPU_INIT_MSG  # noqa: PLW0603
     entries = ["Auto", "CPU"]
+    gpu_entries: list[str] = []
+
+    # ── Primary: torch.cuda ────────────────────────────────────────────────
     try:
         import torch  # noqa: PLC0415
         # Explicitly initialise CUDA so device names are always resolvable.
@@ -92,8 +155,8 @@ def _detect_gpus() -> list[str]:
                 )
             else:
                 for i in range(count):
-                    entries.append(f"GPU {i}: {torch.cuda.get_device_name(i)}")
-                _GPU_INIT_MSG = f"✅  Detected {count} CUDA device(s)."
+                    gpu_entries.append(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+                _GPU_INIT_MSG = f"✅  Detected {count} CUDA device(s) via torch."
         else:
             _GPU_INIT_MSG = (
                 "⚠  torch.cuda.is_available() returned False – "
@@ -103,10 +166,23 @@ def _detect_gpus() -> list[str]:
     except ImportError:
         _GPU_INIT_MSG = (
             "ℹ  torch is not installed in the GUI Python environment – "
-            "GPU list limited to Auto / CPU."
+            "trying wmic fallback."
         )
     except Exception as exc:
         _GPU_INIT_MSG = f"⚠  GPU scan error: {exc}"
+        print(f"[SeedVR2 GPU] {_GPU_INIT_MSG}", flush=True)
+
+    # ── Fallback: wmic (Windows-native, no torch required) ─────────────────
+    if not gpu_entries:
+        wmic_entries, wmic_msg = _detect_gpus_wmic()
+        if wmic_entries:
+            gpu_entries = wmic_entries
+            _GPU_INIT_MSG = wmic_msg
+        else:
+            # Append the wmic diagnostic to the existing torch message.
+            _GPU_INIT_MSG = f"{_GPU_INIT_MSG}  {wmic_msg}".strip()
+
+    entries.extend(gpu_entries)
     return entries
 
 try:
@@ -171,7 +247,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("SeedVR2.5 Upscaler by HB2k v.1.3 beta")
-        self.resize(1400, 960)
+        self.resize(1100, 900)
 
         # Create settings window first – it loads saved paths in its __init__
         self._settings_win = SettingsWindow(self)
