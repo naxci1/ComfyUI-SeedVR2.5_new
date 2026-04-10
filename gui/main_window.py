@@ -1366,9 +1366,10 @@ class MainWindow(QMainWindow):
                     pix = QPixmap(inp_path)
                     if not pix.isNull():
                         self._split_view.set_input_image(pix.toImage())
+                # Do NOT connect either player to the split view sinks – images only.
             else:
                 self._input_player.setVideoOutput(self._split_view.input_sink)
-            self._output_player.setVideoOutput(self._split_view.output_sink)
+                self._output_player.setVideoOutput(self._split_view.output_sink)
             self._viewer_stack.setCurrentIndex(2)
 
     # ------------------------------------------------------------------
@@ -1489,19 +1490,62 @@ class MainWindow(QMainWindow):
             self._mode_input_btn.setChecked(True)
 
     def _try_auto_load_output(self) -> None:
-        if not _MULTIMEDIA_AVAILABLE:
-            return
         out = self._settings_win.output_edit.text().strip()
         if not out:
             return
         out_path = Path(out)
-        if out_path.is_file():
+
+        _image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
+        _video_exts = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+
+        # ── Image input: look for an upscaled image in the output folder ──
+        if self._current_input_is_image and self._split_view is not None:
+            inp = self._settings_win.input_edit.text().strip()
+            inp_stem = Path(inp).stem if inp else ""
+
+            # Determine search path
+            search_dir: Optional[Path] = None
+            direct_file: Optional[Path] = None
+            if out_path.is_file() and out_path.suffix.lower() in _image_exts:
+                direct_file = out_path
+            elif out_path.is_dir():
+                search_dir = out_path
+
+            def _pick_output_image(folder: Path) -> Optional[Path]:
+                # Prefer files whose stem starts with the input stem (upscaled suffix)
+                candidates = sorted(
+                    (f for f in folder.iterdir() if f.suffix.lower() in _image_exts),
+                    key=lambda f: f.stat().st_mtime,
+                    reverse=True,
+                )
+                if inp_stem:
+                    preferred = [f for f in candidates if f.stem.startswith(inp_stem)]
+                    if preferred:
+                        return preferred[0]
+                return candidates[0] if candidates else None
+
+            result: Optional[Path] = direct_file
+            if result is None and search_dir is not None:
+                result = _pick_output_image(search_dir)
+
+            if result is not None:
+                img = QPixmap(str(result))
+                if not img.isNull():
+                    self._split_view.set_output_image(img.toImage())
+                    # Switch to split view so the comparison is visible
+                    self._mode_split_btn.setChecked(True)
+                    self._on_mode_button(2, True)
+            return
+
+        # ── Video input: load into output player as before ──
+        if not _MULTIMEDIA_AVAILABLE:
+            return
+        if out_path.is_file() and out_path.suffix.lower() in _video_exts:
             self._load_output_video(str(out_path))
             self._mode_output_btn.setChecked(True)
         elif out_path.is_dir():
-            video_exts = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
             candidates = sorted(
-                (f for f in out_path.iterdir() if f.suffix.lower() in video_exts),
+                (f for f in out_path.iterdir() if f.suffix.lower() in _video_exts),
                 key=lambda f: f.stat().st_mtime,
                 reverse=True,
             )
