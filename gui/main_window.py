@@ -213,7 +213,7 @@ def _make_group(title: str) -> tuple[QGroupBox, QFormLayout]:
     layout.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
     layout.setHorizontalSpacing(12)
     layout.setVerticalSpacing(6)
-    layout.setContentsMargins(10, 6, 10, 10)
+    layout.setContentsMargins(10, 15, 10, 10)
     box.setLayout(layout)
     return box, layout
 
@@ -289,7 +289,7 @@ class CheckableComboBox(QComboBox):
             it = self._item(i)
             if it.text() == text:
                 it.setCheckState(Qt.CheckState.Checked)
-                self._enforce_exclusion(it)
+                self._enforce_exclusion(i)
             else:
                 it.setCheckState(Qt.CheckState.Unchecked)
         self._refresh_label()
@@ -311,29 +311,25 @@ class CheckableComboBox(QComboBox):
         )
         item.setCheckState(new_state)
         if new_state == Qt.CheckState.Checked:
-            self._enforce_exclusion(item)
+            self._enforce_exclusion(index.row())  # type: ignore[union-attr]
         self._refresh_label()
 
-    def _enforce_exclusion(self, changed: QStandardItem) -> None:
-        """Apply mutual-exclusion rules when *changed* has just been checked.
+    def _enforce_exclusion(self, row: int) -> None:
+        """Apply mutual-exclusion rules when the item at *row* has just been checked.
 
-        Rule A: "Auto" checked  → uncheck EVERYTHING else.
-        Rule B: "CPU" checked   → uncheck EVERYTHING else.
-        Rule C: "GPU X" checked → uncheck "Auto" and "CPU" only.
-        Rule D: Multiple "GPU X" items may be checked simultaneously.
+        Auto / CPU selected → uncheck everything else.
+        GPU X selected      → uncheck Auto and CPU only; other GPUs may co-exist.
         """
-        text = changed.text()
-        for i in range(self._model.rowCount()):
-            it = self._item(i)
-            if it is changed:
-                continue
-            if text in ("Auto", "CPU"):
-                # Rules A & B: exclusive items clear everything else
-                it.setCheckState(Qt.CheckState.Unchecked)
-            else:
-                # Rule C: any GPU clears Auto and CPU, leaves other GPUs alone
-                if it.text() in ("Auto", "CPU"):
-                    it.setCheckState(Qt.CheckState.Unchecked)
+        model = self._model
+        clicked_text = model.item(row).text()
+        if clicked_text in ("Auto", "CPU"):
+            for i in range(model.rowCount()):
+                if i != row:
+                    model.item(i).setCheckState(Qt.CheckState.Unchecked)
+        else:
+            for i in range(model.rowCount()):
+                if model.item(i).text() in ("Auto", "CPU"):
+                    model.item(i).setCheckState(Qt.CheckState.Unchecked)
 
     def _refresh_label(self) -> None:
         sel = self.checkedTexts()
@@ -609,7 +605,7 @@ class MainWindow(QMainWindow):
 
         container = QWidget()
         container_layout = QVBoxLayout(container)
-        container_layout.setContentsMargins(10, 10, 25, 10)
+        container_layout.setContentsMargins(10, 10, 30, 10)
         container_layout.setSpacing(8)
 
         # ── AI Model ───────────────────────────────────────────────────
