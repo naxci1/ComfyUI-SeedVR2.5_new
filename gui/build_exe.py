@@ -127,6 +127,10 @@ def main() -> None:
     if assets_dir.is_dir():
         cmd += ["--add-data", f"{assets_dir}{os.pathsep}assets"]
 
+    # Bundle icon.ico at the bundle root so _resource_path("icon.ico") resolves
+    if icon_path.exists():
+        cmd += ["--add-data", f"{icon_path}{os.pathsep}."]
+
     # ── Portable mode: bundle Python + SeedVR2 source ───────────────────
     if args.python_embeded_dir:
         py_dir = args.python_embeded_dir.resolve()

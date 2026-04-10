@@ -140,7 +140,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("SeedVR2.5 Upscaler by HB2k v.1b")
+        self.setWindowTitle("SeedVR2.5 Upscaler by HB2k")
         self.resize(1400, 960)
 
         # Create settings window first – it loads saved paths in its __init__
@@ -182,7 +182,7 @@ class MainWindow(QMainWindow):
         title_vlayout = QVBoxLayout(title_col)
         title_vlayout.setContentsMargins(0, 0, 0, 0)
         title_vlayout.setSpacing(2)
-        title_lbl = QLabel("SeedVR2.5 Upscaler by HB2k v.1b")
+        title_lbl = QLabel("SeedVR2.5 Upscaler by HB2k")
         title_lbl.setObjectName("header_label")
         sub_lbl = QLabel("Powered by SeedVR2 Diffusion Models")
         sub_lbl.setObjectName("subheader_label")
@@ -251,14 +251,6 @@ class MainWindow(QMainWindow):
         mode_bar.addWidget(self._mode_split_btn)
         mode_bar.addStretch(1)
         layout.addWidget(mode_bar_w)
-
-        # ── Quick input file access ────────────────────────────────────
-        open_input_btn = QPushButton("📂  Open Input File…")
-        open_input_btn.setToolTip(
-            "Browse for a video file, load it in the preview, and set it as the input path"
-        )
-        open_input_btn.clicked.connect(self._browse_input_file)
-        layout.addWidget(open_input_btn)
 
         # ── Viewer stack ───────────────────────────────────────────────
         self._viewer_stack = QStackedWidget()
@@ -1091,18 +1083,6 @@ class MainWindow(QMainWindow):
     def _load_output_video(self, path: str) -> None:
         if self._output_player:
             self._output_player.setSource(QUrl.fromLocalFile(path))
-
-    def _browse_input_file(self) -> None:
-        """Open a file dialog, load the selected video into the preview, and set the input path."""
-        start_dir = self._settings_win.input_edit.text().strip() or ""
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Open Input File", start_dir,
-            "Videos (*.mp4 *.avi *.mov *.mkv *.webm *.gif);;All Files (*)",
-        )
-        if path:
-            self._settings_win.input_edit.setText(path)
-            self._load_input_video(path)
-            self._mode_input_btn.setChecked(True)
 
     def _browse_output_video(self) -> None:
         start_dir = self._settings_win.output_edit.text().strip() or ""

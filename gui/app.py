@@ -39,7 +39,7 @@ def main() -> int:
     )
 
     app = QApplication(sys.argv)
-    app.setApplicationName("SeedVR2.5 Upscaler by HB2k v.1b")
+    app.setApplicationName("SeedVR2.5 Upscaler by HB2k")
     app.setOrganizationName("SeedVR2")
     app.setStyleSheet(DARK_STYLESHEET)
 
