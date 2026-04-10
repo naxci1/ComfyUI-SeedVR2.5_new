@@ -321,7 +321,10 @@ class CheckableComboBox(QComboBox):
         GPU X selected      → uncheck Auto and CPU only; other GPUs may co-exist.
         """
         model = self._model
-        clicked_text = model.item(row).text()
+        item = model.item(row)
+        if not item:
+            return
+        clicked_text = item.text()
         if clicked_text in ("Auto", "CPU"):
             for i in range(model.rowCount()):
                 if i != row:
@@ -605,7 +608,7 @@ class MainWindow(QMainWindow):
 
         container = QWidget()
         container_layout = QVBoxLayout(container)
-        container_layout.setContentsMargins(10, 10, 30, 10)
+        container_layout.setContentsMargins(10, 10, 40, 10)
         container_layout.setSpacing(8)
 
         # ── AI Model ───────────────────────────────────────────────────
