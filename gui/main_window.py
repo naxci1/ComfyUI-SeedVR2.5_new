@@ -1189,15 +1189,17 @@ class MainWindow(QMainWindow):
         _btn_font.setBold(True)
         _btn_font.setPointSize(12)
 
-        minus_btn = QPushButton("-")
-        minus_btn.setFixedWidth(34)
-        minus_btn.setFont(_btn_font)
-        minus_btn.setToolTip("Decrease batch size by 4")
-        minus_btn.setStyleSheet(
+        _stepper_ss = (
             "QPushButton { background-color: #222222; border: 1px solid #444; border-radius: 4px; }"
             "QPushButton:hover { background-color: #2e2e2e; }"
             "QPushButton:pressed { background-color: #1a1a1a; }"
         )
+
+        minus_btn = QPushButton("-")
+        minus_btn.setFixedWidth(34)
+        minus_btn.setFont(_btn_font)
+        minus_btn.setToolTip("Decrease batch size by 4")
+        minus_btn.setStyleSheet(_stepper_ss)
 
         self.batch_size_spin = QSpinBox()
         self.batch_size_spin.setRange(1, 10001)
@@ -1215,11 +1217,7 @@ class MainWindow(QMainWindow):
         plus_btn.setFixedWidth(34)
         plus_btn.setFont(_btn_font)
         plus_btn.setToolTip("Increase batch size by 4")
-        plus_btn.setStyleSheet(
-            "QPushButton { background-color: #222222; border: 1px solid #444; border-radius: 4px; }"
-            "QPushButton:hover { background-color: #2e2e2e; }"
-            "QPushButton:pressed { background-color: #1a1a1a; }"
-        )
+        plus_btn.setStyleSheet(_stepper_ss)
 
         # ±4 step – result is always 4k+1 if starting from a valid value
         minus_btn.clicked.connect(
