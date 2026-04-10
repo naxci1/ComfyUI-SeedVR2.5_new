@@ -12,8 +12,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QSettings, QUrl
-from PyQt6.QtGui import QFont, QIcon
+from PyQt6.QtCore import Qt, QSettings, QUrl, QEvent
+from PyQt6.QtGui import QFont, QIcon, QStandardItem, QStandardItemModel
 from PyQt6.QtWidgets import (
     QApplication,
     QAbstractSpinBox,
@@ -68,119 +68,99 @@ except ImportError:
 _GPU_INIT_MSG: str = ""
 
 
-def _detect_gpus_wmic() -> tuple[list[str], str]:
-    """Windows-native GPU detection via ``wmic path win32_VideoController get name``.
-
-    Returns a ``(gpu_entries, message)`` tuple.  ``gpu_entries`` uses the same
-    ``"GPU N: <name>"`` format as the torch path so ``_build_args()`` parsing is
-    unchanged.  Only NVIDIA adapters are assigned CUDA indices; other adapters are
-    skipped (they are not CUDA-capable).
-    """
-    entries: list[str] = []
-    msg = ""
-    try:
-        # CREATE_NO_WINDOW (0x08000000) prevents a console flash on Windows.
-        flags = 0x08000000 if sys.platform == "win32" else 0
-        result = subprocess.run(
-            ["wmic", "path", "win32_VideoController", "get", "name"],
-            capture_output=True,
-            text=True,
-            timeout=8,
-            creationflags=flags,
-        )
-        names = [
-            line.strip()
-            for line in result.stdout.splitlines()
-            if line.strip() and line.strip().lower() != "name"
-        ]
-        if names:
-            cuda_idx = 0
-            for name in names:
-                if "nvidia" in name.lower():
-                    entries.append(f"GPU {cuda_idx}: {name}")
-                    cuda_idx += 1
-                # Non-NVIDIA adapters (Intel, AMD, etc.) are skipped – they have
-                # no CUDA index and the backend would reject them.
-            if entries:
-                msg = (
-                    f"✅  Detected {len(entries)} CUDA-capable GPU(s) via wmic "
-                    f"(all adapters: {', '.join(names)})."
-                )
-            else:
-                msg = (
-                    f"⚠  wmic found adapter(s) ({', '.join(names)}) "
-                    "but none are NVIDIA/CUDA-capable."
-                )
-        else:
-            msg = "⚠  wmic returned no video controller names."
-    except FileNotFoundError:
-        msg = "ℹ  wmic not available (non-Windows system or PATH issue)."
-    except Exception as exc:  # noqa: BLE001
-        msg = f"⚠  wmic GPU scan error: {exc}"
-        print(f"[SeedVR2 GPU] {msg}", flush=True)
-    return entries, msg
-
-
 def _detect_gpus() -> list[str]:
-    """Return a list of GPU entries suitable for a QComboBox.
+    """Return GPU entries for the checkable GPU ComboBox.
 
-    Format: ``["Auto", "CPU", "GPU 0: NVIDIA GeForce RTX 5070 Ti", "GPU 1: …", …]``
+    Format: ``["Auto", "CPU", "GPU 0: NVIDIA GeForce RTX 5070 Ti", …]``
 
-    Strategy:
-    1. Try ``torch.cuda`` first (most accurate, uses the inference runtime).
-    2. If torch is unavailable or reports no GPUs, fall back to the Windows-native
-       ``wmic path win32_VideoController get name`` command so the combo is
-       populated even when the GUI Python has no torch installed.
+    Strategy
+    --------
+    1. **Primary – Windows wmic**: run
+       ``wmic path win32_VideoController get name`` via ``subprocess.check_output``
+       with ``shell=True``.  This is hardware-level and works regardless of whether
+       torch or CUDA is installed in the GUI Python.
+    2. **Enhancement – torch.cuda**: if torch is importable and reports GPUs, its
+       device names overwrite the wmic names (they are more precise and correctly
+       ordered by CUDA index).
+    3. **Fallback**: if neither source yields GPU entries, return ``["Auto", "CPU"]``
+       and emit a warning.
 
-    Side-effect: sets the module-level ``_GPU_INIT_MSG`` for console display.
+    Side-effect: sets module-level ``_GPU_INIT_MSG`` for startup console display.
     """
     global _GPU_INIT_MSG  # noqa: PLW0603
     entries = ["Auto", "CPU"]
     gpu_entries: list[str] = []
+    wmic_names: list[str] = []
 
-    # ── Primary: torch.cuda ────────────────────────────────────────────────
+    # ── Primary: wmic (Windows-native) ─────────────────────────────────────
+    try:
+        flags = 0x08000000 if sys.platform == "win32" else 0  # CREATE_NO_WINDOW
+        raw = subprocess.check_output(
+            "wmic path win32_VideoController get name",
+            shell=True,
+            stderr=subprocess.DEVNULL,
+            timeout=8,
+            creationflags=flags,
+        )
+        for line in raw.decode(errors="replace").splitlines():
+            name = line.strip()
+            if name and name.lower() != "name":
+                wmic_names.append(name)
+
+        cuda_idx = 0
+        for name in wmic_names:
+            if "nvidia" in name.lower():
+                gpu_entries.append(f"GPU {cuda_idx}: {name}")
+                cuda_idx += 1
+
+        if gpu_entries:
+            _GPU_INIT_MSG = (
+                f"✅  Detected {len(gpu_entries)} CUDA GPU(s) via wmic "
+                f"(all adapters: {', '.join(wmic_names)})."
+            )
+        elif wmic_names:
+            _GPU_INIT_MSG = (
+                f"⚠  wmic found adapter(s) ({', '.join(wmic_names)}) "
+                "but none are NVIDIA/CUDA-capable."
+            )
+        else:
+            _GPU_INIT_MSG = "⚠  wmic returned no video controller names."
+
+    except FileNotFoundError:
+        _GPU_INIT_MSG = "ℹ  wmic not available (non-Windows system or PATH issue)."
+    except subprocess.TimeoutExpired:
+        _GPU_INIT_MSG = "⚠  wmic timed out during GPU scan."
+    except Exception as exc:  # noqa: BLE001
+        _GPU_INIT_MSG = f"⚠  wmic GPU scan error: {exc}"
+        print(f"[SeedVR2 GPU] {_GPU_INIT_MSG}", flush=True)
+
+    # ── Enhancement: torch.cuda (overwrites wmic names with CUDA-runtime names) ─
     try:
         import torch  # noqa: PLC0415
-        # Explicitly initialise CUDA so device names are always resolvable.
         try:
             torch.cuda.init()
         except Exception:
             pass
         if torch.cuda.is_available():
             count = torch.cuda.device_count()
-            if count == 0:
+            if count > 0:
+                gpu_entries = [
+                    f"GPU {i}: {torch.cuda.get_device_name(i)}"
+                    for i in range(count)
+                ]
                 _GPU_INIT_MSG = (
-                    "⚠  torch.cuda.is_available() returned True but "
-                    "device_count() is 0 – no CUDA GPUs detected."
+                    f"✅  Detected {count} CUDA device(s) via torch "
+                    f"(wmic adapters: {', '.join(wmic_names) if wmic_names else 'none'})."
                 )
-            else:
-                for i in range(count):
-                    gpu_entries.append(f"GPU {i}: {torch.cuda.get_device_name(i)}")
-                _GPU_INIT_MSG = f"✅  Detected {count} CUDA device(s) via torch."
-        else:
-            _GPU_INIT_MSG = (
-                "⚠  torch.cuda.is_available() returned False – "
-                "CUDA is not accessible from this Python environment.  "
-                "GPU inference requires the SeedVR2 Python (python_embeded)."
-            )
     except ImportError:
-        _GPU_INIT_MSG = (
-            "ℹ  torch is not installed in the GUI Python environment – "
-            "trying wmic fallback."
-        )
-    except Exception as exc:
-        _GPU_INIT_MSG = f"⚠  GPU scan error: {exc}"
-        print(f"[SeedVR2 GPU] {_GPU_INIT_MSG}", flush=True)
+        pass  # torch not in GUI env – wmic result stands
+    except Exception:
+        pass  # best-effort; keep wmic result
 
-    # ── Fallback: wmic (Windows-native, no torch required) ─────────────────
     if not gpu_entries:
-        wmic_entries, wmic_msg = _detect_gpus_wmic()
-        if wmic_entries:
-            gpu_entries = wmic_entries
-            _GPU_INIT_MSG = wmic_msg
-        else:
-            # Append the wmic diagnostic to the existing torch message.
-            _GPU_INIT_MSG = f"{_GPU_INIT_MSG}  {wmic_msg}".strip()
+        _GPU_INIT_MSG = (
+            "⚠  No CUDA-capable GPUs found – defaulting to Auto.  " + _GPU_INIT_MSG
+        ).strip()
 
     entries.extend(gpu_entries)
     return entries
@@ -232,6 +212,126 @@ def _make_group(title: str) -> tuple[QGroupBox, QFormLayout]:
     layout.setContentsMargins(10, 6, 10, 10)
     box.setLayout(layout)
     return box, layout
+
+
+# ---------------------------------------------------------------------------
+# CheckableComboBox – multi-select GPU picker
+# ---------------------------------------------------------------------------
+
+class CheckableComboBox(QComboBox):
+    """A QComboBox where every item carries a checkbox for multi-selection.
+
+    Mutual-exclusion rules
+    ----------------------
+    * Checking **"Auto"** unchecks all other items.
+    * Checking **"CPU"** unchecks all other items.
+    * Checking any **GPU N** item unchecks "Auto" and "CPU".
+
+    The closed-combo display shows a comma-separated summary of checked items.
+    Call :meth:`checkedTexts` to retrieve the current selection as a list.
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._model = QStandardItemModel(self)
+        self.setModel(self._model)
+        # Make the combo editable so we can write a summary into the line-edit.
+        self.setEditable(True)
+        self.lineEdit().setReadOnly(True)
+        # Clicking the (read-only) line-edit should open the popup.
+        self.lineEdit().installEventFilter(self)
+        self.view().pressed.connect(self._on_item_pressed)
+
+    # ------------------------------------------------------------------
+    # Event filter – open popup when the read-only line-edit is clicked
+
+    def eventFilter(self, obj: object, event: QEvent) -> bool:
+        if obj is self.lineEdit() and event.type() == QEvent.Type.MouseButtonRelease:
+            self.showPopup()
+            return True
+        return super().eventFilter(obj, event)  # type: ignore[arg-type]
+
+    # ------------------------------------------------------------------
+    # Item helpers
+
+    def _item(self, row: int) -> QStandardItem:
+        return self._model.item(row)
+
+    # ------------------------------------------------------------------
+    # Public API – mirroring QComboBox where needed
+
+    def addItem(self, text: str, userData: object = None) -> None:  # type: ignore[override]
+        item = QStandardItem(text)
+        item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(Qt.CheckState.Unchecked)
+        self._model.appendRow(item)
+        self._refresh_label()
+
+    def addItems(self, texts: list[str]) -> None:  # type: ignore[override]
+        for t in texts:
+            self.addItem(t)
+
+    def checkedTexts(self) -> list[str]:
+        """Return all currently checked item texts in row order."""
+        return [
+            self._item(i).text()
+            for i in range(self._model.rowCount())
+            if self._item(i).checkState() == Qt.CheckState.Checked
+        ]
+
+    def setCurrentText(self, text: str) -> None:  # type: ignore[override]
+        """Check the single item matching *text*, uncheck everything else."""
+        for i in range(self._model.rowCount()):
+            it = self._item(i)
+            if it.text() == text:
+                it.setCheckState(Qt.CheckState.Checked)
+                self._enforce_exclusion(it)
+            else:
+                it.setCheckState(Qt.CheckState.Unchecked)
+        self._refresh_label()
+
+    def currentText(self) -> str:  # type: ignore[override]
+        """Return the first checked item text (for single-select compatibility)."""
+        texts = self.checkedTexts()
+        return texts[0] if texts else ""
+
+    # ------------------------------------------------------------------
+    # Internal logic
+
+    def _on_item_pressed(self, index: object) -> None:
+        item = self._model.itemFromIndex(index)  # type: ignore[arg-type]
+        new_state = (
+            Qt.CheckState.Unchecked
+            if item.checkState() == Qt.CheckState.Checked
+            else Qt.CheckState.Checked
+        )
+        item.setCheckState(new_state)
+        if new_state == Qt.CheckState.Checked:
+            self._enforce_exclusion(item)
+        self._refresh_label()
+
+    def _enforce_exclusion(self, changed: QStandardItem) -> None:
+        """Apply mutual-exclusion rules when *changed* has just been checked."""
+        text = changed.text()
+        is_exclusive = text in ("Auto", "CPU")
+        for i in range(self._model.rowCount()):
+            it = self._item(i)
+            if it is changed:
+                continue
+            if is_exclusive:
+                # Auto / CPU: uncheck everything else
+                it.setCheckState(Qt.CheckState.Unchecked)
+            elif it.text() in ("Auto", "CPU"):
+                # Any GPU checked: uncheck Auto and CPU
+                it.setCheckState(Qt.CheckState.Unchecked)
+
+    def _refresh_label(self) -> None:
+        sel = self.checkedTexts()
+        self.lineEdit().setText(", ".join(sel) if sel else "— none —")
+
+    def hidePopup(self) -> None:
+        self._refresh_label()
+        super().hidePopup()
 
 
 # ---------------------------------------------------------------------------
@@ -612,8 +712,14 @@ class MainWindow(QMainWindow):
 
         # ── Device Management ──────────────────────────────────────────
         g, f = _make_group("Device Management")
-        self.gpu_device_combo = QComboBox()
+        self.gpu_device_combo = CheckableComboBox()
         self.gpu_device_combo.addItems(_detect_gpus())
+        self.gpu_device_combo.setCurrentText("Auto")  # default: Auto checked
+        self.gpu_device_combo.setToolTip(
+            "Select one or more GPUs.\n"
+            "Auto/CPU are exclusive; multiple GPU N items may be checked together\n"
+            "for multi-GPU inference (--cuda_device 0,1,…)."
+        )
         f.addRow("GPU Device:", self.gpu_device_combo)
 
         self.dit_offload_combo = QComboBox()
@@ -930,16 +1036,24 @@ class MainWindow(QMainWindow):
         if cc != "lab":
             args += ["--color_correction", cc]
 
-        # device
-        gpu_sel = self.gpu_device_combo.currentText()
-        if gpu_sel == "CPU":
-            cuda_dev = "cpu"
-        elif gpu_sel == "Auto":
+        # device – read all checked items from the CheckableComboBox
+        checked_gpus = self.gpu_device_combo.checkedTexts()
+        if not checked_gpus or "Auto" in checked_gpus:
+            # Auto or nothing: let the backend choose device 0
             cuda_dev = "0"
+        elif "CPU" in checked_gpus:
+            cuda_dev = "cpu"
         else:
-            # Format is "GPU 0: NVIDIA GeForce RTX 5070 Ti" – extract the numeric index
-            # "GPU 0" is before the colon; split on space to get "0"
-            cuda_dev = gpu_sel.split(":")[0].split()[-1].strip()
+            # One or more "GPU N: Name" entries – extract the numeric CUDA indices
+            # and join with commas for multi-GPU support.
+            indices: list[str] = []
+            for sel in checked_gpus:
+                try:
+                    # "GPU 0: NVIDIA GeForce …" → split on ":" → "GPU 0" → last token
+                    indices.append(sel.split(":")[0].split()[-1].strip())
+                except (IndexError, ValueError):
+                    pass
+            cuda_dev = ",".join(indices) if indices else "0"
         args += ["--cuda_device", cuda_dev]
 
         dit_offload = self.dit_offload_combo.currentText()
