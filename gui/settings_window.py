@@ -138,6 +138,7 @@ class SettingsWindow(QDialog):
         browse_input_btn = QPushButton("📂")
         browse_input_btn.setFixedWidth(32)
         browse_input_btn.setToolTip("Browse for input file or folder")
+        browse_input_btn.setAccessibleName("Browse input")
         browse_input_btn.clicked.connect(self._browse_input)
         input_row = QHBoxLayout()
         input_row.addWidget(self.input_mode_combo)

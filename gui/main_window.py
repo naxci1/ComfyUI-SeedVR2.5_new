@@ -751,6 +751,8 @@ class MainWindow(QMainWindow):
         fmt_val, fmt_10bit = _FMT_MAP.get(self.output_format_combo.currentText(), ("", False))
         if fmt_val:
             args += ["--output_format", fmt_val]
+        # H.265 forces 10-bit encoding; only append here if the checkbox hasn't
+        # already done so (avoids duplicate --10bit flags).
         if fmt_10bit and not self.use_10bit_check.isChecked():
             args.append("--10bit")
 
