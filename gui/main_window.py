@@ -502,14 +502,13 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         # Windows: set AppUserModelID so taskbar icon matches the window icon
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                "naxci1.seedvr.upscaler.1.4"
-            )
+            myappid = "naxci1.seedvr.upscaler.2.5"
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
         except Exception:
             pass
 
         super().__init__()
-        self.setWindowTitle("SeedVR2 v.1.4 beta")
+        self.setWindowTitle("SeedVR2.5 GUI by HB2k v.1.4 beta")
         self.resize(1100, 900)
 
         # Create settings window first – it loads saved paths in its __init__
@@ -524,8 +523,9 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
 
-        # Load window icon from gui/favicon.ico
-        self.setWindowIcon(QIcon(os.path.join("gui", "favicon.ico")))
+        # Load window icon from gui/icon.ico
+        _icon_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "gui", "icon.ico")
+        self.setWindowIcon(QIcon(_icon_path))
 
         self._set_running(False)
 
@@ -554,7 +554,7 @@ class MainWindow(QMainWindow):
         title_vlayout = QVBoxLayout(title_col)
         title_vlayout.setContentsMargins(0, 0, 0, 0)
         title_vlayout.setSpacing(2)
-        title_lbl = QLabel("SeedVR2 v.1.4 beta")
+        title_lbl = QLabel("SeedVR2.5 GUI by HB2k v.1.4 beta")
         title_lbl.setObjectName("header_label")
         sub_lbl = QLabel("Powered by SeedVR2 Diffusion Models")
         sub_lbl.setObjectName("subheader_label")
