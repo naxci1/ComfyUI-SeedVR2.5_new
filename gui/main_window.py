@@ -399,9 +399,9 @@ class MainWindow(QMainWindow):
             "seedvr2_ema_7b_sharp_fp8_e4m3fn_mixed_block35_fp16.safetensors",
             "seedvr2_ema_7b_sharp_fp16.safetensors",
         ])
-        self.dit_model_combo.setCurrentIndex(
-            self.dit_model_combo.findText("seedvr2_ema_3b-Q8_0.gguf")
-        )
+        _idx = self.dit_model_combo.findText("seedvr2_ema_3b-Q8_0.gguf")
+        if _idx >= 0:
+            self.dit_model_combo.setCurrentIndex(_idx)
         f.addRow("DiT Model:", self.dit_model_combo)
         container_layout.addWidget(g)
 
@@ -548,9 +548,9 @@ class MainWindow(QMainWindow):
         self.attention_mode_combo.addItems([
             "sdpa", "flash_attn_2", "flash_attn_3", "sageattn_2", "sageattn_3"
         ])
-        self.attention_mode_combo.setCurrentIndex(
-            self.attention_mode_combo.findText("sageattn_3")
-        )
+        _attn_idx = self.attention_mode_combo.findText("sageattn_3")
+        if _attn_idx >= 0:
+            self.attention_mode_combo.setCurrentIndex(_attn_idx)
         f.addRow("Attention Mode:", self.attention_mode_combo)
 
         self.compile_dit_check = QCheckBox()
