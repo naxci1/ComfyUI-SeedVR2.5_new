@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import Qt, QSettings, QUrl, QEvent
-from PyQt6.QtGui import QFont, QIcon, QStandardItem, QStandardItemModel
+from PyQt6.QtGui import QFont, QIcon, QPixmap, QStandardItem, QStandardItemModel
 from PyQt6.QtWidgets import (
     QApplication,
     QAbstractSpinBox,
@@ -213,7 +213,7 @@ def _make_group(title: str) -> tuple[QGroupBox, QFormLayout]:
     layout.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
     layout.setHorizontalSpacing(12)
     layout.setVerticalSpacing(6)
-    layout.setContentsMargins(10, 15, 10, 10)
+    layout.setContentsMargins(10, 20, 10, 10)
     box.setLayout(layout)
     return box, layout
 
@@ -324,14 +324,15 @@ class CheckableComboBox(QComboBox):
         item = model.item(row)
         if not item:
             return
-        clicked_text = item.text()
-        if clicked_text in ("Auto", "CPU"):
+        txt = item.text().strip()
+        if txt in ("Auto", "CPU"):
             for i in range(model.rowCount()):
                 if i != row:
                     model.item(i).setCheckState(Qt.CheckState.Unchecked)
         else:
             for i in range(model.rowCount()):
-                if model.item(i).text() in ("Auto", "CPU"):
+                it_txt = model.item(i).text().strip()
+                if it_txt in ("Auto", "CPU"):
                     model.item(i).setCheckState(Qt.CheckState.Unchecked)
 
     def _refresh_label(self) -> None:
@@ -498,6 +499,15 @@ class MainWindow(QMainWindow):
             self._split_view = SplitViewWidget()
             self._viewer_stack.addWidget(self._split_view)
 
+            # page 3 – Static image preview (for image inputs)
+            self._image_label = QLabel()
+            self._image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._image_label.setMinimumHeight(300)
+            self._image_label.setStyleSheet(
+                "background:#0d0d0d; border:1px solid #2a2a2a; border-radius:4px;"
+            )
+            self._viewer_stack.addWidget(self._image_label)
+
             # Media players
             self._input_player = QMediaPlayer()
             self._input_audio = QAudioOutput()
@@ -608,7 +618,7 @@ class MainWindow(QMainWindow):
 
         container = QWidget()
         container_layout = QVBoxLayout(container)
-        container_layout.setContentsMargins(10, 10, 40, 10)
+        container_layout.setContentsMargins(10, 10, 50, 10)
         container_layout.setSpacing(8)
 
         # ── AI Model ───────────────────────────────────────────────────
@@ -941,8 +951,28 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _load_preview(self, path: str) -> None:
-        """Load *path* into the Input Preview player."""
-        self._load_input_video(path)
+        """Load *path* into the preview area.
+
+        Image files (jpg/png/bmp/tiff/webp) are shown on the static image label
+        (page 3 of the viewer stack).  Video files are fed to the input player
+        (page 0).
+        """
+        _IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp", ".gif"}
+        suffix = Path(path).suffix.lower()
+        if suffix in _IMAGE_SUFFIXES:
+            pix = QPixmap(path)
+            if not pix.isNull():
+                self._image_label.setPixmap(
+                    pix.scaled(
+                        self._image_label.size().expandedTo(pix.size()),
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                )
+            self._viewer_stack.setCurrentIndex(3)
+        else:
+            self._load_input_video(path)
+            self._viewer_stack.setCurrentIndex(0)
 
     # ------------------------------------------------------------------
     # Argument builder
