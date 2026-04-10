@@ -72,7 +72,7 @@ QScrollBar:vertical {
     border-radius: 6px;
 }
 QScrollBar::handle:vertical {
-    background-color: #3a3a3a;
+    background-color: #666666;
     border-radius: 6px;
     min-height: 40px;
 }
@@ -88,7 +88,7 @@ QScrollBar:horizontal {
     border-radius: 6px;
 }
 QScrollBar::handle:horizontal {
-    background-color: #3a3a3a;
+    background-color: #666666;
     border-radius: 6px;
     min-width: 40px;
 }

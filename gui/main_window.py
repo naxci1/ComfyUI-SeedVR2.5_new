@@ -63,20 +63,50 @@ except ImportError:
 # GPU auto-detection
 # ---------------------------------------------------------------------------
 
+# Populated by _detect_gpus(); read by MainWindow to emit a startup console note.
+_GPU_INIT_MSG: str = ""
+
+
 def _detect_gpus() -> list[str]:
     """Return a list of GPU entries suitable for a QComboBox.
 
     Format: ``["Auto", "CPU", "GPU 0: NVIDIA GeForce RTX 5070 Ti", "GPU 1: …", …]``
     Falls back to ``["Auto", "CPU"]`` when torch is unavailable or no CUDA GPUs exist.
+    Side-effect: sets the module-level ``_GPU_INIT_MSG`` for console display.
     """
+    global _GPU_INIT_MSG  # noqa: PLW0603
     entries = ["Auto", "CPU"]
     try:
         import torch  # noqa: PLC0415
+        # Explicitly initialise CUDA so device names are always resolvable.
+        try:
+            torch.cuda.init()
+        except Exception:
+            pass
         if torch.cuda.is_available():
-            for i in range(torch.cuda.device_count()):
+            count = torch.cuda.device_count()
+            for i in range(count):
                 entries.append(f"GPU {i}: {torch.cuda.get_device_name(i)}")
-    except Exception:  # torch not installed in GUI's Python – that's fine
-        pass
+            if count == 0:
+                _GPU_INIT_MSG = (
+                    "⚠  torch.cuda.is_available() returned True but "
+                    "device_count() is 0 – no CUDA GPUs detected."
+                )
+            else:
+                _GPU_INIT_MSG = f"✅  Detected {count} CUDA device(s)."
+        else:
+            _GPU_INIT_MSG = (
+                "⚠  torch.cuda.is_available() returned False – "
+                "CUDA is not accessible from this Python environment.  "
+                "GPU inference requires the SeedVR2 Python (python_embeded)."
+            )
+    except ImportError:
+        _GPU_INIT_MSG = (
+            "ℹ  torch is not installed in the GUI Python environment – "
+            "GPU list limited to Auto / CPU."
+        )
+    except Exception as exc:
+        _GPU_INIT_MSG = f"⚠  GPU scan error: {exc}"
     return entries
 
 try:
@@ -160,6 +190,10 @@ class MainWindow(QMainWindow):
                 break
 
         self._set_running(False)
+
+        # Emit the GPU scan result into the console so the user can see it on startup.
+        if _GPU_INIT_MSG:
+            self._on_log(_GPU_INIT_MSG)
 
     # ------------------------------------------------------------------
     # UI construction
