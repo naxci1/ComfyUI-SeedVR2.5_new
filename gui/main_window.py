@@ -30,7 +30,6 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QFormLayout,
     QMainWindow,
-    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -691,7 +690,7 @@ class MainWindow(QMainWindow):
 
     def _build_right_panel(self) -> QWidget:
         scroll = QScrollArea()
-        scroll.setMinimumWidth(150)
+        scroll.setMinimumWidth(100)
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
@@ -960,38 +959,10 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 4, 0, 0)
         layout.setSpacing(4)
 
-        # Single row – Batch + Total progress side by side
-        prog_row = QHBoxLayout()
-        batch_lbl = QLabel("Batch:")
-        batch_lbl.setMinimumWidth(50)
-        batch_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        batch_lbl.setStyleSheet("color:#888; font-size:11px;")
-        self.batch_progress_bar = QProgressBar()
-        self.batch_progress_bar.setRange(0, 100)
-        self.batch_progress_bar.setValue(0)
-        self.batch_progress_bar.setMaximumHeight(14)
-        self.batch_progress_bar.setToolTip("Current batch / segment progress")
-        total_lbl = QLabel("Total:")
-        total_lbl.setMinimumWidth(50)
-        total_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        total_lbl.setStyleSheet("color:#888; font-size:11px;")
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setMaximumHeight(14)
-        self.progress_bar.setToolTip("Total video / folder progress")
+        # Status + Run / Abort / Copy All / Clear row
+        btn_row = QHBoxLayout()
         self.status_label = QLabel("Ready")
         self.status_label.setMinimumWidth(200)
-        prog_row.addWidget(batch_lbl)
-        prog_row.addWidget(self.batch_progress_bar, stretch=1)
-        prog_row.addSpacing(12)
-        prog_row.addWidget(total_lbl)
-        prog_row.addWidget(self.progress_bar, stretch=1)
-        prog_row.addWidget(self.status_label)
-        layout.addLayout(prog_row)
-
-        # Row 3 – Run / Abort / Copy All / Clear
-        btn_row = QHBoxLayout()
         self.run_btn = QPushButton("▶  Run")
         self.run_btn.setObjectName("primary_button")
         self.run_btn.clicked.connect(self._run)
@@ -1007,9 +978,11 @@ class MainWindow(QMainWindow):
         self.clear_log_btn = QPushButton("Clear Log")
         self.clear_log_btn.clicked.connect(lambda: self.console.clear())
 
+        btn_row.addWidget(self.status_label)
+        btn_row.addStretch(1)
         btn_row.addWidget(self.run_btn)
         btn_row.addWidget(self.abort_btn)
-        btn_row.addStretch(1)
+        btn_row.addSpacing(12)
         btn_row.addWidget(self.copy_log_btn)
         btn_row.addWidget(self.clear_log_btn)
         layout.addLayout(btn_row)
@@ -1352,13 +1325,10 @@ class MainWindow(QMainWindow):
         self._thread, self._worker = create_worker_thread(cli_script, args, python_exe)
         self._worker.log_line.connect(self._on_log)
         self._worker.progress_update.connect(self._on_progress)
-        self._worker.batch_progress_update.connect(self._on_batch_progress)
         self._worker.finished.connect(self._on_finished)
         self._worker.started_signal.connect(lambda: self._set_running(True))
 
         self._set_running(True)
-        self.progress_bar.setValue(0)
-        self.batch_progress_bar.setValue(0)
         self.status_label.setText("Starting…")
         self._thread.start()
 
@@ -1633,18 +1603,11 @@ class MainWindow(QMainWindow):
 
     def _on_progress(self, cur: int, tot: int) -> None:
         if tot > 0:
-            pct = int(cur / tot * 100)
-            self.progress_bar.setValue(pct)
             self.status_label.setText(f"Processing {cur}/{tot}")
-
-    def _on_batch_progress(self, cur: int, tot: int) -> None:
-        if tot > 0:
-            self.batch_progress_bar.setValue(int(cur / tot * 100))
 
     def _on_finished(self, success: bool, msg: str) -> None:
         self._set_running(False)
         if success:
-            self.progress_bar.setValue(100)
             self.status_label.setText(f"✅  {msg}")
             self._try_auto_load_output()
         else:
