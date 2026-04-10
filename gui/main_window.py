@@ -419,9 +419,9 @@ class MainWindow(QMainWindow):
 
         splitter.addWidget(self._build_left_panel())
         splitter.addWidget(self._build_right_panel())
-        splitter.setStretchFactor(0, 2)
-        splitter.setStretchFactor(1, 3)
-        splitter.setSizes([580, 620])
+        splitter.setStretchFactor(0, 4)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([700, 300])
 
         # ── 3. Bottom controls bar ─────────────────────────────────────
         root_layout.addWidget(self._build_bottom_bar())
@@ -597,13 +597,14 @@ class MainWindow(QMainWindow):
 
     def _build_right_panel(self) -> QWidget:
         scroll = QScrollArea()
-        scroll.setMinimumWidth(360)
+        scroll.setMinimumWidth(280)
+        scroll.setMaximumWidth(400)
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         container = QWidget()
         container_layout = QVBoxLayout(container)
-        container_layout.setContentsMargins(4, 0, 0, 0)
+        container_layout.setContentsMargins(4, 0, 15, 0)
         container_layout.setSpacing(8)
 
         # ── AI Model ───────────────────────────────────────────────────
