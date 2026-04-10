@@ -46,7 +46,7 @@ from PyQt6.QtWidgets import (
 )
 
 try:
-    from PyQt6.QtMultimedia import QAudioOutput, QMediaMetaData, QMediaPlayer
+    from PyQt6.QtMultimedia import QAudioOutput, QMediaMetaData, QMediaPlayer, QVideoFrame, QVideoSink
     from PyQt6.QtMultimediaWidgets import QVideoWidget
     _MULTIMEDIA_AVAILABLE = True
 except ImportError:
@@ -505,7 +505,7 @@ class MainWindow(QMainWindow):
         # Windows: set AppUserModelID so taskbar icon matches the window icon
         try:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                "SeedVR2.HB2k.Upscaler.1.3"
+                "naxci1.seedvr.upscaler.25"
             )
         except Exception:
             pass
@@ -518,15 +518,21 @@ class MainWindow(QMainWindow):
         self._worker = None
         self._input_meta_text: str = ""   # last "Input: …" string for dual metadata
         self._preview_temp_path: Optional[str] = None  # temp file for Preview runs
+        self._is_preview_run: bool = False  # flag: switch to Split View on finish
 
         self._build_ui()
 
-        # Load window icon – try .ico first (Windows), fall back to .png
-        for _icon_rel in ("icon.png", "icon.ico", "assets/icon.ico", "assets/icon.png"):
+        # Load window icon – prefer favicon.ico, then fall back to other common names
+        _icon_found = False
+        for _icon_rel in ("favicon.ico", "icon.ico", "icon.png", "assets/icon.ico", "assets/icon.png"):
             _icon = _resource_path(_icon_rel)
             if os.path.isfile(_icon):
                 self.setWindowIcon(QIcon(_icon))
+                _icon_found = True
                 break
+        if not _icon_found:
+            # Try relative path as last resort (for frozen/bundled builds)
+            self.setWindowIcon(QIcon("favicon.ico"))
 
         self._set_running(False)
 
@@ -639,10 +645,10 @@ class MainWindow(QMainWindow):
         self._open_input_btn.clicked.connect(self._browse_input_for_player)
         mode_bar.addWidget(self._open_input_btn)
 
-        # "Full" – opens split view fullscreen
-        self._fullscreen_btn = QPushButton("Full")
+        # "Full Screen" – opens split view fullscreen
+        self._fullscreen_btn = QPushButton("Full Screen")
         self._fullscreen_btn.setToolTip("Open Split View in full screen (ESC to exit)")
-        self._fullscreen_btn.setFixedWidth(48)
+        self._fullscreen_btn.setMinimumWidth(80)
         self._fullscreen_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
         self._fullscreen_btn.clicked.connect(self._open_fullscreen)
         mode_bar.addWidget(self._fullscreen_btn)
@@ -1479,29 +1485,63 @@ class MainWindow(QMainWindow):
     def _preview_run(self) -> None:
         """Capture the currently displayed video frame, save to a temp PNG,
         set batch size=1 and input to that file, then start an upscale run."""
-        # Try to grab a frame from the video players
-        frame_pix: Optional[QPixmap] = None
-        if _MULTIMEDIA_AVAILABLE:
-            # Check output player first (user might be reviewing output)
+        frame_img = None
+
+        if _MULTIMEDIA_AVAILABLE and self._input_player is not None:
+            # Step 1: pause the video so the frame buffer is stable
+            self._input_player.pause()
+            if self._output_player:
+                self._output_player.pause()
+
+            # Step 2: process pending Qt events so the video sink flushes its frame
+            QApplication.processEvents()
+
+            # Step 3: capture frame from the input player's video sink
+            try:
+                sink = self._input_player.videoSink()
+                if sink is not None:
+                    vframe = sink.videoFrame()
+                    if vframe is not None and vframe.isValid():
+                        frame_img = vframe.toImage()
+                        if frame_img is not None and frame_img.isNull():
+                            frame_img = None
+            except Exception:
+                frame_img = None
+
+        # Fallback: try grabbing from the split view's input sink (when in split mode)
+        if frame_img is None and _MULTIMEDIA_AVAILABLE and self._split_view is not None:
+            try:
+                vframe = self._split_view.input_sink.videoFrame()
+                if vframe is not None and vframe.isValid():
+                    frame_img = vframe.toImage()
+                    if frame_img is not None and frame_img.isNull():
+                        frame_img = None
+            except Exception:
+                frame_img = None
+
+        # Fallback: grab the input widget visually (may be black for GPU-rendered video,
+        # but works fine for image inputs displayed in the zoomable viewer)
+        if frame_img is None and _MULTIMEDIA_AVAILABLE:
             for player_widget in (
-                getattr(self, "_solo_output_vw", None),
                 getattr(self, "_solo_input_vw", None),
+                getattr(self, "_solo_output_vw", None),
             ):
                 if player_widget is not None:
-                    frame_pix = player_widget.grab()
-                    if not frame_pix.isNull() and frame_pix.width() > 4:
+                    pix = player_widget.grab()
+                    if not pix.isNull() and pix.width() > 4:
+                        frame_img = pix.toImage()
                         break
 
-        if frame_pix is None or frame_pix.isNull():
-            # Fall back to whatever the image view is showing
+        # Fallback: use whatever the zoomable image view is showing (image input case)
+        if frame_img is None:
             img_view = getattr(self, "_image_view", None)
-            if img_view is not None:
-                pix = getattr(img_view, "_pixmap", None)
-                if pix is not None and not pix.isNull():
-                    frame_pix = pix
+            if img_view is not None and img_view._pix_item is not None:
+                scene_pix = img_view._pix_item.pixmap()
+                if not scene_pix.isNull():
+                    frame_img = scene_pix.toImage()
 
-        if frame_pix is None or frame_pix.isNull():
-            self._on_log("⚠  Preview: no frame available – play a video first.")
+        if frame_img is None or frame_img.isNull():
+            self._on_log("⚠  Preview: no frame available – play or pause a video first.")
             return
 
         # Save to a temporary PNG file (persist across the upscale run)
@@ -1513,15 +1553,16 @@ class MainWindow(QMainWindow):
         tmp = tempfile.NamedTemporaryFile(suffix="_preview.png", delete=False)
         tmp.close()
         self._preview_temp_path = tmp.name
-        if not frame_pix.save(self._preview_temp_path, "PNG"):
+        if not frame_img.save(self._preview_temp_path, "PNG"):
             self._on_log(f"⚠  Preview: could not save temp frame to {self._preview_temp_path}")
             return
 
-        self._on_log(f"ℹ  Preview: using captured frame → {self._preview_temp_path}")
+        self._on_log(f"ℹ  Preview: captured frame → {self._preview_temp_path}")
 
-        # Point input to the temp file and set batch size to 1
+        # Point input to the temp file, set batch size to 1, mark as preview run
         self._settings_win.input_edit.setText(self._preview_temp_path)
         self.batch_size_spin.setValue(1)
+        self._is_preview_run = True
 
         # Refresh the preview display with the captured frame
         self._load_preview(self._preview_temp_path)
@@ -1936,8 +1977,13 @@ class MainWindow(QMainWindow):
         if success:
             self.status_label.setText(f"✅  {msg}")
             self._try_auto_load_output()
+            # After a Preview run, automatically switch to Split View for comparison
+            if self._is_preview_run and _MULTIMEDIA_AVAILABLE:
+                self._mode_split_btn.setChecked(True)
+                self._on_mode_button(2, True)
         else:
             self.status_label.setText(f"⚠  {msg}")
+        self._is_preview_run = False
 
     # ------------------------------------------------------------------
     # Settings persistence (delegated to SettingsWindow)

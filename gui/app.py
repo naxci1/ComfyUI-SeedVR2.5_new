@@ -19,7 +19,7 @@ if platform.system() == "Windows":
     try:
         import ctypes
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-            "hb2k.seedvr2.v25"
+            "naxci1.seedvr.upscaler.25"
         )
     except Exception:
         pass
