@@ -85,14 +85,14 @@ def _detect_gpus() -> list[str]:
             pass
         if torch.cuda.is_available():
             count = torch.cuda.device_count()
-            for i in range(count):
-                entries.append(f"GPU {i}: {torch.cuda.get_device_name(i)}")
             if count == 0:
                 _GPU_INIT_MSG = (
                     "⚠  torch.cuda.is_available() returned True but "
                     "device_count() is 0 – no CUDA GPUs detected."
                 )
             else:
+                for i in range(count):
+                    entries.append(f"GPU {i}: {torch.cuda.get_device_name(i)}")
                 _GPU_INIT_MSG = f"✅  Detected {count} CUDA device(s)."
         else:
             _GPU_INIT_MSG = (
