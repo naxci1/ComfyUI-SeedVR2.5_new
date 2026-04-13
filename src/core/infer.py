@@ -30,6 +30,7 @@ from ..optimization.performance import (
     optimized_channels_to_last,
     optimized_channels_to_second
 )
+from ..optimization.vae_tiling import apply_blackwell_tiled_decode_patch
 from ..models.dit_3b import na
 
 
@@ -37,8 +38,8 @@ class VideoDiffusionInfer():
     def __init__(self, config: DictConfig, debug: 'Debug',
                  encode_tiled: bool = False, encode_tile_size: Tuple[int, int] = (512, 512), 
                  encode_tile_overlap: Tuple[int, int] = (64, 64),
-                 decode_tiled: bool = False, decode_tile_size: Tuple[int, int] = (512, 512),
-                 decode_tile_overlap: Tuple[int, int] = (64, 64),
+                 decode_tiled: bool = False, decode_tile_size: Tuple[int, int] = (960, 960),
+                 decode_tile_overlap: Tuple[int, int] = (128, 128),
                  tile_debug: str = "false"):
         self.config = config
         self.debug = debug
@@ -50,6 +51,8 @@ class VideoDiffusionInfer():
         self.decode_tile_size = decode_tile_size
         self.decode_tile_overlap = decode_tile_overlap
         self.tile_debug = tile_debug
+        self._vae_decode_diag_logged = False
+        self._blackwell_patch_applied = False
         
     def get_condition(self, latent: Tensor, latent_blur: Tensor, task: str) -> Tensor:
         t, h, w, c = latent.shape
@@ -167,7 +170,9 @@ class VideoDiffusionInfer():
                             latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
                                                 tile_overlap=self.encode_tile_overlap).posterior.mode().squeeze(2)
                     else:
-                        with torch.autocast(device.type, sample.dtype, enabled=True):
+                        # Force BF16 autocast on CUDA to prevent FP16 overflow artifacts
+                        autocast_dtype = torch.bfloat16 if device.type == 'cuda' else sample.dtype
+                        with torch.autocast(device.type, autocast_dtype, enabled=True):
                             if use_sample:
                                 latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size, 
                                                         tile_overlap=self.encode_tile_overlap).latent
@@ -229,6 +234,17 @@ class VideoDiffusionInfer():
 
             self.debug.log(f"Latents shape: {latents[0].shape}", category="info", indent_level=1)
 
+            # Apply Blackwell tiled_decode patch (once per session)
+            # This replaces the VAE's default tiled_decode with the optimized version
+            # that uses dynamic tile sizing, BF16 enforcement, and VRAM-aware overlap
+            if self.decode_tiled and not self._blackwell_patch_applied:
+                self._blackwell_patch_applied = True
+                apply_blackwell_tiled_decode_patch(self.vae, debug=self.debug)
+
+            # Enable TF32 for Blackwell tensor core optimization
+            if device.type == 'cuda':
+                torch.backends.cuda.matmul.allow_tf32 = True
+
             for i, latent in enumerate(latents):
                 latent = latent / scale + shift
                 latent = optimized_channels_to_second(latent)
@@ -240,24 +256,50 @@ class VideoDiffusionInfer():
                 except StopIteration:
                     vae_dtype = dtype  # Fallback
 
-                # Use autocast if VAE dtype differs from latent dtype
-                # Skip autocast on MPS (only supports bf16, unified memory = no benefit)
-                if vae_dtype != latent.dtype:
-                    if device.type == 'mps':
-                        # MPS: explicit dtype conversion instead of autocast
-                        latent = latent.to(vae_dtype)
+                # First-call decode diagnostic: log dtype mismatch and autocast usage
+                if not self._vae_decode_diag_logged:
+                    self._vae_decode_diag_logged = True
+                    uses_autocast = vae_dtype != latent.dtype and device.type != 'mps'
+                    self.debug.log(
+                        f"VAE decode: model_dtype={vae_dtype}, latent_dtype={latent.dtype}, "
+                        f"tiled={self.decode_tiled}, autocast={'yes' if uses_autocast else 'no'}",
+                        category="vae", indent_level=1
+                    )
+                    if vae_dtype != latent.dtype:
+                        self.debug.log(
+                            f"⚠️ VAE/latent dtype mismatch ({vae_dtype} vs {latent.dtype}) — "
+                            f"causes {'autocast' if uses_autocast else 'explicit cast'} overhead",
+                            category="warning", indent_level=1, force=True
+                        )
+                    if self.decode_tiled:
+                        self.debug.log(
+                            f"Using Tile Size: {self.decode_tile_size}, Overlap: {self.decode_tile_overlap}",
+                            category="vae", indent_level=1
+                        )
+
+                # Decode with dtype handling:
+                # - CUDA: disable autocast to prevent FP32 upcasting (causes Blackwell corruption)
+                #   Cast latent to BF16 explicitly for pure BF16 pipeline
+                # - MPS: explicit dtype conversion (no autocast support)
+                # - Matching dtypes: direct decode
+                if device.type == 'cuda':
+                    # Pure BF16 pipeline: cast latent to BF16, NHWC channels_last alignment, disable autocast
+                    mem_fmt = torch.channels_last if latent.ndim == 4 else torch.channels_last_3d
+                    latent = latent.to(torch.bfloat16).contiguous(memory_format=mem_fmt)
+                    with torch.amp.autocast('cuda', enabled=False):
                         sample = self.vae.decode(
                             latent,
                             tiled=self.decode_tiled, tile_size=self.decode_tile_size,
                             tile_overlap=self.decode_tile_overlap
-                        ).sample
-                    else:
-                        with torch.autocast(device.type, latent.dtype, enabled=True):
-                            sample = self.vae.decode(
-                                latent,
-                                tiled=self.decode_tiled, tile_size=self.decode_tile_size,
-                                tile_overlap=self.decode_tile_overlap
-                            ).sample
+                        ).sample.contiguous()
+                elif device.type == 'mps' and vae_dtype != latent.dtype:
+                    # MPS: explicit dtype conversion instead of autocast
+                    latent = latent.to(vae_dtype)
+                    sample = self.vae.decode(
+                        latent,
+                        tiled=self.decode_tiled, tile_size=self.decode_tile_size,
+                        tile_overlap=self.decode_tile_overlap
+                    ).sample
                 else:
                     sample = self.vae.decode(
                         latent,
@@ -274,6 +316,10 @@ class VideoDiffusionInfer():
                 samples = na.unpack(samples, indices)
             else:
                 samples = [sample.squeeze(0) for sample in samples]
+
+            # Synchronize GPU before returning to prevent partial data transfer corruption
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
 
         return samples
 

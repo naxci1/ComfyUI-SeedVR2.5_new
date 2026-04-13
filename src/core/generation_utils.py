@@ -312,12 +312,30 @@ def blend_overlapping_frames(prev_tail: torch.Tensor, cur_head: torch.Tensor, ov
     return prev_tail * w_prev + cur_head * w_cur
 
 
+def _resolve_compute_dtype(precision: str) -> torch.dtype:
+    """Resolve compute dtype from user-selected precision string.
+    
+    Args:
+        precision: 'auto', 'fp16', or 'bf16'
+        
+    Returns:
+        torch.dtype: The resolved compute dtype
+    """
+    if precision == "fp16":
+        return torch.float16
+    elif precision == "bf16":
+        return torch.bfloat16
+    else:
+        return COMPUTE_DTYPE
+
+
 def setup_generation_context(
     dit_device: Optional[Union[str, torch.device]] = None,
     vae_device: Optional[Union[str, torch.device]] = None,
     dit_offload_device: Optional[Union[str, torch.device]] = None,
     vae_offload_device: Optional[Union[str, torch.device]] = None,
     tensor_offload_device: Optional[Union[str, torch.device]] = None,
+    precision: str = "auto",
     debug: Optional['Debug'] = None
 ) -> Dict[str, Any]:
     """
@@ -332,6 +350,7 @@ def setup_generation_context(
         dit_offload_device: Device to offload DiT to when not in use (optional)
         vae_offload_device: Device to offload VAE to when not in use (optional)
         tensor_offload_device: Device to offload intermediate tensors to (optional)
+        precision: Compute precision override ('auto', 'fp16', 'bf16'). Defaults to 'auto'.
         debug: Debug instance for logging
         
     Returns:
@@ -377,7 +396,7 @@ def setup_generation_context(
         'dit_offload_device': dit_offload_device,
         'vae_offload_device': vae_offload_device,
         'tensor_offload_device': tensor_offload_device,
-        'compute_dtype': COMPUTE_DTYPE,
+        'compute_dtype': _resolve_compute_dtype(precision),
         'interrupt_fn': interrupt_fn,
         'video_transform': None,
         'text_embeds': None,
@@ -407,13 +426,16 @@ def setup_generation_context(
             f"LOCAL_RANK={os.environ['LOCAL_RANK']}",
             category="setup"
         )
-        if ctx['compute_dtype'] == torch.float32:
-            reason = "quality"
-        elif not BFLOAT16_SUPPORTED:
-            reason = "compatibility (GPU lacks bfloat16 CUBLAS - 7B models unsupported, 3B may have artifacts)"
+        if precision != "auto":
+            debug.log(f"Unified compute dtype forced to: {ctx['compute_dtype']} by user", category="precision")
         else:
-            reason = "performance"
-        debug.log(f"Unified compute dtype: {ctx['compute_dtype']} across entire pipeline for maximum {reason}", category="precision")
+            if ctx['compute_dtype'] == torch.float32:
+                reason = "quality"
+            elif not BFLOAT16_SUPPORTED:
+                reason = "compatibility (GPU lacks bfloat16 CUBLAS - 7B models unsupported, 3B may have artifacts)"
+            else:
+                reason = "performance"
+            debug.log(f"Unified compute dtype: {ctx['compute_dtype']} across entire pipeline for maximum {reason}", category="precision")
     
     return ctx
 

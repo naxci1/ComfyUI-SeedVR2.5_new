@@ -102,6 +102,7 @@ class FlashAttentionVarlen(nn.Module):
         super().__init__()
         self.attention_mode = attention_mode
         self.compute_dtype = compute_dtype
+        self._diag_logged = False
 
     def tflops(self, args, kwargs, output) -> float:
         cu_seqlens_q = kwargs["cu_seqlens_q"]
@@ -113,6 +114,14 @@ class FlashAttentionVarlen(nn.Module):
 
     def forward(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs):
         kwargs["deterministic"] = torch.are_deterministic_algorithms_enabled()
+        
+        # First-call diagnostic: log backend selection and dtype handling
+        if not self._diag_logged:
+            self._diag_logged = True
+            dtype_cast = self.compute_dtype is not None and q.dtype != self.compute_dtype
+            print(f"[SeedVR2 Attention Diag] Backend: {self.attention_mode}, "
+                  f"Input dtype: {q.dtype}, Compute dtype: {self.compute_dtype}, "
+                  f"Cast required: {dtype_cast}")
         
         # Convert to pipeline compute_dtype if configured (handles FP8 → fp16/bf16)
         if self.compute_dtype is not None and q.dtype != self.compute_dtype:

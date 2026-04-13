@@ -206,6 +206,20 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                         "• 'cuda:X': Offload to another GPU (good balance if available, faster than CPU)"
                     )
                 ),
+                io.Combo.Input("precision",
+                    options=["auto", "fp16", "bf16"],
+                    default="auto",
+                    optional=True,
+                    tooltip=(
+                        "Compute precision for the entire pipeline (default: auto).\n"
+                        "• auto: Auto-detect best precision (BF16 if supported, else FP16)\n"
+                        "• fp16: Force torch.float16 for DiT, VAE, and attention layers\n"
+                        "• bf16: Force torch.bfloat16 for the entire pipeline\n"
+                        "\n"
+                        "Use fp16 for GGUF models with FP16 weights to avoid dtype casting\n"
+                        "overhead and maximize SageAttention 3 performance."
+                    )
+                ),
                 io.Boolean.Input("enable_debug",
                     default=False,
                     optional=True,
@@ -228,7 +242,8 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                 seed: int, resolution: int = 1080, max_resolution: int = 0, batch_size: int = 5,
                 uniform_batch_size: bool = False, temporal_overlap: int = 0, prepend_frames: int = 0,
                 color_correction: str = "wavelet", input_noise_scale: float = 0.0,
-                latent_noise_scale: float = 0.0, offload_device: str = "none", 
+                latent_noise_scale: float = 0.0, offload_device: str = "none",
+                precision: str = "auto",
                 enable_debug: bool = False) -> io.NodeOutput:
         """
         Execute SeedVR2 video upscaling with progress reporting
@@ -252,6 +267,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             input_noise_scale: Input noise injection scale [0.0-1.0]
             latent_noise_scale: Latent noise injection scale [0.0-1.0]
             offload_device: Device to offload intermediate tensors
+            precision: Compute precision override ('auto', 'fp16', 'bf16')
             enable_debug: Enable detailed logging and memory tracking
             
         Returns:
@@ -409,6 +425,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                 dit_offload_device=dit_offload_device,
                 vae_offload_device=vae_offload_device,
                 tensor_offload_device=tensor_offload_device,
+                precision=precision,
                 debug=debug
             )
 

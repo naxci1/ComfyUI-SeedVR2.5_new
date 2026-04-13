@@ -1618,6 +1618,10 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                 result[:, :, : decoded_tile.shape[2], y_out:y_out_end, x_out:x_out_end] += decoded_tile
                 count[:, :, :, y_out:y_out_end, x_out:x_out_end].addcmul_(weight_h_5d, weight_w_5d)
 
+                # Free decoded tile (no empty_cache — keeps TMA active for
+                # continuous throughput on Blackwell GPUs)
+                del decoded_tile
+
         # Move result back to inference device if needed and normalize
         if result.device != z.device:
             result = result.to(z.device)

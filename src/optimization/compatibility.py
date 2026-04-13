@@ -171,6 +171,9 @@ except (ImportError, AttributeError, OSError):
 
 SAGE_ATTN_AVAILABLE = SAGE_ATTN_2_AVAILABLE or SAGE_ATTN_3_AVAILABLE
 
+# Diagnostic flag: logs SA3 details on first call only to avoid hot-loop overhead
+_sa3_diagnostics_logged = False
+
 
 def validate_attention_mode(requested_mode: str, debug=None) -> str:
     """
@@ -453,8 +456,11 @@ def call_sage_attn_3_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, m
     SageAttention 3 / Blackwell provides maximum performance on RTX 50xx series GPUs.
     However, it only supports batched attention (uniform sequence lengths), not varlen.
     
-    This wrapper detects uniform-length batches and reshapes accordingly.
-    For variable-length sequences, it automatically falls back to SageAttention 2.
+    This wrapper handles two cases:
+    1. Uniform sequences: Zero-copy reshape to batched format (fastest path).
+    2. Non-uniform sequences: Pad shorter sequences to max length, run SA3 in
+       batched mode, then extract only the valid (non-padded) positions from the
+       output.  This avoids falling back to the slower SageAttention 2.
     
     This function is excluded from torch.compile because:
     1. SageAttention is a C++ extension that can't be compiled anyway
@@ -470,13 +476,15 @@ def call_sage_attn_3_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, m
         cu_seqlens_k: Cumulative sequence lengths for keys
         max_seqlen_q: Maximum query sequence length (can be tensor or int)
         max_seqlen_k: Maximum key sequence length (can be tensor or int)
-        **kwargs: Additional arguments (passed to SA2 fallback if needed)
+        **kwargs: Additional arguments (ignored for SA3)
         
     Returns:
         Attention output tensor (total_seq, heads, head_dim)
     """
     if not SAGE_ATTN_3_AVAILABLE:
         raise ImportError("SageAttention 3 (Blackwell) is not available")
+    
+    global _sa3_diagnostics_logged
     
     # Convert tensor max_seqlen to Python int if needed
     if torch.is_tensor(max_seqlen_q):
@@ -492,24 +500,8 @@ def call_sage_attn_3_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, m
     uniform_q = (seq_lens_q == seq_lens_q[0]).all()
     uniform_k = (seq_lens_k == seq_lens_k[0]).all()
     
-    if not (uniform_q and uniform_k):
-        # Fall back to SA2 for variable-length sequences
-        # This is expected behavior - SA3 Blackwell doesn't support varlen natively
-        if SAGE_ATTN_2_AVAILABLE:
-            return call_sage_attn_2_varlen(
-                q, k, v, cu_seqlens_q, cu_seqlens_k,
-                max_seqlen_q, max_seqlen_k, **kwargs
-            )
-        raise RuntimeError(
-            "SageAttention 3 (Blackwell) requires uniform sequence lengths, "
-            "and SageAttention 2 is not available as fallback. "
-            "Please install sageattention package or use flash_attn/sdpa instead."
-        )
-    
-    # Extract batch dimensions
+    # Extract batch / head dimensions
     batch_size = len(cu_seqlens_q) - 1
-    seq_len_q = int(seq_lens_q[0].item())
-    seq_len_k = int(seq_lens_k[0].item())
     heads = q.shape[1]
     dim = q.shape[2]
     
@@ -526,20 +518,140 @@ def call_sage_attn_3_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, m
         k = k.to(torch.bfloat16)
         v = v.to(torch.bfloat16)
     
+    if not (uniform_q and uniform_k):
+        # ── Non-uniform path: pad to max length so SA3 can run in batched mode ──
+        if not _sa3_diagnostics_logged:
+            _sa3_diagnostics_logged = True
+            print(f"[SeedVR2 SA3 Diag] ✅ SageAttention 3 Blackwell with zero-pad (non-uniform seqlens)")
+            print(f"[SeedVR2 SA3 Diag]   Batch: {batch_size}, MaxSeqLen Q: {max_seqlen_q}, MaxSeqLen K: {max_seqlen_k}, Heads: {heads}, Dim: {dim}")
+            if q.dtype == torch.float16:
+                print(f"[SeedVR2 SA3 Diag]   FP16 mode: sageattn_qk_int8_pv_fp16_cuda kernel expected")
+            elif q.dtype == torch.bfloat16:
+                print(f"[SeedVR2 SA3 Diag]   BF16 mode: sageattn_qk_int8_pv_bf16_cuda kernel expected")
+        
+        # Build scatter indices for vectorized padding.
+        # For each batch element i with sequence length s_i starting at offset o_i,
+        # we compute a flat index into a (batch, max_seqlen, ...) tensor so that
+        # position j of sequence i lands at row (i * max_seqlen + j).
+        # This replaces a Python loop with a single index_copy_ call per tensor.
+        q_offsets = cu_seqlens_q[:-1]  # (batch,)
+        k_offsets = cu_seqlens_k[:-1]
+        
+        # Source indices (into the packed varlen tensor) for Q and K/V
+        src_idx_q = torch.cat([
+            torch.arange(sq, device=q.device) + q_offsets[i]
+            for i, sq in enumerate(seq_lens_q)
+        ])
+        src_idx_k = torch.cat([
+            torch.arange(sk, device=k.device) + k_offsets[i]
+            for i, sk in enumerate(seq_lens_k)
+        ])
+        
+        # Destination indices (into the padded batch tensor, flattened along batch*seq)
+        dst_idx_q = torch.cat([
+            torch.arange(sq, device=q.device) + i * max_seqlen_q
+            for i, sq in enumerate(seq_lens_q)
+        ])
+        dst_idx_k = torch.cat([
+            torch.arange(sk, device=k.device) + i * max_seqlen_k
+            for i, sk in enumerate(seq_lens_k)
+        ])
+        
+        # Allocate padded tensors and scatter valid tokens in one operation
+        q_padded = q.new_zeros((batch_size * max_seqlen_q, heads, dim))
+        k_padded = k.new_zeros((batch_size * max_seqlen_k, heads, dim))
+        v_padded = v.new_zeros((batch_size * max_seqlen_k, heads, dim))
+        
+        q_padded.index_copy_(0, dst_idx_q, q.index_select(0, src_idx_q))
+        k_padded.index_copy_(0, dst_idx_k, k.index_select(0, src_idx_k))
+        v_padded.index_copy_(0, dst_idx_k, v.index_select(0, src_idx_k))
+        
+        # Reshape to (batch, heads, seq, dim) for SA3.
+        # .contiguous() is called here so SA3's internal pad_128 receives
+        # already-contiguous tensors and doesn't allocate a second copy
+        # (which caused OOM on 16GB Blackwell GPUs with large batch sizes).
+        q_padded = q_padded.view(batch_size, max_seqlen_q, heads, dim).transpose(1, 2).contiguous()
+        k_padded = k_padded.view(batch_size, max_seqlen_k, heads, dim).transpose(1, 2).contiguous()
+        v_padded = v_padded.view(batch_size, max_seqlen_k, heads, dim).transpose(1, 2).contiguous()
+        
+        # Pre-emptive pad sequence dimension to nearest multiple of 128 so that
+        # SA3's internal pad_128 becomes a no-op (no extra allocation).
+        pad_q = (128 - max_seqlen_q % 128) % 128
+        pad_k = (128 - max_seqlen_k % 128) % 128
+        if pad_q > 0:
+            q_padded = torch.nn.functional.pad(q_padded, (0, 0, 0, pad_q))
+        if pad_k > 0:
+            k_padded = torch.nn.functional.pad(k_padded, (0, 0, 0, pad_k))
+            v_padded = torch.nn.functional.pad(v_padded, (0, 0, 0, pad_k))
+        
+        # Free original packed tensors before SA3 allocates its internal buffers.
+        # Keep dst_idx_q — it's needed to gather valid positions from the output.
+        del q, k, v, src_idx_q, src_idx_k, dst_idx_k
+        
+        # Defragment CUDA memory for large sequences to prevent OOM during SA3 kernel.
+        # Threshold of 2000 tokens corresponds to ~720p+ resolution where peak VRAM from
+        # SA3's internal buffers risks exceeding 16GB on RTX 5070 Ti class GPUs.
+        if max_seqlen_q > 2000 and q_padded.is_cuda:
+            torch.cuda.empty_cache()
+        
+        out_padded = sageattn_blackwell(q_padded, k_padded, v_padded, per_block_mean=False)
+        
+        # Gather valid (non-padded) positions back into varlen layout
+        # Slice off the pre-emptive padding before flattening
+        if pad_q > 0:
+            out_padded = out_padded[:, :, :max_seqlen_q, :]
+        out_flat = out_padded.transpose(1, 2).reshape(batch_size * max_seqlen_q, heads, dim)
+        out = out_flat.index_select(0, dst_idx_q).contiguous()
+        
+        return out.to(out_dtype) if out.dtype != out_dtype else out
+    
+    # ── Uniform path: zero-copy reshape (fastest) ──
+    seq_len_q = int(seq_lens_q[0].item())
+    seq_len_k = int(seq_lens_k[0].item())
+    
+    # First-call diagnostics: log kernel selection, tensor alignment, and dtype info
+    if not _sa3_diagnostics_logged:
+        _sa3_diagnostics_logged = True
+        dtype_cast = out_dtype not in half_dtypes
+        print(f"[SeedVR2 SA3 Diag] ✅ SageAttention 3 Blackwell kernel active (sageattn_blackwell)")
+        print(f"[SeedVR2 SA3 Diag]   Input dtype: {out_dtype} → Kernel dtype: {q.dtype}"
+              f"{' (cast required)' if dtype_cast else ' (native, no cast)'}")
+        print(f"[SeedVR2 SA3 Diag]   Q contiguous: {q.is_contiguous()}, K contiguous: {k.is_contiguous()}, V contiguous: {v.is_contiguous()}")
+        print(f"[SeedVR2 SA3 Diag]   Batch: {batch_size}, SeqLen Q: {seq_len_q}, SeqLen K: {seq_len_k}, Heads: {heads}, Dim: {dim}")
+        if q.dtype == torch.float16:
+            print(f"[SeedVR2 SA3 Diag]   FP16 mode: sageattn_qk_int8_pv_fp16_cuda kernel expected")
+        elif q.dtype == torch.bfloat16:
+            print(f"[SeedVR2 SA3 Diag]   BF16 mode: sageattn_qk_int8_pv_bf16_cuda kernel expected")
+    
     # Reshape varlen (total_seq, heads, dim) -> batched (batch, seq, heads, dim)
     q_batched = q.view(batch_size, seq_len_q, heads, dim)
     k_batched = k.view(batch_size, seq_len_k, heads, dim)
     v_batched = v.view(batch_size, seq_len_k, heads, dim)
     
-    # SA3/Blackwell expects (batch, heads, seq, dim) layout
-    q_batched = q_batched.transpose(1, 2)  # (batch, heads, seq, dim)
-    k_batched = k_batched.transpose(1, 2)
-    v_batched = v_batched.transpose(1, 2)
+    # SA3/Blackwell expects (batch, heads, seq, dim) layout.
+    # .contiguous() ensures SA3's internal pad_128 doesn't allocate a second
+    # copy of each tensor (OOM risk on 16GB GPUs with large batch sizes).
+    q_batched = q_batched.transpose(1, 2).contiguous()  # (batch, heads, seq, dim)
+    k_batched = k_batched.transpose(1, 2).contiguous()
+    v_batched = v_batched.transpose(1, 2).contiguous()
+    
+    # Pre-emptive pad sequence dimension to nearest multiple of 128 so that
+    # SA3's internal pad_128 becomes a no-op (no extra allocation).
+    pad_q = (128 - seq_len_q % 128) % 128
+    pad_k = (128 - seq_len_k % 128) % 128
+    if pad_q > 0:
+        q_batched = torch.nn.functional.pad(q_batched, (0, 0, 0, pad_q))
+    if pad_k > 0:
+        k_batched = torch.nn.functional.pad(k_batched, (0, 0, 0, pad_k))
+        v_batched = torch.nn.functional.pad(v_batched, (0, 0, 0, pad_k))
     
     # Call SA3 Blackwell
     out = sageattn_blackwell(q_batched, k_batched, v_batched, per_block_mean=False)
     
     # Reshape back to varlen format (total_seq, heads, dim)
+    # Slice off the pre-emptive padding before flattening
+    if pad_q > 0:
+        out = out[:, :, :seq_len_q, :]
     out = out.transpose(1, 2).reshape(-1, heads, dim).contiguous()
     
     return out.to(out_dtype) if out.dtype != out_dtype else out
@@ -711,7 +823,7 @@ def call_rope_with_stability(method, *args, **kwargs):
     # Only use CUDA autocast context on CUDA devices
     # MPS has no CUDA autocast to disable
     if torch.cuda.is_available():
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
             return method(*args, **kwargs)
     else:
         return method(*args, **kwargs)
@@ -760,6 +872,19 @@ class CompatibleDiT(torch.nn.Module):
                 self.debug.start_timer("_force_nadit_precision")
                 self._force_nadit_precision(target_dtype=self.compute_dtype)
                 self.debug.end_timer("_force_nadit_precision", "NaDiT parameters/buffers conversion")
+        
+        # CUDA: Align non-FP8 model parameters to compute_dtype to eliminate FP32 leaks.
+        # Without this, FP32 model weights cause linear projections to output FP32 Q/K/V,
+        # forcing the attention layer to hold both FP32 and BF16 copies simultaneously
+        # (wasting ~5GB VRAM on large batch sizes like 81 frames).
+        if (not skip_conversion and not self.is_fp8_model
+                and torch.cuda.is_available()
+                and self.model_dtype != self.compute_dtype
+                and not (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available())):
+            self.debug.log(f"Aligning NaDiT parameters to {self.compute_dtype} for VRAM efficiency", category="setup", force=True)
+            self.debug.start_timer("_force_nadit_precision_cuda")
+            self._force_nadit_precision(target_dtype=self.compute_dtype)
+            self.debug.end_timer("_force_nadit_precision_cuda", "NaDiT CUDA precision alignment")
             
         # Apply RoPE stabilization for numerical stability
         self.debug.log(f"Stabilizing RoPE computations for numerical stability", category="setup")
@@ -894,23 +1019,39 @@ class CompatibleDiT(torch.nn.Module):
     
     def forward(self, *args, **kwargs):
         """
-        Forward pass with minimal dtype conversion overhead
+        Forward pass with proactive dtype conversion to eliminate casting overhead.
         
         Conversion strategy:
-            - FP16/BFloat16/Float32 models: Use native precision (no conversion needed)
-            - FP8 models: Convert FP8 tensors to compute_dtype for arithmetic operations
-            (FP8 parameters stay in FP8 for memory efficiency, only converted for computation)
+            - All models: Pre-cast all tensor inputs to compute_dtype before the DiT
+              forward pass. This ensures downstream attention kernels (SageAttention 3,
+              FlashAttention) receive native-dtype tensors without per-layer casting.
+            - FP8 models: Additionally handles FP8-specific tensor types.
+            - GGUF models: On-the-fly dequantization already targets compute_dtype.
         """
+        target_dtype = self.compute_dtype
+        fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
         
-        # Only convert if we have an FP8 model for arithmetic operations 
-        if self.is_fp8_model:
-            fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
-            target_dtype = self.compute_dtype
-            
+        # Pre-cast all tensor inputs to compute_dtype to eliminate downstream
+        # dtype casting overhead (e.g., in attention kernels like SageAttention 3).
+        # For FP8 models this converts FP8 inputs; for non-FP8 models with
+        # mismatched input dtype (e.g., FP16 inputs + BF16 compute) this also
+        # ensures the DiT receives consistent precision throughout.
+        # Short-circuit: FP8 models always need casting; otherwise check lazily.
+        needs_cast = self.is_fp8_model
+        if not needs_cast:
+            needs_cast = any(
+                isinstance(a, torch.Tensor) and a.is_floating_point() and a.dtype != target_dtype
+                for a in args
+            ) or any(
+                isinstance(v, torch.Tensor) and v.is_floating_point() and v.dtype != target_dtype
+                for v in kwargs.values()
+            )
+        
+        if needs_cast:
             # Convert args
             converted_args = []
             for arg in args:
-                if isinstance(arg, torch.Tensor) and arg.dtype in fp8_dtypes:
+                if isinstance(arg, torch.Tensor) and arg.is_floating_point() and arg.dtype != target_dtype:
                     converted_args.append(arg.to(target_dtype))
                 else:
                     converted_args.append(arg)
@@ -918,7 +1059,7 @@ class CompatibleDiT(torch.nn.Module):
             # Convert kwargs
             converted_kwargs = {}
             for key, value in kwargs.items():
-                if isinstance(value, torch.Tensor) and value.dtype in fp8_dtypes:
+                if isinstance(value, torch.Tensor) and value.is_floating_point() and value.dtype != target_dtype:
                     converted_kwargs[key] = value.to(target_dtype)
                 else:
                     converted_kwargs[key] = value
@@ -934,7 +1075,7 @@ class CompatibleDiT(torch.nn.Module):
             if self.is_fp8_model:
                 self.debug.log(f"FP8 model - converted FP8 tensors to {self.compute_dtype}", category="info", force=True)
             else:
-                self.debug.log(f"{self.model_dtype} model - no conversion applied", category="info", force=True)
+                self.debug.log(f"{self.model_dtype} model - inputs cast to {self.compute_dtype}", category="info", force=True)
             raise
     
     def __getattr__(self, name):
