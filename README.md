@@ -670,6 +670,13 @@ Configure the VAE (Variational Autoencoder) model for encoding/decoding video fr
 
 - **decode_tile_overlap**: Decoding tile overlap in pixels (default: 128)
 
+- **decode_cuda_graph**: Enable CUDA Graph capture/replay for VAE decode (default: False)
+  - NVIDIA GPU only; ignored on CPU and Apple Silicon
+  - Cannot be used together with `decode_tiled` (CUDA Graphs require fixed tensor shapes)
+  - Two warmup runs are performed on the first call; subsequent calls with the same latent shape replay the graph directly
+  - The graph is automatically re-captured when the latent shape or dtype changes
+  - Recommended for workflows with stable latent shapes (e.g. `uniform_batch_size` enabled)
+
 - **torch_compile_args**: Connect to SeedVR2 Torch Compile Settings node for 15-25% speedup
 
 **VAE Tiling Explained:**
@@ -1077,6 +1084,11 @@ python inference_cli.py media_folder/ \
 - `--compile_dynamic`: Handle varying input shapes without recompilation (default: False)
 - `--compile_dynamo_cache_size_limit`: Max cached compiled versions per function (default: 64)
 - `--compile_dynamo_recompile_limit`: Max recompilation attempts before fallback (default: 128)
+- `--vae_decode_cuda_graph`: Enable CUDA Graph capture/replay for VAE decode (NVIDIA GPU only, off by default).
+  Reduces kernel-launch overhead. Incompatible with `--vae_decode_tiled`. Two warmup forward passes are
+  performed before the graph is captured; subsequent batches with the same latent shape replay the graph
+  directly. The graph is automatically re-captured when the latent shape or dtype changes. Recommended for
+  multi-batch workflows where shapes are stable (e.g. `--uniform_batch_size`).
 
 **Model Caching (batch processing):**
 - `--cache_dit`: Keep DiT model in memory between generations. Works with single-GPU directory processing or multi-GPU streaming (`--chunk_size`). Requires `--dit_offload_device`

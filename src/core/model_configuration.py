@@ -749,7 +749,8 @@ def configure_runner(
     tile_debug: str = "false",
     attention_mode: str = 'sdpa',
     torch_compile_args_dit: Optional[Dict[str, Any]] = None,
-    torch_compile_args_vae: Optional[Dict[str, Any]] = None
+    torch_compile_args_vae: Optional[Dict[str, Any]] = None,
+    vae_decode_cuda_graph: bool = False
 ) -> Tuple[VideoDiffusionInfer, Dict[str, Any]]:
     """
     Configure VideoDiffusionInfer runner with model loading and settings.
@@ -777,6 +778,8 @@ def configure_runner(
         attention_mode: Attention computation backend ('sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3')
         torch_compile_args_dit: Optional torch.compile configuration for DiT model
         torch_compile_args_vae: Optional torch.compile configuration for VAE model
+        vae_decode_cuda_graph: Enable CUDA Graph capture/replay for VAE decode (CUDA only,
+            incompatible with tiled decode, off by default)
         
     Returns:
         Tuple[VideoDiffusionInfer, Dict[str, Any]]: (configured runner, cache context dict)
@@ -822,7 +825,8 @@ def configure_runner(
         decode_tiled, decode_tile_size, decode_tile_overlap,
         tile_debug, attention_mode,
         torch_compile_args_dit, torch_compile_args_vae,
-        block_swap_config, debug
+        block_swap_config, debug,
+        vae_decode_cuda_graph=vae_decode_cuda_graph
     )
     
     # Phase 4: Setup models (load from cache or create new)
@@ -848,7 +852,8 @@ def _configure_runner_settings(
     torch_compile_args_dit: Optional[Dict[str, Any]],
     torch_compile_args_vae: Optional[Dict[str, Any]],
     block_swap_config: Optional[Dict[str, Any]],
-    debug: Optional['Debug'] = None
+    debug: Optional['Debug'] = None,
+    vae_decode_cuda_graph: bool = False
 ) -> None:
     """
     Configure runner settings for VAE tiling, torch.compile, and BlockSwap.
@@ -873,6 +878,7 @@ def _configure_runner_settings(
         torch_compile_args_vae: torch.compile configuration for VAE model or None
         block_swap_config: BlockSwap configuration for DiT model or None
         debug: Debug instance (stored on runner for model access)
+        vae_decode_cuda_graph: Enable CUDA Graph capture/replay for VAE decode
     """
     # VAE tiling settings
     runner.encode_tiled = encode_tiled
@@ -882,6 +888,16 @@ def _configure_runner_settings(
     runner.decode_tile_size = decode_tile_size
     runner.decode_tile_overlap = decode_tile_overlap
     runner.tile_debug = tile_debug
+
+    # CUDA Graph setting; reset cached graph if toggled off to free memory
+    if (
+        getattr(runner, 'use_vae_decode_cuda_graph', False)
+        and not vae_decode_cuda_graph
+        and getattr(runner, '_cuda_graph_cache', None) is not None
+    ):
+        runner._cuda_graph_cache.reset()
+    runner.use_vae_decode_cuda_graph = vae_decode_cuda_graph
+    print(f"[SeedVR] CUDA Graph status: {vae_decode_cuda_graph}")
     
     # Store the new configs temporarily for later comparison
     # Don't set them as attributes yet - let the update functions handle that

@@ -941,7 +941,8 @@ def _process_frames_core(
         tile_debug=args.tile_debug.lower() if args.tile_debug else "false",
         attention_mode=args.attention_mode,
         torch_compile_args_dit=torch_compile_args_dit,
-        torch_compile_args_vae=torch_compile_args_vae
+        torch_compile_args_vae=torch_compile_args_vae,
+        vae_decode_cuda_graph=args.vae_decode_cuda_graph
     )
     
     ctx['cache_context'] = cache_context
@@ -1469,6 +1470,12 @@ Examples:
                         help="Max cached compiled versions per function. Increase when using many different input shapes. Higher uses more memory (default: 64)")
     perf_group.add_argument("--compile_dynamo_recompile_limit", type=int, default=128,
                         help="Max recompilation attempts before fallback to eager mode. Safety limit to prevent compilation loops (default: 128)")
+    perf_group.add_argument("--vae_decode_cuda_graph", action="store_true",
+                        help="Enable CUDA Graph capture/replay for VAE decode to reduce kernel-launch overhead "
+                        "(NVIDIA GPU only, off by default). "
+                        "Incompatible with --vae_decode_tiled. Two warmup runs are performed before the graph is "
+                        "captured; subsequent batches with the same latent shape replay the graph directly. "
+                        "The graph is automatically re-captured if the latent shape or dtype changes.")
     
     # Model Caching (for batch processing)
     cache_group = parser.add_argument_group('Model caching (batch processing)')
@@ -1535,6 +1542,15 @@ def main() -> None:
     if args.vae_decode_tiled and args.vae_decode_tile_overlap >= args.vae_decode_tile_size:
         debug.log(f"VAE decode tile overlap ({args.vae_decode_tile_overlap}) must be smaller than tile size ({args.vae_decode_tile_size})", level="ERROR", category="vae", force=True)
         sys.exit(1)
+    
+    if args.vae_decode_cuda_graph and args.vae_decode_tiled:
+        debug.log(
+            "--vae_decode_cuda_graph is incompatible with --vae_decode_tiled "
+            "(CUDA Graphs require fixed tensor shapes; tiled decode uses variable tile sizes). "
+            "--vae_decode_cuda_graph will be disabled.",
+            level="WARNING", category="perf", force=True
+        )
+        args.vae_decode_cuda_graph = False
     
     # Validate ffmpeg availability if selected
     if args.video_backend == "ffmpeg" and shutil.which("ffmpeg") is None:
