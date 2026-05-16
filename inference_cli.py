@@ -519,7 +519,22 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
     # Guard: image inputs must never write to a video-extension path (OpenCV imwrite crash)
     if input_type == "image" and Path(output_path).suffix.lower() not in _IMAGE_OUTPUT_EXTS:
         output_path = str(Path(output_path).with_suffix(".png").resolve())
-    
+
+    # Guard: video/directory inputs must never write to an image-extension path when the
+    # requested output format is a video container.  This fixes the BrokenPipeError that
+    # occurs when FFmpeg is told to write ProRes/H.265/etc. into a path ending with .png,
+    # .jpg, or another image suffix (e.g. GUI preview paths like preview_frame_001.png).
+    if input_type in ("video", "directory") and args.output_format not in ("png",):
+        fmt_lower = (args.output_format or "mp4").lower()
+        correct_ext = _VIDEO_CONTAINER_EXTS.get(fmt_lower, f".{fmt_lower}")
+        if Path(output_path).suffix.lower() in _IMAGE_OUTPUT_EXTS:
+            output_path = str(Path(output_path).with_suffix(correct_ext).resolve())
+            debug.log(
+                f"Output path extension corrected to '{correct_ext}' to match "
+                f"container '{args.output_format}' (was an image extension)",
+                category="info", force=True, indent_level=1
+            )
+
     # Show format with auto-detection indicator
     format_prefix = "Auto-detected" if format_auto_detected else "Requested"
     debug.log(f"{format_prefix} output format: {args.output_format}", category="info", force=True, indent_level=1)

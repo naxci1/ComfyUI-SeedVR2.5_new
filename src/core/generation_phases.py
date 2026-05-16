@@ -972,6 +972,40 @@ def decode_all_batches(
             except Exception:
                 pass  # ComfyUI not installed – fall through to tiled decode path
 
+            # ── Tile-size auto-reduction safeguard ──────────────────────────────
+            # When tiled VAE decode is active with a large tile (e.g. 720) AND
+            # the batch exceeds 16 frames at 720p resolution, the peak pixel-space
+            # tensor can spill 2+ GB into Windows Shared System RAM without raising
+            # an OOM error.  Drop the tile size to (512, 512) for this batch and
+            # restore it afterwards so subsequent smaller batches still benefit from
+            # the user's preferred setting.
+            _orig_decode_tile_size = None
+            num_frames_check = upscaled_latent.shape[0]
+            if (runner.decode_tiled
+                    and num_frames_check > 16
+                    and runner.decode_tile_size is not None
+                    and max(runner.decode_tile_size) > 512):
+                _orig_decode_tile_size = runner.decode_tile_size
+                runner.decode_tile_size = (512, 512)
+                debug.log(
+                    f"Auto-reducing VAE decode tile size from {_orig_decode_tile_size} "
+                    f"to (512, 512) for {num_frames_check}-frame batch to prevent "
+                    "VRAM overflow into Windows Shared RAM",
+                    category="memory", force=True
+                )
+
+            # ── Micro-chunk basket cap ───────────────────────────────────────────
+            # Even without a ComfyUI headroom signal, cap micro-chunk decode at
+            # 8 frames per pass when the latent exceeds 16 frames, as an additional
+            # safety net against silent shared-RAM spillover.
+            if _micro_chunk_size == 0 and num_frames_check > 16:
+                _micro_chunk_size = 8
+                debug.log(
+                    f"Activating precautionary 8-frame micro-chunk VAE decode "
+                    f"({num_frames_check} frames total > 16-frame safe threshold)",
+                    category="memory", force=True
+                )
+
             # Move to VAE device with correct dtype for decoding (no-op if already there)
             upscaled_latent = manage_tensor(
                 tensor=upscaled_latent,
@@ -1021,6 +1055,11 @@ def decode_all_batches(
                 sample = samples[0]
                 del samples
             
+            # Restore original tile size if it was temporarily reduced
+            if _orig_decode_tile_size is not None:
+                runner.decode_tile_size = _orig_decode_tile_size
+                _orig_decode_tile_size = None
+
             # Get original length for this batch (before any padding was added)
             ori_length = ctx['all_ori_lengths'][decode_idx] if decode_idx < len(ctx['all_ori_lengths']) else sample.shape[0]
             
