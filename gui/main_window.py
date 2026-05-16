@@ -6,7 +6,9 @@ Topaz-style dark-mode wrapper around inference_cli.py.
 from __future__ import annotations
 
 import ctypes
+import json
 import os
+import time
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import subprocess
@@ -14,10 +16,25 @@ import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from PyQt6.QtCore import Qt, QRectF, QSettings, QUrl, QEvent, pyqtSignal
-from PyQt6.QtGui import QColor, QDesktopServices, QFont, QIcon, QImageReader, QPixmap, QPainter, QPen, QStandardItem, QStandardItemModel, QWheelEvent
+from PyQt6.QtGui import (
+    QAction,
+    QColor,
+    QDesktopServices,
+    QDragEnterEvent,
+    QDropEvent,
+    QFont,
+    QIcon,
+    QImageReader,
+    QPixmap,
+    QPainter,
+    QPen,
+    QStandardItem,
+    QStandardItemModel,
+    QWheelEvent,
+)
 from PyQt6.QtWidgets import (
     QApplication,
     QAbstractSpinBox,
@@ -30,10 +47,14 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
     QCheckBox,
     QComboBox,
     QFormLayout,
     QMainWindow,
+    QMenu,
+    QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -42,6 +63,7 @@ from PyQt6.QtWidgets import (
     QSplitter,
     QSplitterHandle,
     QStackedWidget,
+    QSystemTrayIcon,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -438,6 +460,23 @@ class CheckableComboBox(QComboBox):
             if self._item(i).checkState() == Qt.CheckState.Checked
         ]
 
+    def setCheckedTexts(self, texts: list[str]) -> None:
+        """Check all items in *texts*, preserving Auto/CPU exclusivity rules."""
+        wanted = set(texts)
+        for i in range(self._model.rowCount()):
+            it = self._item(i)
+            it.setCheckState(
+                Qt.CheckState.Checked
+                if it.text() in wanted
+                else Qt.CheckState.Unchecked
+            )
+
+        # Re-apply exclusivity in deterministic order
+        for i in range(self._model.rowCount()):
+            if self._item(i).checkState() == Qt.CheckState.Checked:
+                self._enforce_exclusion(i)
+        self._refresh_label()
+
     def setCurrentText(self, text: str) -> None:  # type: ignore[override]
         """Check the single item matching *text*, uncheck everything else."""
         for i in range(self._model.rowCount()):
@@ -532,11 +571,27 @@ class MainWindow(QMainWindow):
         self._input_meta_text: str = ""   # last "Input: …" string for dual metadata
         self._preview_temp_path: Optional[str] = None  # temp file for Preview runs
         self._is_preview_run: bool = False  # flag: switch to Split View on finish
+        self._run_started_at: Optional[float] = None
+        self._latest_output_path: Optional[Path] = None
+        self._queue_jobs: list[dict[str, Any]] = []
+        self._queue_running: bool = False
+        self._queue_entry_counter: int = 0
+        self._force_exit: bool = False
+        self._tray_tip_shown: bool = False
 
         self._build_ui()
+        self._build_menu_bar()
 
         # Load window icon (PyInstaller-compatible path)
-        self.setWindowIcon(QIcon(get_resource_path("icon.ico")))
+        icon_path = Path(get_resource_path("assets/icon.ico"))
+        if not icon_path.exists():
+            icon_path = Path(get_resource_path("icon.ico"))
+        self.setWindowIcon(QIcon(str(icon_path)))
+        self.setAcceptDrops(True)
+        self._setup_system_tray()
+        self._persistable_widgets = self._build_persistable_widget_map()
+        self._load_model_settings()
+        self._prompt_load_last_preset()
 
         self._set_running(False)
 
@@ -807,6 +862,19 @@ class MainWindow(QMainWindow):
         container_layout.setContentsMargins(10, 10, 10, 10)
         container_layout.setSpacing(8)
 
+        # ── Presets ────────────────────────────────────────────────────
+        preset_bar = QHBoxLayout()
+        self.save_preset_btn = QPushButton("Save Preset…")
+        self.save_preset_btn.setToolTip("Save model/processing settings to a JSON preset")
+        self.save_preset_btn.clicked.connect(self._save_preset_dialog)
+        self.load_preset_btn = QPushButton("Load Preset…")
+        self.load_preset_btn.setToolTip("Load model/processing settings from a JSON preset")
+        self.load_preset_btn.clicked.connect(self._load_preset_dialog)
+        preset_bar.addWidget(self.save_preset_btn)
+        preset_bar.addWidget(self.load_preset_btn)
+        preset_bar.addStretch(1)
+        container_layout.addLayout(preset_bar)
+
         # ── AI Model ───────────────────────────────────────────────────
         g, f = _make_group("AI Model")
         self.dit_model_combo = QComboBox()
@@ -1045,6 +1113,36 @@ class MainWindow(QMainWindow):
         f.addRow("Verbose Debug:", self.debug_check)
         container_layout.addWidget(g)
 
+        # ── Job Queue ──────────────────────────────────────────────────
+        qg = QGroupBox("Job Queue")
+        qg.setCheckable(True)
+        qg.setChecked(False)
+        qv = QVBoxLayout(qg)
+        qv.setContentsMargins(8, 8, 8, 8)
+        qv.setSpacing(6)
+
+        self.queue_list = QListWidget()
+        self.queue_list.setMinimumHeight(120)
+        qv.addWidget(self.queue_list)
+
+        queue_btns_row = QHBoxLayout()
+        self.queue_add_btn = QPushButton("Add Current")
+        self.queue_add_btn.clicked.connect(self._queue_add_current_job)
+        self.queue_remove_btn = QPushButton("Remove Selected")
+        self.queue_remove_btn.clicked.connect(self._queue_remove_selected)
+        self.queue_clear_btn = QPushButton("Clear")
+        self.queue_clear_btn.clicked.connect(self._queue_clear_all)
+        queue_btns_row.addWidget(self.queue_add_btn)
+        queue_btns_row.addWidget(self.queue_remove_btn)
+        queue_btns_row.addWidget(self.queue_clear_btn)
+        qv.addLayout(queue_btns_row)
+
+        self.queue_run_btn = QPushButton("Run Queue")
+        self.queue_run_btn.clicked.connect(self._queue_run)
+        qv.addWidget(self.queue_run_btn)
+
+        container_layout.addWidget(qg)
+
         container_layout.addStretch(1)
 
         # Constrain input widgets and set flexible size policy to prevent overflow
@@ -1066,6 +1164,19 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(bar)
         layout.setContentsMargins(0, 4, 0, 0)
         layout.setSpacing(4)
+
+        # Progress bars (outer: global frame/chunk, inner: batch step)
+        self.global_progress = QProgressBar()
+        self.global_progress.setRange(0, 100)
+        self.global_progress.setValue(0)
+        self.global_progress.setFormat("Total Progress: idle")
+        layout.addWidget(self.global_progress)
+
+        self.batch_progress = QProgressBar()
+        self.batch_progress.setRange(0, 100)
+        self.batch_progress.setValue(0)
+        self.batch_progress.setFormat("Batch Progress: idle")
+        layout.addWidget(self.batch_progress)
 
         # Status + Run / Abort / Copy All / Clear row
         btn_row = QHBoxLayout()
@@ -1093,11 +1204,16 @@ class MainWindow(QMainWindow):
         self.clear_log_btn = QPushButton("Clear Log")
         self.clear_log_btn.clicked.connect(lambda: self.console.clear())
 
+        self.open_output_folder_btn = QPushButton("Open Output Folder")
+        self.open_output_folder_btn.setEnabled(False)
+        self.open_output_folder_btn.clicked.connect(self._open_output_folder)
+
         btn_row.addWidget(self.status_label)
         btn_row.addStretch(1)
         btn_row.addWidget(self.run_btn)
         btn_row.addWidget(self.preview_btn)
         btn_row.addWidget(self.abort_btn)
+        btn_row.addWidget(self.open_output_folder_btn)
         btn_row.addSpacing(12)
         btn_row.addWidget(self.copy_log_btn)
         btn_row.addWidget(self.clear_log_btn)
@@ -1123,6 +1239,317 @@ class MainWindow(QMainWindow):
         self._settings_win.show()
         self._settings_win.raise_()
         self._settings_win.activateWindow()
+
+    def _build_menu_bar(self) -> None:
+        help_menu = self.menuBar().addMenu("Help")
+        about_action = QAction("About SeedVR2 GUI", self)
+        about_action.triggered.connect(self._show_about_dialog)
+        help_menu.addAction(about_action)
+
+        github_action = QAction("Open GitHub", self)
+        github_action.triggered.connect(
+            lambda: QDesktopServices.openUrl(
+                QUrl("https://github.com/naxci1/ComfyUI-SeedVR2.5_new")
+            )
+        )
+        help_menu.addAction(github_action)
+
+    def _show_about_dialog(self) -> None:
+        QMessageBox.about(
+            self,
+            "About SeedVR2 GUI",
+            (
+                "<b>SeedVR2.5 GUI by HB2k</b><br>"
+                "Version: v1.4 beta<br><br>"
+                "Topaz-style wrapper for SeedVR2 inference_cli.py.<br>"
+                "License: Apache-2.0<br><br>"
+                '<a href="https://github.com/naxci1/ComfyUI-SeedVR2.5_new">'
+                "GitHub Repository</a>"
+            ),
+        )
+
+    def _setup_system_tray(self) -> None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self._tray_icon = None
+            return
+
+        icon = self.windowIcon()
+        if icon.isNull():
+            path = Path(get_resource_path("assets/icon.ico"))
+            if not path.exists():
+                path = Path(get_resource_path("icon.ico"))
+            icon = QIcon(str(path))
+        self._tray_icon = QSystemTrayIcon(icon, self)
+        self._tray_icon.setToolTip("SeedVR2.5 GUI")
+        self._tray_icon.activated.connect(self._on_tray_activated)
+
+        tray_menu = QMenu()
+        show_action = tray_menu.addAction("Show")
+        show_action.triggered.connect(self._restore_from_tray)
+        exit_action = tray_menu.addAction("Exit")
+        exit_action.triggered.connect(self._exit_from_tray)
+        self._tray_icon.setContextMenu(tray_menu)
+        self._tray_icon.show()
+
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self._restore_from_tray()
+
+    def _restore_from_tray(self) -> None:
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _exit_from_tray(self) -> None:
+        self._force_exit = True
+        self.close()
+
+    def _build_persistable_widget_map(self) -> dict[str, QWidget]:
+        return {
+            "dit_model_combo": self.dit_model_combo,
+            "output_format_combo": self.output_format_combo,
+            "video_backend_combo": self.video_backend_combo,
+            "use_10bit_check": self.use_10bit_check,
+            "color_correction_combo": self.color_correction_combo,
+            "resolution_spin": self.resolution_spin,
+            "max_resolution_spin": self.max_resolution_spin,
+            "batch_size_spin": self.batch_size_spin,
+            "uniform_batch_check": self.uniform_batch_check,
+            "temporal_overlap_spin": self.temporal_overlap_spin,
+            "prepend_frames_spin": self.prepend_frames_spin,
+            "seed_spin": self.seed_spin,
+            "skip_first_frames_spin": self.skip_first_frames_spin,
+            "load_cap_spin": self.load_cap_spin,
+            "chunk_size_spin": self.chunk_size_spin,
+            "gpu_device_combo": self.gpu_device_combo,
+            "dit_offload_combo": self.dit_offload_combo,
+            "vae_offload_combo": self.vae_offload_combo,
+            "tensor_offload_combo": self.tensor_offload_combo,
+            "blocks_to_swap_spin": self.blocks_to_swap_spin,
+            "swap_io_check": self.swap_io_check,
+            "vae_encode_tiled_check": self.vae_encode_tiled_check,
+            "vae_encode_tile_size_spin": self.vae_encode_tile_size_spin,
+            "vae_encode_tile_overlap_spin": self.vae_encode_tile_overlap_spin,
+            "vae_decode_tiled_check": self.vae_decode_tiled_check,
+            "vae_decode_tile_size_spin": self.vae_decode_tile_size_spin,
+            "vae_decode_tile_overlap_spin": self.vae_decode_tile_overlap_spin,
+            "tile_debug_combo": self.tile_debug_combo,
+            "attention_mode_combo": self.attention_mode_combo,
+            "compile_dit_check": self.compile_dit_check,
+            "compile_vae_check": self.compile_vae_check,
+            "compile_backend_combo": self.compile_backend_combo,
+            "compile_mode_combo": self.compile_mode_combo,
+            "compile_fullgraph_check": self.compile_fullgraph_check,
+            "compile_dynamic_check": self.compile_dynamic_check,
+            "dynamo_cache_spin": self.dynamo_cache_spin,
+            "dynamo_recompile_spin": self.dynamo_recompile_spin,
+            "cache_dit_check": self.cache_dit_check,
+            "cache_vae_check": self.cache_vae_check,
+            "debug_check": self.debug_check,
+        }
+
+    def _serialize_model_settings(self) -> dict[str, Any]:
+        data: dict[str, Any] = {}
+        for key, widget in self._persistable_widgets.items():
+            if isinstance(widget, CheckableComboBox):
+                data[key] = widget.checkedTexts()
+            elif isinstance(widget, QComboBox):
+                data[key] = widget.currentText()
+            elif isinstance(widget, QSpinBox):
+                data[key] = widget.value()
+            elif isinstance(widget, QCheckBox):
+                data[key] = widget.isChecked()
+        return data
+
+    def _apply_model_settings(self, data: dict[str, Any]) -> None:
+        for key, value in data.items():
+            widget = self._persistable_widgets.get(key)
+            if widget is None:
+                continue
+            if isinstance(widget, CheckableComboBox) and isinstance(value, list):
+                widget.setCheckedTexts([str(v) for v in value])
+            elif isinstance(widget, QComboBox):
+                idx = widget.findText(str(value))
+                if idx >= 0:
+                    widget.setCurrentIndex(idx)
+            elif isinstance(widget, QSpinBox):
+                try:
+                    widget.setValue(int(value))
+                except (TypeError, ValueError):
+                    continue
+            elif isinstance(widget, QCheckBox):
+                widget.setChecked(bool(value))
+
+    def _save_model_settings(self) -> None:
+        s = QSettings(self._SETTINGS_ORG, self._SETTINGS_APP)
+        s.setValue("model_settings_json", json.dumps(self._serialize_model_settings()))
+
+    def _load_model_settings(self) -> None:
+        s = QSettings(self._SETTINGS_ORG, self._SETTINGS_APP)
+        raw = s.value("model_settings_json", "", type=str)
+        if not raw:
+            return
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+        if isinstance(data, dict):
+            self._apply_model_settings(data)
+
+    def _save_preset_dialog(self) -> None:
+        start = ""
+        s = QSettings(self._SETTINGS_ORG, self._SETTINGS_APP)
+        last = s.value("last_preset_path", "", type=str)
+        if last:
+            start = str(Path(last).parent)
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save GUI Preset",
+            start,
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if not path:
+            return
+        p = Path(path)
+        if p.suffix.lower() != ".json":
+            p = p.with_suffix(".json")
+        payload = {"version": 1, "model_settings": self._serialize_model_settings()}
+        try:
+            p.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except OSError as exc:
+            self._on_log(f"❌  Failed to save preset: {exc}")
+            return
+        s.setValue("last_preset_path", str(p))
+        self._on_log(f"✅  Preset saved: {p}")
+
+    def _load_preset_dialog(self) -> None:
+        s = QSettings(self._SETTINGS_ORG, self._SETTINGS_APP)
+        start = s.value("last_preset_path", "", type=str)
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load GUI Preset",
+            start,
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if not path:
+            return
+        self._load_preset_from_path(Path(path), write_last_path=True)
+
+    def _load_preset_from_path(self, path: Path, write_last_path: bool = False) -> None:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            self._on_log(f"❌  Failed to load preset: {exc}")
+            return
+        if not isinstance(payload, dict):
+            self._on_log("❌  Preset format is invalid.")
+            return
+        model_settings = payload.get("model_settings", {})
+        if not isinstance(model_settings, dict):
+            self._on_log("❌  Preset model_settings section is invalid.")
+            return
+        self._apply_model_settings(model_settings)
+        self._save_model_settings()
+        if write_last_path:
+            s = QSettings(self._SETTINGS_ORG, self._SETTINGS_APP)
+            s.setValue("last_preset_path", str(path))
+        self._on_log(f"✅  Preset loaded: {path}")
+
+    def _prompt_load_last_preset(self) -> None:
+        s = QSettings(self._SETTINGS_ORG, self._SETTINGS_APP)
+        last = s.value("last_preset_path", "", type=str).strip()
+        if not last:
+            return
+        p = Path(last)
+        if not p.is_file():
+            return
+        answer = QMessageBox.question(
+            self,
+            "Load last preset?",
+            f"Load the last used preset?\n\n{p}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self._load_preset_from_path(p, write_last_path=False)
+
+    def _queue_add_current_job(self) -> None:
+        if not self._settings_win.input_edit.text().strip():
+            self._on_log("⚠  Queue: set an input file/folder first.")
+            return
+        self._queue_entry_counter += 1
+        job = {
+            "id": self._queue_entry_counter,
+            "paths": {
+                "python_exe": self._settings_win.python_exe_edit.text().strip(),
+                "seedvr2_folder": self._settings_win.seedvr2_folder_edit.text().strip(),
+                "input_mode": self._settings_win.input_mode_combo.currentText(),
+                "input_path": self._settings_win.input_edit.text().strip(),
+                "output_path": self._settings_win.output_edit.text().strip(),
+                "model_dir": self._settings_win.model_dir_edit.text().strip(),
+            },
+            "model_settings": self._serialize_model_settings(),
+        }
+        self._queue_jobs.append(job)
+        self.queue_list.addItem(
+            f"#{job['id']}  {job['paths']['input_path']}  →  {job['paths']['output_path'] or 'auto'}"
+        )
+
+    def _queue_remove_selected(self) -> None:
+        row = self.queue_list.currentRow()
+        if row < 0 or row >= len(self._queue_jobs):
+            return
+        self._queue_jobs.pop(row)
+        self.queue_list.takeItem(row)
+
+    def _queue_clear_all(self) -> None:
+        self._queue_jobs.clear()
+        self.queue_list.clear()
+        self._queue_running = False
+
+    def _queue_run(self) -> None:
+        if not self._queue_jobs:
+            self._on_log("⚠  Queue is empty.")
+            return
+        if self.abort_btn.isEnabled():
+            self._on_log("⚠  Cannot start queue while a job is running.")
+            return
+        self._queue_running = True
+        self._run_next_queued_job()
+
+    def _run_next_queued_job(self) -> None:
+        if not self._queue_jobs:
+            self._queue_running = False
+            self._on_log("✅  Queue finished.")
+            return
+        job = self._queue_jobs[0]
+        paths = job["paths"]
+        self._settings_win.python_exe_edit.setText(str(paths.get("python_exe", "")))
+        self._settings_win.seedvr2_folder_edit.setText(str(paths.get("seedvr2_folder", "")))
+        self._settings_win.input_edit.setText(str(paths.get("input_path", "")))
+        self._settings_win.output_edit.setText(str(paths.get("output_path", "")))
+        self._settings_win.model_dir_edit.setText(str(paths.get("model_dir", "")))
+        mode = str(paths.get("input_mode", "File"))
+        idx = self._settings_win.input_mode_combo.findText(mode)
+        if idx >= 0:
+            self._settings_win.input_mode_combo.setCurrentIndex(idx)
+        model_settings = job.get("model_settings", {})
+        if isinstance(model_settings, dict):
+            self._apply_model_settings(model_settings)
+        inp = self._settings_win.input_edit.text().strip()
+        if inp and Path(inp).is_file():
+            self._load_preview(inp)
+        self._on_log(f"▶  Queue job #{job['id']} started.")
+        self._run()
+        # Remove the started job from visual queue list
+        self._queue_jobs.pop(0)
+        self.queue_list.takeItem(0)
+        if self._worker is None:
+            self._on_log(f"⚠  Queue job #{job['id']} could not start, skipping.")
+            self._run_next_queued_job()
 
     # ------------------------------------------------------------------
     # Preview / video loading
@@ -1468,15 +1895,20 @@ class MainWindow(QMainWindow):
 
         # Persist the current paths
         self._settings_win.save_settings()
+        self._save_model_settings()
+        self._set_latest_output_path(None)
 
         args = self._build_args()
 
         self._thread, self._worker = create_worker_thread(cli_script, args, python_exe)
         self._worker.log_line.connect(self._on_log)
-        self._worker.progress_update.connect(self._on_progress)
+        self._worker.progress_update.connect(self._on_global_progress)
+        self._worker.batch_progress_update.connect(self._on_batch_progress)
         self._worker.finished.connect(self._on_finished)
         self._worker.started_signal.connect(lambda: self._set_running(True))
 
+        self._run_started_at = time.time()
+        self._reset_progress_bars()
         self._set_running(True)
         self.status_label.setText("Starting…")
         self._thread.start()
@@ -1853,6 +2285,7 @@ class MainWindow(QMainWindow):
                 img = QPixmap(str(result))
                 if not img.isNull():
                     self._split_view.set_output_image(img.toImage())
+                    self._set_latest_output_path(result)
                     # Update metadata label with combined input | output info
                     reader = QImageReader(str(result))
                     size = reader.size()
@@ -1869,6 +2302,7 @@ class MainWindow(QMainWindow):
             return
         if out_path.is_file() and out_path.suffix.lower() in _video_exts:
             self._load_output_video(str(out_path))
+            self._set_latest_output_path(out_path)
             self._mode_output_btn.setChecked(True)
         elif out_path.is_dir():
             candidates = sorted(
@@ -1878,6 +2312,7 @@ class MainWindow(QMainWindow):
             )
             if candidates:
                 self._load_output_video(str(candidates[0]))
+                self._set_latest_output_path(candidates[0])
                 self._mode_output_btn.setChecked(True)
 
     # ------------------------------------------------------------------
@@ -1972,12 +2407,69 @@ class MainWindow(QMainWindow):
         ts = datetime.now().strftime("%H:%M:%S")
         self.console.append(f"[{ts}] {line}")
 
-    def _on_progress(self, cur: int, tot: int) -> None:
-        if tot > 0:
-            self.status_label.setText(f"Processing {cur}/{tot}")
+    def _reset_progress_bars(self) -> None:
+        self.global_progress.setRange(0, 100)
+        self.global_progress.setValue(0)
+        self.global_progress.setFormat("Total Progress: idle")
+        self.batch_progress.setRange(0, 100)
+        self.batch_progress.setValue(0)
+        self.batch_progress.setFormat("Batch Progress: idle")
+
+    def _format_seconds(self, seconds: float) -> str:
+        total = max(0, int(seconds))
+        return f"{total // 60}:{total % 60:02d}"
+
+    def _on_global_progress(self, cur: int, tot: int) -> None:
+        if tot <= 0:
+            return
+        self.global_progress.setRange(0, tot)
+        self.global_progress.setValue(max(0, min(cur, tot)))
+        self.global_progress.setFormat(f"Total Progress: {cur}/{tot}")
+
+        elapsed = 0.0 if self._run_started_at is None else (time.time() - self._run_started_at)
+        eta_text = "estimating…"
+        if cur > 0:
+            remaining = (elapsed / cur) * max(0, tot - cur)
+            eta_text = f"≈ {self._format_seconds(remaining)} remaining"
+        self.status_label.setText(
+            f"Processing {cur}/{tot}  |  {self._format_seconds(elapsed)} elapsed  |  {eta_text}"
+        )
+
+    def _on_batch_progress(self, cur: int, tot: int) -> None:
+        if tot <= 0:
+            return
+        self.batch_progress.setRange(0, tot)
+        self.batch_progress.setValue(max(0, min(cur, tot)))
+        self.batch_progress.setFormat(f"Batch Progress: {cur}/{tot}")
+
+    def _set_latest_output_path(self, path: Optional[Path]) -> None:
+        self._latest_output_path = path
+        self.open_output_folder_btn.setEnabled(path is not None)
+
+    def _open_output_folder(self) -> None:
+        if self._latest_output_path is None:
+            return
+        folder = (
+            self._latest_output_path
+            if self._latest_output_path.is_dir()
+            else self._latest_output_path.parent
+        )
+        if not folder.exists():
+            self._on_log(f"⚠  Output folder does not exist: {folder}")
+            return
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(folder))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(folder)])
+            else:
+                subprocess.Popen(["xdg-open", str(folder)])
+        except Exception as exc:
+            self._on_log(f"❌  Failed to open output folder: {exc}")
 
     def _on_finished(self, success: bool, msg: str) -> None:
         self._set_running(False)
+        self._run_started_at = None
         if success:
             self.status_label.setText(f"✅  {msg}")
             self._try_auto_load_output()
@@ -1987,7 +2479,23 @@ class MainWindow(QMainWindow):
                 self._on_mode_button(2, True)
         else:
             self.status_label.setText(f"⚠  {msg}")
+        if self.batch_progress.maximum() == self.batch_progress.value():
+            self.batch_progress.setFormat("Batch Progress: complete")
+        if self.global_progress.maximum() == self.global_progress.value():
+            self.global_progress.setFormat("Total Progress: complete")
+        if getattr(self, "_tray_icon", None) is not None:
+            self._tray_icon.showMessage(
+                "SeedVR2 GUI",
+                f"Processing finished: {msg}",
+                QSystemTrayIcon.MessageIcon.Information if success else QSystemTrayIcon.MessageIcon.Warning,
+                4000,
+            )
         self._is_preview_run = False
+        self._worker = None
+        self._thread = None
+
+        if self._queue_running:
+            self._run_next_queued_job()
 
     # ------------------------------------------------------------------
     # Settings persistence (delegated to SettingsWindow)
@@ -2009,6 +2517,51 @@ class MainWindow(QMainWindow):
         self.run_btn.setEnabled(not running)
         self.preview_btn.setEnabled(not running)
         self.abort_btn.setEnabled(running)
+        if hasattr(self, "queue_run_btn"):
+            self.queue_run_btn.setEnabled(not running)
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # type: ignore[override]
+        mime = event.mimeData()
+        if mime.hasUrls():
+            for url in mime.urls():
+                if url.isLocalFile():
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+
+    def dropEvent(self, event: QDropEvent) -> None:  # type: ignore[override]
+        urls = [u for u in event.mimeData().urls() if u.isLocalFile()]
+        if not urls:
+            event.ignore()
+            return
+        path = Path(urls[0].toLocalFile())
+        if path.is_dir():
+            self._settings_win.input_mode_combo.setCurrentText("Folder")
+            self._settings_win.input_edit.setText(str(path))
+            self._on_log(f"📂  Input folder set from drag-drop: {path}")
+        elif path.is_file():
+            self._settings_win.input_mode_combo.setCurrentText("File")
+            self._settings_win.input_edit.setText(str(path))
+            self._load_preview(str(path))
+            self._mode_input_btn.setChecked(True)
+            self._on_log(f"📂  Input file set from drag-drop: {path}")
+        event.acceptProposedAction()
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._save_model_settings()
+        if getattr(self, "_tray_icon", None) is not None and not self._force_exit:
+            self.hide()
+            event.ignore()
+            if not self._tray_tip_shown:
+                self._tray_icon.showMessage(
+                    "SeedVR2 GUI",
+                    "SeedVR2 GUI is still running in the system tray.",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    3500,
+                )
+                self._tray_tip_shown = True
+            return
+        super().closeEvent(event)
 
 
 # ---------------------------------------------------------------------------

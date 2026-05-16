@@ -31,3 +31,9 @@ The .exe will be created in `dist/SeedVR2_GUI.exe`.
 ## Notes
 - The GUI wraps `inference_cli.py` and does not modify any core logic.
 - All console output from the CLI is streamed in real-time.
+- Dual progress bars show total and per-batch progress with elapsed/ETA status.
+- Right-panel model/processing settings are persisted across launches.
+- Drag-and-drop supports input files/folders directly onto the main window.
+- Presets can be saved/loaded as JSON from the right panel.
+- A job queue panel can enqueue multiple jobs for sequential execution.
+- System tray integration keeps the app running in the background and shows completion notifications.
