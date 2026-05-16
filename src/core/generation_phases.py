@@ -516,6 +516,12 @@ def encode_all_batches(
             
             del cond_latents
             
+            # Clear GPU cache between encode batches to prevent VRAM accumulation
+            if ctx['vae_device'].type == 'cuda':
+                torch.cuda.empty_cache()
+            elif ctx['vae_device'].type == 'mps':
+                torch.mps.empty_cache()
+            
             debug.end_timer(f"encode_batch_{encode_idx+1}", f"Encoded batch {encode_idx+1}")
             
             if progress_callback:
@@ -748,6 +754,12 @@ def upscale_all_batches(
             ctx['all_latents'][batch_idx] = None
             
             del noises, aug_noises, latent, conditions, condition, base_noise, upscaled_latents
+            
+            # Clear GPU cache between upscale batches to prevent VRAM accumulation
+            if ctx['dit_device'].type == 'cuda':
+                torch.cuda.empty_cache()
+            elif ctx['dit_device'].type == 'mps':
+                torch.mps.empty_cache()
             
             debug.end_timer(f"upscale_batch_{upscale_idx+1}", f"Upscaled batch {upscale_idx+1}")
             
@@ -1027,6 +1039,12 @@ def decode_all_batches(
             release_tensor_memory(ctx['all_upscaled_latents'][batch_idx])
             ctx['all_upscaled_latents'][batch_idx] = None
             del upscaled_latent, sample
+            
+            # Clear GPU cache between decode batches to prevent VRAM accumulation
+            if ctx['vae_device'].type == 'cuda':
+                torch.cuda.empty_cache()
+            elif ctx['vae_device'].type == 'mps':
+                torch.mps.empty_cache()
             
             debug.end_timer(f"decode_batch_{decode_idx+1}", f"Decoded batch {decode_idx+1}")
             

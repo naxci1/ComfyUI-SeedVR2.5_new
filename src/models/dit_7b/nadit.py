@@ -224,6 +224,7 @@ class NaDiTUpscaler(nn.Module):
         window_method: Optional[Tuple[str]] = None,
         temporal_window_size: int = None,
         temporal_shifted: bool = False,
+        attention_mode: str = 'sdpa',
         **kwargs,
     ):
         ada = get_ada_layer(ada)

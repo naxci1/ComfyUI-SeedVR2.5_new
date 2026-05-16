@@ -9,6 +9,33 @@ import torch
 from typing import List
 
 
+def configure_cuda_backends():
+    """
+    Configure CUDA backend settings for optimal inference performance.
+    
+    Enables TF32 precision for matmul/convolutions (19-bit mantissa, ~2× throughput
+    on Ampere+ GPUs with negligible quality impact) and CuDNN benchmark mode for
+    automatic kernel selection.
+    
+    Safe to call multiple times; idempotent. Only applies when CUDA is available.
+    """
+    if not torch.cuda.is_available():
+        return
+    
+    # TF32: Use Tensor Cores with TF32 precision for float32 matmuls and convolutions
+    # Provides ~2× throughput on Ampere+ with ~0.1% numerical difference
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    
+    # CuDNN benchmark: Auto-tune convolution algorithms for current hardware
+    # Trades ~1s warmup per unique shape for optimal kernel selection
+    torch.backends.cudnn.benchmark = True
+
+
+# Apply CUDA backend optimizations at import time for all inference paths
+configure_cuda_backends()
+
+
 def optimized_channels_to_last(tensor):
     """🚀 Optimized replacement for rearrange(tensor, 'b c ... -> b ... c')
     Moves channels from position 1 to last position using PyTorch native operations.

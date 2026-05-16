@@ -374,7 +374,7 @@ def _configure_blocks(
             block.to(device)
             total_main_memory += block_memory
         else:
-            block.to(offload_device, non_blocking=False)
+            block.to(offload_device, non_blocking=True)
             total_offload_memory += block_memory
 
     # Ensure all buffers match their containing module's device
@@ -382,7 +382,7 @@ def _configure_blocks(
         target_device = device if b > model.blocks_to_swap else offload_device
         for name, buffer in block.named_buffers():
             if buffer.device != torch.device(target_device):
-                buffer.data = buffer.data.to(target_device, non_blocking=False)
+                buffer.data = buffer.data.to(target_device, non_blocking=True)
 
     return {
         "offload_memory": total_offload_memory,
@@ -503,13 +503,37 @@ def _wrap_block_forward(
             target_device = torch.device(model.main_device)
             
             if current_device != target_device:
-                self.to(model.main_device, non_blocking=False)
+                self.to(model.main_device, non_blocking=True)
+                # Synchronize to ensure parameters are fully transferred before computation
+                if target_device.type == 'cuda':
+                    torch.cuda.current_stream(target_device).synchronize()
+
+            # Pre-fetch next block asynchronously while this block executes
+            # This overlaps CPU→GPU transfer of block N+1 with computation of block N
+            next_idx = self._block_idx + 1
+            prefetch_stream = None
+            if (target_device.type == 'cuda' and 
+                hasattr(model, 'blocks') and next_idx < len(model.blocks) and
+                next_idx <= model.blocks_to_swap):
+                next_block = model.blocks[next_idx]
+                try:
+                    next_device = next(next_block.parameters()).device
+                    if next_device != target_device:
+                        prefetch_stream = torch.cuda.Stream(target_device)
+                        with torch.cuda.stream(prefetch_stream):
+                            next_block.to(model.main_device, non_blocking=True)
+                except StopIteration:
+                    pass
 
             # Execute forward pass with OOM protection
             output = original_forward(*args, **kwargs)
 
-            # Move back to offload device
-            self.to(model.offload_device, non_blocking=False)
+            # Synchronize pre-fetch stream before swapping out current block
+            if prefetch_stream is not None:
+                prefetch_stream.synchronize()
+
+            # Move back to offload device (non-blocking: next swap-in will synchronize)
+            self.to(model.offload_device, non_blocking=True)
             
             # Use dynamo-disabled helper to log timing (avoids compilation warnings)
             _log_swap_timing(debug, t_start, self._block_idx, "block")
@@ -582,13 +606,16 @@ def _wrap_io_forward(
         
         # Move to GPU for computation if needed
         if current_device != target_device:
-            self.to(model.main_device, non_blocking=False)
+            self.to(model.main_device, non_blocking=True)
+            # Synchronize to ensure parameters are fully transferred before computation
+            if target_device.type == 'cuda':
+                torch.cuda.current_stream(target_device).synchronize()
 
         # Execute forward pass
         output = self._original_forward(*args, **kwargs)
 
-        # Move back to offload device
-        self.to(model.offload_device, non_blocking=False)
+        # Move back to offload device (non-blocking: next swap-in will synchronize)
+        self.to(model.offload_device, non_blocking=True)
         
         # Use dynamo-disabled helper to log timing (avoids compilation warnings)
         _log_swap_timing(debug, t_start, self._module_name, "I/O")

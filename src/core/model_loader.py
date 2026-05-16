@@ -199,7 +199,7 @@ def _load_gguf_state(checkpoint_path: str, device: torch.device, debug: Optional
         
         # Create tensor directly on target device to avoid CPU->GPU copy overhead
         # For meta-initialized models, this directly materializes to the target device
-        torch_tensor = torch.from_numpy(tensor.data).to(device, non_blocking=False)
+        torch_tensor = torch.from_numpy(tensor.data).to(device, non_blocking=True)
             
         # Get original shape from metadata or infer from tensor shape
         shape = _get_tensor_logical_shape(reader, tensor_name)

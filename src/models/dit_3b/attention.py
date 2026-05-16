@@ -18,7 +18,8 @@ import torch.nn.functional as F
 # Import flash/sage attn with automatic fallback from compatibility layer
 from ...optimization.compatibility import (
     call_flash_attn_2_varlen, call_flash_attn_3_varlen,
-    call_sage_attn_2_varlen, call_sage_attn_3_varlen
+    call_sage_attn_2_varlen, call_sage_attn_2_int8_varlen,
+    call_sage_attn_3_varlen
 )
 
 from torch import nn

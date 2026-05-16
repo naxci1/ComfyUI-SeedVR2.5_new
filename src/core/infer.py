@@ -142,16 +142,16 @@ class VideoDiffusionInfer():
             else:
                 batches = [sample.unsqueeze(0) for sample in samples]
 
+            # Detect VAE model dtype once (avoids repeated iteration)
+            try:
+                vae_dtype = next(self.vae.parameters()).dtype
+            except StopIteration:
+                vae_dtype = dtype  # Fallback
+
             # VAE process by each group.
             for sample in batches:
                 if hasattr(self.vae, "preprocess"):
                     sample = self.vae.preprocess(sample)
-
-                # Detect VAE model dtype
-                try:
-                    vae_dtype = next(self.vae.parameters()).dtype
-                except StopIteration:
-                    vae_dtype = dtype  # Fallback
 
                 # Use autocast if VAE dtype differs from input dtype
                 # Skip autocast on MPS (only supports bf16, unified memory = no benefit)
@@ -183,10 +183,19 @@ class VideoDiffusionInfer():
                         latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
                                             tile_overlap=self.encode_tile_overlap).posterior.mode().squeeze(2)
 
+                # Free input sample to reduce VRAM pressure
+                del sample
+
                 latent = latent.unsqueeze(2) if latent.ndim == 4 else latent
                 latent = optimized_channels_to_last(latent)
                 latent = (latent - shift) * scale
                 latents.append(latent)
+
+                # Clear GPU cache between encode iterations to prevent VRAM accumulation
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                elif device.type == 'mps':
+                    torch.mps.empty_cache()
 
             # Ungroup back to individual latent with the original order.
             if self.config.vae.grouping:
@@ -201,7 +210,11 @@ class VideoDiffusionInfer():
 
     @torch.no_grad()
     def vae_decode(self, latents: List[Tensor]) -> List[Tensor]:
-        """VAE decode with configured dtype - converts latents to samples with optional tiling"""
+        """VAE decode with configured dtype - converts latents to samples with optional tiling.
+        
+        On CUDA devices with FP8 support (Blackwell/Hopper), uses FP8 autocast for reduced
+        VRAM usage. Aggressively clears GPU cache after each frame to prevent accumulation.
+        """
         samples = []
         if len(latents) > 0:
             # Use VAE model's current device
@@ -229,20 +242,33 @@ class VideoDiffusionInfer():
 
             self.debug.log(f"Latents shape: {latents[0].shape}", category="info", indent_level=1)
 
+            # Detect VAE model dtype once (avoids repeated iteration)
+            try:
+                vae_dtype = next(self.vae.parameters()).dtype
+            except StopIteration:
+                vae_dtype = dtype  # Fallback
+
+            # Check FP8 capability for VRAM-efficient decoding on Blackwell/Hopper
+            use_fp8_decode = (
+                device.type == 'cuda' and 
+                vae_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+            )
+
             for i, latent in enumerate(latents):
                 latent = latent / scale + shift
                 latent = optimized_channels_to_second(latent)
                 latent = latent.squeeze(2)
 
-                # Detect VAE model dtype
-                try:
-                    vae_dtype = next(self.vae.parameters()).dtype
-                except StopIteration:
-                    vae_dtype = dtype  # Fallback
-
-                # Use autocast if VAE dtype differs from latent dtype
-                # Skip autocast on MPS (only supports bf16, unified memory = no benefit)
-                if vae_dtype != latent.dtype:
+                # Decode with appropriate precision handling
+                if use_fp8_decode:
+                    # FP8 VAE: model weights are FP8, use bfloat16 autocast for activations
+                    with torch.autocast(device.type, torch.bfloat16, enabled=True):
+                        sample = self.vae.decode(
+                            latent,
+                            tiled=self.decode_tiled, tile_size=self.decode_tile_size,
+                            tile_overlap=self.decode_tile_overlap
+                        ).sample
+                elif vae_dtype != latent.dtype:
                     if device.type == 'mps':
                         # MPS: explicit dtype conversion instead of autocast
                         latent = latent.to(vae_dtype)
@@ -265,10 +291,20 @@ class VideoDiffusionInfer():
                         tile_overlap=self.decode_tile_overlap
                     ).sample
 
+                # Free input latent to reduce VRAM pressure before postprocess
+                del latent
+
                 if hasattr(self.vae, "postprocess"):
                     sample = self.vae.postprocess(sample)
 
                 samples.append(sample)
+
+                # Aggressive cache clearing between decode iterations
+                # Critical for 16GB VRAM systems processing high-res frames
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                elif device.type == 'mps':
+                    torch.mps.empty_cache()
 
             if self.config.vae.grouping:
                 samples = na.unpack(samples, indices)
