@@ -14,6 +14,12 @@ QMainWindow {
     background-color: #111214;
 }
 
+QWidget#top_bar {
+    background-color: #1A1C1E;
+    border: 1px solid #272A2D;
+    border-radius: 6px;
+}
+
 QMenuBar, QMenu {
     background-color: #1A1C1E;
     color: #E3E4E6;
@@ -219,5 +225,22 @@ QToolTip {
     border: 1px solid #2A2D31;
     border-radius: 6px;
     padding: 4px 8px;
+}
+
+/* Topaz v5 radius normalization */
+QPushButton,
+QLineEdit,
+QSpinBox,
+QDoubleSpinBox,
+QComboBox,
+QProgressBar,
+QTextEdit,
+QGroupBox,
+QScrollArea,
+QVideoWidget,
+QGraphicsView,
+QStackedWidget,
+QCheckBox::indicator {
+    border-radius: 6px;
 }
 """

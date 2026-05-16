@@ -13,7 +13,6 @@ import time
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import subprocess
 import sys
-import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -447,7 +446,7 @@ class _ZoomableImageView(QGraphicsView):
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         self.setMinimumHeight(300)
         self.setStyleSheet(
-            "background:#0d0d0d; border:1px solid #2a2a2a; border-radius:4px;"
+            "background:#0d0d0d; border:1px solid #2a2a2a; border-radius:6px;"
         )
 
     def set_pixmap(self, pix: QPixmap) -> None:
@@ -638,7 +637,7 @@ class MainWindow(QMainWindow):
         self._thread = None
         self._worker = None
         self._input_meta_text: str = ""   # last "Input: …" string for dual metadata
-        self._preview_temp_path: Optional[str] = None  # temp file for Preview runs
+        self._preview_temp_path: Optional[str] = None  # preview input frame path
         self._is_preview_run: bool = False  # flag: switch to Split View on finish
         self._run_started_at: Optional[float] = None
         self._latest_output_path: Optional[Path] = None
@@ -703,6 +702,7 @@ class MainWindow(QMainWindow):
 
         # ── 1. Header ──────────────────────────────────────────────────
         header_widget = QWidget()
+        header_widget.setObjectName("top_bar")
         header_layout = QHBoxLayout(header_widget)
         header_layout.setContentsMargins(6, 2, 6, 6)
         header_layout.setSpacing(10)
@@ -719,9 +719,9 @@ class MainWindow(QMainWindow):
             lambda: QDesktopServices.openUrl(QUrl("https://github.com/naxci1/ComfyUI-SeedVR2.5_new"))
         )
 
-        settings_btn = QPushButton("⚙  Settings")
+        settings_btn = QPushButton("⚙")
         settings_btn.setToolTip("Open Paths & Configuration settings")
-        settings_btn.setMinimumWidth(110)
+        settings_btn.setMinimumWidth(38)
         settings_btn.clicked.connect(self._open_settings)
 
         header_layout.addWidget(help_btn)
@@ -990,7 +990,7 @@ class MainWindow(QMainWindow):
         container_layout.addWidget(g)
 
         # ── Output Settings ────────────────────────────────────────────
-        g, f = _make_group("Output Settings")
+        g, f = _make_group("Export Settings")
         self.container_combo = QComboBox()
         self.container_combo.addItems(list(EXPORT_CODEC_PROFILES.keys()))
         self.container_combo.currentTextChanged.connect(self._update_export_controls)
@@ -1012,7 +1012,8 @@ class MainWindow(QMainWindow):
         f.addRow("Audio:", self.audio_mode_combo)
 
         self.video_backend_combo = QComboBox()
-        self.video_backend_combo.addItems(["opencv", "ffmpeg"])
+        self.video_backend_combo.addItems(["ffmpeg"])
+        self.video_backend_combo.setEnabled(False)
         f.addRow("Video Backend:", self.video_backend_combo)
 
         self.use_10bit_check = QCheckBox()
@@ -1541,6 +1542,40 @@ class MainWindow(QMainWindow):
         profile = EXPORT_CODEC_PROFILES.get(container, {}).get(codec, {})
         return bool(profile.get("is_10bit", False))
 
+    def _resolve_export_output_dir(self) -> Path:
+        """Return the export directory from Settings output path (file or directory)."""
+        out_raw = self._settings_win.output_edit.text().strip()
+        if out_raw:
+            out_path = Path(out_raw)
+            # Existing directory => use it.
+            if out_path.exists() and out_path.is_dir():
+                return out_path
+            # If user entered a file-like path, use its parent directory.
+            if out_path.suffix:
+                return out_path.parent if str(out_path.parent) else Path.cwd()
+            # Non-existing path without suffix: treat as target directory.
+            return out_path
+        # Fallback: input parent directory.
+        inp = self._settings_win.input_edit.text().strip()
+        if inp:
+            return Path(inp).parent
+        return Path.cwd()
+
+    @staticmethod
+    def _ensure_unique_file_path(path: Path) -> Path:
+        """Return a non-colliding file path by appending _N before suffix."""
+        if not path.exists():
+            return path
+        stem = path.stem
+        suffix = path.suffix
+        parent = path.parent
+        counter = 1
+        while True:
+            candidate = parent / f"{stem}_{counter}{suffix}"
+            if not candidate.exists():
+                return candidate
+            counter += 1
+
     def _serialize_model_settings(self) -> dict[str, Any]:
         data: dict[str, Any] = {}
         for key, widget in self._persistable_widgets.items():
@@ -1857,7 +1892,15 @@ class MainWindow(QMainWindow):
 
         # output
         out = self._settings_win.output_edit.text().strip()
-        if out:
+        if self._is_preview_run:
+            # Preview must write to an explicit PNG file in the selected export directory.
+            export_dir = self._resolve_export_output_dir()
+            preview_out = self._ensure_unique_file_path(
+                export_dir / "preview_upscaled_frame_001.png"
+            )
+            self._settings_win.output_edit.setText(str(preview_out))
+            args += ["--output", str(preview_out)]
+        elif out:
             args += ["--output", out]
 
         # model dir
@@ -1877,8 +1920,8 @@ class MainWindow(QMainWindow):
             container = self.container_combo.currentText().lower()
             args += ["--output_format", container or "mp4"]
 
-        # video backend
-        # Video backend + custom codec args
+        # video backend (FFmpeg-only)
+        args += ["--video_backend", "ffmpeg"]
         # Emit ffmpeg_video_args when a custom (non-default) video codec is selected and we
         # are running an actual export (not a preview PNG run).
         if not self._is_preview_run and not self.export_image_sequence_check.isChecked():
@@ -1887,16 +1930,6 @@ class MainWindow(QMainWindow):
             if video_codec_args:
                 import json as _json
                 args += ["--ffmpeg_video_args", _json.dumps(video_codec_args)]
-                # custom codecs always need the ffmpeg backend
-                args += ["--video_backend", "ffmpeg"]
-            else:
-                vb = self.video_backend_combo.currentText()
-                if vb != "opencv":
-                    args += ["--video_backend", vb]
-        else:
-            vb = self.video_backend_combo.currentText()
-            if vb != "opencv":
-                args += ["--video_backend", vb]
 
         # 10-bit: either explicitly requested or implied by selected export profile
         if self.use_10bit_check.isChecked() or self._selected_profile_is_10bit():
@@ -2183,7 +2216,11 @@ class MainWindow(QMainWindow):
         self._release_cuda_resources()
         if getattr(self, "_tray_icon", None) is not None:
             self._tray_icon.hide()
-        QApplication.instance().quit()
+            self._tray_icon.deleteLater()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+        raise SystemExit(0)
 
     def _preview_run(self) -> None:
         """Capture the currently displayed video frame, save to a temp PNG,
@@ -2254,17 +2291,15 @@ class MainWindow(QMainWindow):
             self._on_log("⚠  Preview: no frame available – play or pause a video first.")
             return
 
-        # Save to a temporary PNG file (persist across the upscale run)
-        if self._preview_temp_path and os.path.isfile(self._preview_temp_path):
-            try:
-                os.remove(self._preview_temp_path)
-            except OSError:
-                pass
-        tmp = tempfile.NamedTemporaryFile(suffix="_preview.png", delete=False)
-        tmp.close()
-        self._preview_temp_path = tmp.name
+        # Save preview input frame directly inside the selected export directory.
+        export_dir = self._resolve_export_output_dir()
+        export_dir.mkdir(parents=True, exist_ok=True)
+        preview_input = self._ensure_unique_file_path(
+            export_dir / "preview_input_frame_001.png"
+        )
+        self._preview_temp_path = str(preview_input)
         if not frame_img.save(self._preview_temp_path, "PNG"):
-            self._on_log(f"⚠  Preview: could not save temp frame to {self._preview_temp_path}")
+            self._on_log(f"⚠  Preview: could not save input frame to {self._preview_temp_path}")
             return
 
         self._on_log(f"ℹ  Preview: captured frame → {self._preview_temp_path}")
@@ -2273,9 +2308,9 @@ class MainWindow(QMainWindow):
         # Also set an explicit output PNG path so the CLI never tries to create a video from
         # a single-image input (which caused the cv2.imwrite crash on .mp4 extension).
         self._settings_win.input_edit.setText(self._preview_temp_path)
-        preview_out_png = str(Path(self._preview_temp_path).with_name(
-            Path(self._preview_temp_path).stem + "_upscaled.png"
-        ))
+        preview_out_png = str(
+            self._ensure_unique_file_path(export_dir / "preview_upscaled_frame_001.png")
+        )
         self._settings_win.output_edit.setText(preview_out_png)
         self.batch_size_spin.setValue(1)
         self._is_preview_run = True
@@ -2572,6 +2607,10 @@ class MainWindow(QMainWindow):
             )
 
             def _find_image_output() -> Optional[Path]:
+                # Explicit file path already points to image output.
+                if out_path.is_file() and out_path.suffix.lower() in _image_exts:
+                    return out_path
+
                 # Build ordered list of extensions to try: preferred ext first, then all others.
                 _all_img_exts = [".png", ".jpg", ".jpeg", ".webp", ".tiff", ".tif", ".bmp"]
                 if _preferred_ext:
@@ -2678,7 +2717,7 @@ class MainWindow(QMainWindow):
         _btn_font.setPointSize(12)
 
         _stepper_ss = (
-            "QPushButton { background-color: #222222; border: 1px solid #444; border-radius: 4px; }"
+            "QPushButton { background-color: #222222; border: 1px solid #444; border-radius: 6px; }"
             "QPushButton:hover { background-color: #2e2e2e; }"
             "QPushButton:pressed { background-color: #1a1a1a; }"
         )

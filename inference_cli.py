@@ -145,7 +145,7 @@ class FFMPEGVideoWriter:
     
     Provides cv2.VideoWriter-compatible interface (write, isOpened, release) while
     using ffmpeg for encoding. Enables 10-bit output (yuv420p10le with x265) which
-    reduces banding artifacts in gradients compared to 8-bit opencv output.
+    reduces banding artifacts in gradients compared to standard 8-bit encodes.
     
     Args:
         path: Output video file path
@@ -806,7 +806,7 @@ def save_frames_to_video(
     output_path: str, 
     fps: float = 30.0,
     writer: Optional[cv2.VideoWriter] = None,
-    video_backend: str = "opencv",
+    video_backend: str = "ffmpeg",
     use_10bit: bool = False,
     custom_video_args: Optional[List[str]] = None,
 ) -> Optional[cv2.VideoWriter]:
@@ -822,7 +822,7 @@ def save_frames_to_video(
         output_path: Output video file path (directory created if doesn't exist)
         fps: Frames per second for output video (default: 30.0)
         writer: Existing VideoWriter for streaming (if None, creates new one)
-        video_backend: "opencv" or "ffmpeg"
+        video_backend: reserved for backwards compatibility (FFmpeg-only export path)
         use_10bit: When video_backend=ffmpeg and custom_video_args is None, use x265/10-bit
         custom_video_args: Optional list of ffmpeg video encoding args (overrides codec/pix_fmt
                            defaults). Implies video_backend=ffmpeg.
@@ -836,18 +836,14 @@ def save_frames_to_video(
     frames_np = (frames_tensor.cpu().numpy() * 255.0).astype(np.uint8)
     T, H, W, C = frames_np.shape
     
-    # custom_video_args always means ffmpeg
-    effective_backend = "ffmpeg" if custom_video_args else video_backend
+    # FFmpeg-only export backend (OpenCV VideoWriter path intentionally removed)
+    effective_backend = "ffmpeg"
     
     if writer is None:
         debug.log(f"Saving {T} frames to video: {output_path} (backend={effective_backend})", category="file")
         os.makedirs(Path(output_path).parent, exist_ok=True)
-        if effective_backend == "ffmpeg":
-            writer = FFMPEGVideoWriter(output_path, W, H, fps, use_10bit,
-                                       custom_video_args=custom_video_args)
-        else:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            writer = cv2.VideoWriter(output_path, fourcc, fps, (W, H))
+        writer = FFMPEGVideoWriter(output_path, W, H, fps, use_10bit,
+                                   custom_video_args=custom_video_args)
         if not writer.isOpened():
             raise ValueError(f"Cannot create video writer for: {output_path}")
     
@@ -1429,8 +1425,8 @@ Examples:
     io_group.add_argument("--output_format", type=str, default=None,
                         help="Output format/container: 'png' (image sequence), 'mp4', 'mov', 'mkv', 'webm'. "
                              "Default: auto-detect from input type")
-    io_group.add_argument("--video_backend", type=str, default="opencv", choices=["opencv", "ffmpeg"],
-                        help="Video encoder backend: 'opencv' (default) or 'ffmpeg' (requires ffmpeg in PATH)")
+    io_group.add_argument("--video_backend", type=str, default="ffmpeg", choices=["ffmpeg"],
+                        help="Video encoder backend (FFmpeg-only). Requires ffmpeg in PATH.")
     io_group.add_argument("--10bit", dest="use_10bit", action="store_true",
                         help="Save 10-bit video with x265 codec (reduces banding). Without this flag, "
                          "ffmpeg uses x264 for maximum compatibility. Requires --video_backend ffmpeg")
@@ -1629,7 +1625,7 @@ def main() -> None:
         args.video_backend = "ffmpeg"
     
     if args.video_backend == "ffmpeg" and shutil.which("ffmpeg") is None:
-        debug.log("--video_backend ffmpeg requires ffmpeg in PATH. Install ffmpeg or use --video_backend opencv", 
+        debug.log("--video_backend ffmpeg requires ffmpeg in PATH. Install ffmpeg and retry.", 
                  level="ERROR", category="setup", force=True)
         sys.exit(1)
     
