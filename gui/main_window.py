@@ -1153,15 +1153,8 @@ class MainWindow(QMainWindow):
         self.max_resolution_spin.setToolTip("0 = no limit")
         f.addRow("Max Resolution:", self.max_resolution_spin)
 
-        self.batch_size_spin = QSpinBox()
-        self.batch_size_spin.setRange(1, 10001)
-        self.batch_size_spin.setSingleStep(4)
-        self.batch_size_spin.setValue(81)
-        self.batch_size_spin.setToolTip(
-            "Must be 4k+1: 1, 5, 9, 13, … (automatically snapped when typed)"
-        )
-        self.batch_size_spin.valueChanged.connect(self._snap_batch_size)
-        f.addRow("Batch Size:", self.batch_size_spin)
+        # Batch Size – custom ±4 stepper enforces strict 4k+1 values
+        f.addRow("Batch Size:", self._build_batch_stepper())
 
         self.uniform_batch_check = QCheckBox()
         f.addRow("Uniform Batch Size:", self.uniform_batch_check)

@@ -665,21 +665,23 @@ def process_single_file(input_path: str, args: "argparse.Namespace", device_list
                 'frames_to_process': frames_to_process,
             }
             result = _gpu_processing(None, device_list, args, video_info=video_info)
-            if ds_factor > 1:
-                result = _apply_lanczos_downscale(result, ds_factor)
-            
+            # NOTE: Lanczos downscale is now applied to INPUT frames inside
+            # _stream_video_chunks (called by each GPU worker), so no post-processing
+            # downscale is needed here.
+
             # Save result
             if is_png:
-                save_frames_to_image(result, output_path, base_name)
+                save_frames_to_image(result, output_path, base_name,
+                                     image_format=args.output_format)
             else:
-                video_writer = save_frames_to_video(result, output_path, fps, 
+                video_writer = save_frames_to_video(result, output_path, fps,
                     video_backend=args.video_backend, use_10bit=args.use_10bit,
                     custom_video_args=custom_video_args)
                 if video_writer is not None:
                     video_writer.release()
-            
+
             frames_written = result.shape[0]
-        
+
         # Single GPU: stream in main process
         else:
             chunk_count = 0
@@ -697,9 +699,9 @@ def process_single_file(input_path: str, args: "argparse.Namespace", device_list
                 cleanup_timer_name="chunk_cleanup"
             ):
                 chunk_count += 1
-                # Apply pre-downscale Lanczos if requested
-                if ds_factor > 1:
-                    result = _apply_lanczos_downscale(result, ds_factor)
+                # NOTE: Lanczos downscale is applied to input frames inside
+                # _stream_video_chunks, so the result here is already at the
+                # correct (upscaled) resolution.
                 # Save output
                 if is_png:
                     save_frames_to_image(result, output_path, base_name,
@@ -709,10 +711,10 @@ def process_single_file(input_path: str, args: "argparse.Namespace", device_list
                     video_writer = save_frames_to_video(result, output_path, fps, writer=video_writer,
                         video_backend=args.video_backend, use_10bit=args.use_10bit,
                         custom_video_args=custom_video_args)
-                
+
                 frames_written += result.shape[0]
                 del result
-            
+
             chunk_idx = chunk_count
             cap.release()
             if video_writer is not None:
@@ -730,7 +732,25 @@ def process_single_file(input_path: str, args: "argparse.Namespace", device_list
     
     # === IMAGE PROCESSING ===
     frames_tensor, _ = extract_frames_from_image(input_path)
-    
+
+    # Apply pre-downscale Lanczos to input image and resolve effective resolution
+    img_ds_factor = getattr(args, "pre_downscale", 1) or 1
+    _, img_h, img_w, _ = frames_tensor.shape
+    args.resolution = _resolve_effective_resolution(args, img_w, img_h)
+    if img_ds_factor > 1:
+        debug.log(
+            f"Pre-Downscale {img_ds_factor}:1 on image: "
+            f"{img_w}×{img_h} → {img_w // img_ds_factor}×{img_h // img_ds_factor} px",
+            category="info", force=True, indent_level=1,
+        )
+        frames_tensor = _apply_lanczos_downscale(
+            frames_tensor.to(torch.float32), img_ds_factor
+        ).to(torch.float16)
+    debug.log(
+        f"Effective target resolution: {args.resolution} px (short side)",
+        category="info", force=True, indent_level=1,
+    )
+
     processing_start = time.time()
     # Process frames (multiprocessing only for multi-GPU)
     if len(device_list) > 1:
@@ -738,12 +758,12 @@ def process_single_file(input_path: str, args: "argparse.Namespace", device_list
     else:
         result = _single_gpu_direct_processing(frames_tensor, args, device_list[0], runner_cache)
     debug.log(f"Processing time: {time.time() - processing_start:.2f}s", category="timing")
-    
+
     # Save single image
     os.makedirs(Path(output_path).parent, exist_ok=True)
     frame_np = (result[0].cpu().numpy() * 255.0).astype(np.uint8)
     _save_image_bgr(frame_np, output_path)
-    
+
     debug.log(f"Output saved to: {output_path}", category="file", force=True)
     return 1
 
@@ -815,7 +835,9 @@ def _stream_video_chunks(
     prev_raw_tail = None
     chunk_idx = 0
     streaming = chunk_size < frames_to_process
-    
+    # Pre-downscale factor – applied to each chunk's raw frames before processing
+    ds_factor = getattr(chunk_args, "pre_downscale", 1) or 1
+
     while frames_read < frames_to_process:
         read_count = min(chunk_size, frames_to_process - frames_read)
         new_frames = _read_frames_from_cap(cap, read_count)
@@ -823,11 +845,17 @@ def _stream_video_chunks(
             break
         frames_read += new_frames.shape[0]
         chunk_idx += 1
-        
+
+        # Apply pre-downscale Lanczos to raw input frames before processing.
+        # This must happen BEFORE overlap concatenation so that prev_raw_tail
+        # and new_frames are both at the downscaled resolution.
+        if ds_factor > 1:
+            new_frames = _apply_lanczos_downscale(new_frames, ds_factor)
+
         # Disable prepend_frames after first chunk
         if chunk_idx > 1:
             chunk_args.prepend_frames = 0
-        
+
         # Prepend context from previous chunk
         if prev_raw_tail is not None and overlap > 0:
             context_count = min(overlap, prev_raw_tail.shape[0])
@@ -835,17 +863,17 @@ def _stream_video_chunks(
         else:
             frames = new_frames
             context_count = 0
-        
+
         # Log progress if enabled
         if log_progress and streaming:
             if chunk_idx > 1:
                 debug.log("", category="none", force=True)
                 debug.log("━" * 60, category="none", force=True)
             debug.log("", category="none", force=True)
-            debug.log(f"{log_prefix}Chunk {chunk_idx}/{total_chunks}: {new_frames.shape[0]} new + {context_count} context frames", 
+            debug.log(f"{log_prefix}Chunk {chunk_idx}/{total_chunks}: {new_frames.shape[0]} new + {context_count} context frames",
                      category="generation", force=True)
             debug.log("", category="none", force=True)
-        
+
         # Process chunk
         result = _process_frames_core(
             frames_tensor=frames.to(torch.float16),
@@ -854,19 +882,19 @@ def _stream_video_chunks(
             debug=debug,
             runner_cache=runner_cache
         )
-        
+
         # Remove context frames from output
         if context_count > 0:
             result = result[context_count:]
-        
-        # Save tail for next chunk context
+
+        # Save tail for next chunk context (downscaled frames for consistency)
         prev_raw_tail = new_frames[-overlap:].clone() if overlap > 0 else None
-        
+
         # Cleanup before yield
         del frames
-        
+
         yield result
-        
+
         # Memory cleanup between chunks
         if streaming:
             clear_memory(debug=debug, deep=True, force=True, timer_name=cleanup_timer_name)
@@ -957,37 +985,53 @@ def save_frames_to_video(
 
 
 def save_frames_to_image(
-    frames_tensor: torch.Tensor, 
-    output_dir: str, 
+    frames_tensor: torch.Tensor,
+    output_dir: str,
     base_name: str,
-    start_index: int = 0
+    start_index: int = 0,
+    image_format: Optional[str] = None,
 ) -> int:
     """
-    Save frames tensor as sequential PNG image files.
-    
-    Each frame saved as {base_name}_{index:0Nd}.png with zero-padded indices.
+    Save frames tensor as sequential image files in the chosen format.
+
+    Each frame saved as ``{base_name}_{index:0Nd}{ext}`` with zero-padded indices.
     Converts Float32 [0,1] to uint8 [0,255] and RGB(A) to BGR(A) for OpenCV.
-    
+
     Args:
         frames_tensor: Frames in format [T, H, W, C], Float32, range [0,1]
-        output_dir: Directory to save PNG files (created if doesn't exist)
+        output_dir: Directory to save image files (created if doesn't exist)
         base_name: Base name for output files (e.g., "frame" → "frame_00000.png")
         start_index: Starting index for filenames (for streaming continuation)
-    
+        image_format: Image format string from CLI ``--output_format`` (e.g. "png",
+            "tiff", "tif", "jpg", "jpeg", "dpx", "exr").  Defaults to "png".
+
     Returns:
         Number of frames saved
     """
+    # Map CLI format name → file extension
+    _FMT_TO_EXT: Dict[str, str] = {
+        "tiff": ".tiff", "tif": ".tiff",
+        "jpg": ".jpg", "jpeg": ".jpg",
+        "dpx": ".dpx",
+        "exr": ".exr",
+        "png": ".png",
+    }
+    ext = _FMT_TO_EXT.get((image_format or "png").lower(), ".png")
+
     os.makedirs(output_dir, exist_ok=True)
-    
+
     frames_np = (frames_tensor.cpu().numpy() * 255.0).astype(np.uint8)
     total = frames_np.shape[0]
-    
+
     if start_index == 0:
-        debug.log(f"Saving {total} frames as PNGs to directory: {output_dir}", category="file")
+        debug.log(
+            f"Saving {total} frames as {ext.lstrip('.')} sequence to directory: {output_dir}",
+            category="file",
+        )
     digits = 6  # Supports up to 999,999 frames (~11.5 hours at 24fps)
 
     for idx, frame in enumerate(frames_np):
-        filename = f"{base_name}_{start_index + idx:0{digits}d}.png"
+        filename = f"{base_name}_{start_index + idx:0{digits}d}{ext}"
         file_path = os.path.join(output_dir, filename)
         _save_image_bgr(frame, file_path)
         if debug.enabled and (idx + 1) % 100 == 0:
