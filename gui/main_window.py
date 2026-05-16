@@ -1370,9 +1370,13 @@ class MainWindow(QMainWindow):
         _host_layout.addWidget(self._adj_pane)
         _host_layout.addWidget(self._codec_pane)
 
-        # Constrain input widgets to fill available width
-        for _cw in _host.findChildren((QComboBox, QSpinBox, QLineEdit)):
+        # Constrain input widgets: comboboxes fill available width; spinboxes
+        # are capped at 80 px so they never stretch across the full panel.
+        for _cw in _host.findChildren(QComboBox):
             _cw.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        for _cw in _host.findChildren(QSpinBox):
+            _cw.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+            _cw.setMaximumWidth(80)
 
         scroll.setWidget(_host)
         outer_layout.addWidget(scroll, stretch=1)
@@ -2149,8 +2153,7 @@ class MainWindow(QMainWindow):
             args += ["--max_resolution", str(max_res)]
 
         batch = self.batch_size_spin.value()
-        if batch != 81:
-            args += ["--batch_size", str(batch)]
+        args += ["--batch_size", str(batch)]
 
         if self.uniform_batch_check.isChecked():
             args.append("--uniform_batch_size")
