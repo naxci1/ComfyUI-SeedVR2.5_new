@@ -1283,6 +1283,8 @@ class MainWindow(QMainWindow):
 
         # Debug
         g, f = _make_group("Debug")
+        self.auto_safeguard_check = QCheckBox()
+        f.addRow("Auto Safeguard:", self.auto_safeguard_check)
         self.debug_check = QCheckBox()
         f.addRow("Verbose Debug:", self.debug_check)
         adj_layout.addWidget(g)
@@ -1640,6 +1642,7 @@ class MainWindow(QMainWindow):
             "dynamo_recompile_spin": self.dynamo_recompile_spin,
             "cache_dit_check": self.cache_dit_check,
             "cache_vae_check": self.cache_vae_check,
+            "auto_safeguard_check": self.auto_safeguard_check,
             "debug_check": self.debug_check,
         }
 
@@ -2284,6 +2287,10 @@ class MainWindow(QMainWindow):
 
         if self.cache_vae_check.isChecked():
             args.append("--cache_vae")
+
+        # auto safeguard
+        if self.auto_safeguard_check.isChecked():
+            args.append("--auto_safeguard")
 
         # debug
         if self.debug_check.isChecked():

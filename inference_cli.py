@@ -66,6 +66,13 @@ os.environ['PYTHONPATH'] = script_dir + ':' + os.environ.get('PYTHONPATH', '')
 if mp.get_start_method(allow_none=True) != 'spawn':
     mp.set_start_method('spawn', force=True)
 
+# ── Blackwell / PyTorch performance environment variables ────────────────────
+# Must be injected BEFORE 'import torch' so the CUDA runtime picks them up.
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "backend:cudaMallocAsync")
+os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
+os.environ.setdefault("TORCH_CUDNN_V8_API_ENABLED", "1")
+os.environ.setdefault("CUDA_CACHE_MAXSIZE", "4294967296")
+
 # Configure platform-specific memory management before heavy imports
 # Must be set BEFORE import torch
 if platform.system() == "Darwin":
@@ -971,7 +978,10 @@ def _process_frames_core(
         )
         if runner_cache is not None:
             runner_cache['ctx'] = ctx
-    
+
+    # Propagate Auto Safeguard flag into ctx so generation phases can read it
+    ctx['auto_safeguard'] = getattr(args, 'auto_safeguard', False)
+
     # Build torch compile args
     torch_compile_args_dit = None
     torch_compile_args_vae = None
@@ -1570,6 +1580,11 @@ Examples:
     
     # Debugging
     debug_group = parser.add_argument_group('Debugging')
+    debug_group.add_argument("--auto_safeguard", action="store_true",
+                        help="Enable automatic VRAM overflow safeguards: reduces VAE decode tile size from >512 "
+                             "to 512 for batches >16 frames and caps micro-chunk decode at 8 frames per pass. "
+                             "Useful on Windows where Shared System RAM spillover is silent. "
+                             "When disabled, user-defined tile sizes are always respected.")
     debug_group.add_argument("--debug", action="store_true",
                         help="Enable verbose debug logging")
     
