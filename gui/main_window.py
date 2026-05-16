@@ -740,11 +740,11 @@ class MainWindow(QMainWindow):
         splitter.setChildrenCollapsible(True)
         root_layout.addWidget(splitter, stretch=1)
 
-        splitter.addWidget(self._build_left_panel())
         splitter.addWidget(self._build_right_panel())
-        splitter.setStretchFactor(0, 65)
-        splitter.setStretchFactor(1, 35)
-        splitter.setSizes([780, 420])
+        splitter.addWidget(self._build_left_panel())
+        splitter.setStretchFactor(0, 35)
+        splitter.setStretchFactor(1, 65)
+        splitter.setSizes([420, 780])
 
         # ── 3. Bottom controls bar ─────────────────────────────────────
         root_layout.addWidget(self._build_bottom_bar())
@@ -954,6 +954,51 @@ class MainWindow(QMainWindow):
         outer_layout = QVBoxLayout(outer)
         outer_layout.setContentsMargins(0, 0, 0, 0)
         outer_layout.setSpacing(0)
+
+        # ── Mode switcher: Video Mode | Image Sequence Mode ─────────────
+        _MODE_SS = (
+            "QPushButton{"
+            "  background:transparent; border:none;"
+            "  border-bottom:2px solid transparent;"
+            "  color:#888; padding:6px 14px; font-size:13px;"
+            "}"
+            "QPushButton:checked{ color:#E3E4E6; border-bottom:2px solid #0052CC; }"
+            "QPushButton:hover:!checked{ color:#BFC3CA; }"
+        )
+        mode_bar = QWidget()
+        mode_bar.setObjectName("mode_bar")
+        mode_bar.setFixedHeight(38)
+        mb_layout = QHBoxLayout(mode_bar)
+        mb_layout.setContentsMargins(6, 0, 6, 0)
+        mb_layout.setSpacing(0)
+
+        self._mode_video_btn = QPushButton("Video Mode")
+        self._mode_video_btn.setCheckable(True)
+        self._mode_video_btn.setChecked(True)
+        self._mode_video_btn.setStyleSheet(_MODE_SS)
+
+        self._mode_imgseq_btn = QPushButton("Image Sequence")
+        self._mode_imgseq_btn.setCheckable(True)
+        self._mode_imgseq_btn.setStyleSheet(_MODE_SS)
+
+        _mode_grp = QButtonGroup(outer)
+        _mode_grp.setExclusive(True)
+        _mode_grp.addButton(self._mode_video_btn, 0)
+        _mode_grp.addButton(self._mode_imgseq_btn, 1)
+        _mode_grp.idToggled.connect(
+            lambda idx, checked: self._update_output_mode(idx) if checked else None
+        )
+
+        mb_layout.addWidget(self._mode_video_btn)
+        mb_layout.addWidget(self._mode_imgseq_btn)
+        mb_layout.addStretch(1)
+
+        mode_sep = QWidget()
+        mode_sep.setFixedHeight(1)
+        mode_sep.setStyleSheet("background:#272A2D;")
+
+        outer_layout.addWidget(mode_bar)
+        outer_layout.addWidget(mode_sep)
 
         # ── Tab header bar (Adjustments | Codec settings) ───────────────
         _TAB_SS = (
@@ -1275,32 +1320,43 @@ class MainWindow(QMainWindow):
         codec_layout.setContentsMargins(10, 10, 10, 10)
         codec_layout.setSpacing(8)
 
-        g, f = _make_group("Export Settings")
+        # Invisible backing state — read by _build_args, _selected_export_extension,
+        # _selected_export_profile_to_ffmpeg_args, and preset load/save.
+        # Driven by the top-level mode switcher; also accepts setChecked() from preset restore.
+        self.export_image_sequence_check = QCheckBox()
+        self.export_image_sequence_check.toggled.connect(self._update_export_controls)
+        self.export_image_sequence_check.toggled.connect(self._on_image_sequence_toggled)
+
+        # ── Video export group (visible when Video Mode is active) ──────
+        self._video_export_group, vf = _make_group("Video Export")
         self.container_combo = QComboBox()
         self.container_combo.addItems(list(EXPORT_CODEC_PROFILES.keys()))
         self.container_combo.currentTextChanged.connect(self._update_export_controls)
-        f.addRow("Container:", self.container_combo)
+        vf.addRow("Container:", self.container_combo)
 
         self.video_codec_combo = QComboBox()
-        f.addRow("Video Codec:", self.video_codec_combo)
-
-        self.export_image_sequence_check = QCheckBox()
-        self.export_image_sequence_check.toggled.connect(self._update_export_controls)
-        f.addRow("Export as Image Sequence:", self.export_image_sequence_check)
-
-        self.image_sequence_format_combo = QComboBox()
-        self.image_sequence_format_combo.addItems(list(IMAGE_SEQUENCE_PROFILES.keys()))
-        f.addRow("Image Sequence Format:", self.image_sequence_format_combo)
+        vf.addRow("Video Codec:", self.video_codec_combo)
 
         self.audio_mode_combo = QComboBox()
         self.audio_mode_combo.addItems(list(AUDIO_PROFILES.keys()))
-        f.addRow("Audio:", self.audio_mode_combo)
+        vf.addRow("Audio:", self.audio_mode_combo)
 
         self.video_backend_combo = QComboBox()
         self.video_backend_combo.addItems(["ffmpeg"])
         self.video_backend_combo.setEnabled(False)
-        f.addRow("Video Backend:", self.video_backend_combo)
+        vf.addRow("Video Backend:", self.video_backend_combo)
+        codec_layout.addWidget(self._video_export_group)
 
+        # ── Image sequence group (visible when Image Sequence Mode is active) ─
+        self._image_export_group, imgf = _make_group("Image Sequence Export")
+        self.image_sequence_format_combo = QComboBox()
+        self.image_sequence_format_combo.addItems(list(IMAGE_SEQUENCE_PROFILES.keys()))
+        imgf.addRow("Format:", self.image_sequence_format_combo)
+        self._image_export_group.setVisible(False)
+        codec_layout.addWidget(self._image_export_group)
+
+        # ── Common output options (always visible) ──────────────────────
+        g, f = _make_group("Output Options")
         self.use_10bit_check = QCheckBox()
         f.addRow("10-bit Output:", self.use_10bit_check)
 
@@ -1359,6 +1415,43 @@ class MainWindow(QMainWindow):
         self._adj_pane.setVisible(idx == 0)
         self._codec_pane.setVisible(idx == 1)
 
+    def _update_output_mode(self, idx: int) -> None:
+        """Switch between Video Mode (idx=0) and Image Sequence Mode (idx=1).
+
+        Drives the invisible ``export_image_sequence_check`` backing widget that
+        all downstream code (``_build_args``, ``_selected_export_extension``, etc.)
+        reads.  Uses a guard flag so the ``_on_image_sequence_toggled`` callback
+        does not create a cycle.
+        """
+        is_image_seq = (idx == 1)
+        self._updating_output_mode = True
+        try:
+            self.export_image_sequence_check.setChecked(is_image_seq)
+        finally:
+            self._updating_output_mode = False
+        self._video_export_group.setVisible(not is_image_seq)
+        self._image_export_group.setVisible(is_image_seq)
+        self._update_export_controls()
+
+    def _on_image_sequence_toggled(self, is_seq: bool) -> None:
+        """Sync the mode switcher buttons when the backing checkbox is set externally.
+
+        This is called when preset load/save restores ``export_image_sequence_check``
+        (via the persistable widget map) so the mode switcher buttons stay in sync
+        even without user interaction.
+        """
+        if getattr(self, "_updating_output_mode", False):
+            return
+        # Update button group (blockSignals to avoid re-entering _update_output_mode)
+        self._mode_video_btn.blockSignals(True)
+        self._mode_imgseq_btn.blockSignals(True)
+        self._mode_video_btn.setChecked(not is_seq)
+        self._mode_imgseq_btn.setChecked(is_seq)
+        self._mode_video_btn.blockSignals(False)
+        self._mode_imgseq_btn.blockSignals(False)
+        # Sync group visibility
+        self._video_export_group.setVisible(not is_seq)
+        self._image_export_group.setVisible(is_seq)
 
 
     # ── Bottom bar ─────────────────────────────────────────────────────
@@ -1369,18 +1462,17 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 4, 0, 0)
         layout.setSpacing(4)
 
-        # Progress bars (outer: global frame/chunk, inner: batch step)
+        # Progress bars are kept as invisible backing objects so that existing
+        # signal handlers (_on_global_progress, _on_batch_progress, _on_finished,
+        # _reset_progress_bars) continue to work unchanged.  Progress text is
+        # surfaced through status_label instead of a visible bar widget.
         self.global_progress = QProgressBar()
         self.global_progress.setRange(0, 100)
-        self.global_progress.setValue(0)
-        self.global_progress.setFormat("Total Progress: idle")
-        layout.addWidget(self.global_progress)
+        self.global_progress.hide()
 
         self.batch_progress = QProgressBar()
         self.batch_progress.setRange(0, 100)
-        self.batch_progress.setValue(0)
-        self.batch_progress.setFormat("Batch Progress: idle")
-        layout.addWidget(self.batch_progress)
+        self.batch_progress.hide()
 
         # Status + primary actions
         # Note: run_btn and preview_btn are created in _build_right_panel (action bar at bottom
