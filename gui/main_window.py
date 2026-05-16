@@ -234,10 +234,12 @@ INPUT_DIALOG_FILTER = (
 EXPORT_CODEC_PROFILES: dict[str, dict[str, dict[str, Any]]] = {
     "MP4": {
         "H.264 High (8-bit)": {"ffmpeg": ["-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p"], "is_10bit": False},
+        "H.264 (NVIDIA NVENC)": {"ffmpeg": ["-c:v", "h264_nvenc", "-preset", "p4", "-pix_fmt", "yuv420p"], "is_10bit": False},
         "H.265 (HEVC) Main (8-bit)": {"ffmpeg": ["-c:v", "libx265", "-profile:v", "main", "-pix_fmt", "yuv420p"], "is_10bit": False},
         "H.265 (HEVC) Main10 (10-bit)": {"ffmpeg": ["-c:v", "libx265", "-profile:v", "main10", "-pix_fmt", "yuv420p10le"], "is_10bit": True},
-        "AV1 (8-bit)": {"ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p"], "is_10bit": False},
-        "AV1 (10-bit)": {"ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p10le"], "is_10bit": True},
+        "AV1 (8-bit)": {"ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p", "-strict", "experimental", "-cpu-used", "4", "-row-mt", "1"], "is_10bit": False},
+        "AV1 (10-bit)": {"ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p10le", "-strict", "experimental", "-cpu-used", "4", "-row-mt", "1"], "is_10bit": True},
+        "AV1 (NVIDIA NVENC)": {"ffmpeg": ["-c:v", "av1_nvenc", "-preset", "p4", "-pix_fmt", "yuv420p"], "is_10bit": False},
     },
     "MOV": {
         "ProRes 422 Proxy": {"ffmpeg": ["-c:v", "prores_ks", "-profile:v", "0", "-pix_fmt", "yuv422p10le"], "is_10bit": True},
@@ -246,6 +248,7 @@ EXPORT_CODEC_PROFILES: dict[str, dict[str, dict[str, Any]]] = {
         "ProRes 422 HQ": {"ffmpeg": ["-c:v", "prores_ks", "-profile:v", "3", "-pix_fmt", "yuv422p10le"], "is_10bit": True},
         "ProRes 4444 XQ": {"ffmpeg": ["-c:v", "prores_ks", "-profile:v", "5", "-pix_fmt", "yuva444p12le"], "is_10bit": True},
         "H.264 High (8-bit)": {"ffmpeg": ["-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p"], "is_10bit": False},
+        "H.264 (NVIDIA NVENC)": {"ffmpeg": ["-c:v", "h264_nvenc", "-preset", "p4", "-pix_fmt", "yuv420p"], "is_10bit": False},
         "H.265 (HEVC) Main (8-bit)": {"ffmpeg": ["-c:v", "libx265", "-profile:v", "main", "-pix_fmt", "yuv420p"], "is_10bit": False},
         "H.265 (HEVC) Main10 (10-bit)": {"ffmpeg": ["-c:v", "libx265", "-profile:v", "main10", "-pix_fmt", "yuv420p10le"], "is_10bit": True},
         "Uncompressed YUV (V210)": {"ffmpeg": ["-c:v", "v210"], "is_10bit": True},
@@ -254,10 +257,12 @@ EXPORT_CODEC_PROFILES: dict[str, dict[str, dict[str, Any]]] = {
     },
     "MKV": {
         "H.264 High (8-bit)": {"ffmpeg": ["-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p"], "is_10bit": False},
+        "H.264 (NVIDIA NVENC)": {"ffmpeg": ["-c:v", "h264_nvenc", "-preset", "p4", "-pix_fmt", "yuv420p"], "is_10bit": False},
         "H.265 (HEVC) Main (8-bit)": {"ffmpeg": ["-c:v", "libx265", "-profile:v", "main", "-pix_fmt", "yuv420p"], "is_10bit": False},
         "H.265 (HEVC) Main10 (10-bit)": {"ffmpeg": ["-c:v", "libx265", "-profile:v", "main10", "-pix_fmt", "yuv420p10le"], "is_10bit": True},
-        "AV1 (8-bit)": {"ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p"], "is_10bit": False},
-        "AV1 (10-bit)": {"ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p10le"], "is_10bit": True},
+        "AV1 (8-bit)": {"ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p", "-strict", "experimental", "-cpu-used", "4", "-row-mt", "1"], "is_10bit": False},
+        "AV1 (10-bit)": {"ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p10le", "-strict", "experimental", "-cpu-used", "4", "-row-mt", "1"], "is_10bit": True},
+        "AV1 (NVIDIA NVENC)": {"ffmpeg": ["-c:v", "av1_nvenc", "-preset", "p4", "-pix_fmt", "yuv420p"], "is_10bit": False},
         "VP9 (Good)": {"ffmpeg": ["-c:v", "libvpx-vp9", "-deadline", "good"], "is_10bit": False},
         "VP9 (Best)": {"ffmpeg": ["-c:v", "libvpx-vp9", "-deadline", "best"], "is_10bit": False},
         "FFV1 (Lossless 8/10/12-bit)": {"ffmpeg": ["-c:v", "ffv1", "-level", "3"], "is_10bit": True},
@@ -266,8 +271,8 @@ EXPORT_CODEC_PROFILES: dict[str, dict[str, dict[str, Any]]] = {
     "WEBM": {
         "VP9 (Good)": {"ffmpeg": ["-c:v", "libvpx-vp9", "-deadline", "good"], "is_10bit": False},
         "VP9 (Best)": {"ffmpeg": ["-c:v", "libvpx-vp9", "-deadline", "best"], "is_10bit": False},
-        "AV1 (8-bit)": {"ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p"], "is_10bit": False},
-        "AV1 (10-bit)": {"ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p10le"], "is_10bit": True},
+        "AV1 (8-bit)": {"ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p", "-strict", "experimental", "-cpu-used", "4", "-row-mt", "1"], "is_10bit": False},
+        "AV1 (10-bit)": {"ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p10le", "-strict", "experimental", "-cpu-used", "4", "-row-mt", "1"], "is_10bit": True},
     },
 }
 
@@ -1217,37 +1222,6 @@ class MainWindow(QMainWindow):
         self.attention_mode_combo.setMinimumWidth(240)
         f.addRow("Attention Mode:", self.attention_mode_combo)
 
-        self.compile_dit_check = QCheckBox()
-        f.addRow("Compile DiT:", self.compile_dit_check)
-
-        self.compile_vae_check = QCheckBox()
-        f.addRow("Compile VAE:", self.compile_vae_check)
-
-        self.compile_backend_combo = QComboBox()
-        self.compile_backend_combo.addItems(["inductor", "cudagraphs"])
-        f.addRow("Compile Backend:", self.compile_backend_combo)
-
-        self.compile_mode_combo = QComboBox()
-        self.compile_mode_combo.addItems([
-            "default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"
-        ])
-        f.addRow("Compile Mode:", self.compile_mode_combo)
-
-        self.compile_fullgraph_check = QCheckBox()
-        f.addRow("Full Graph:", self.compile_fullgraph_check)
-
-        self.compile_dynamic_check = QCheckBox()
-        f.addRow("Dynamic:", self.compile_dynamic_check)
-
-        self.dynamo_cache_spin = QSpinBox()
-        self.dynamo_cache_spin.setRange(1, 1000)
-        self.dynamo_cache_spin.setValue(64)
-        f.addRow("Dynamo Cache Limit:", self.dynamo_cache_spin)
-
-        self.dynamo_recompile_spin = QSpinBox()
-        self.dynamo_recompile_spin.setRange(1, 1000)
-        self.dynamo_recompile_spin.setValue(128)
-        f.addRow("Dynamo Recompile Limit:", self.dynamo_recompile_spin)
         adj_layout.addWidget(g)
 
         # Model Cache
@@ -1313,6 +1287,30 @@ class MainWindow(QMainWindow):
         self.audio_mode_combo = QComboBox()
         self.audio_mode_combo.addItems(list(AUDIO_PROFILES.keys()))
         vf.addRow("Audio:", self.audio_mode_combo)
+
+        # ── Bitrate / Quality Mode ────────────────────────────────────────
+        self.bitrate_mode_combo = QComboBox()
+        self.bitrate_mode_combo.addItems(["Dynamic (VBR/CRF)", "Constant (CBR)"])
+        vf.addRow("Bitrate Mode:", self.bitrate_mode_combo)
+
+        # Quality level row – visible only in Dynamic mode
+        self._quality_row_lbl = QLabel("Quality Level:")
+        self.quality_level_combo = QComboBox()
+        self.quality_level_combo.addItems(["High", "Medium", "Low"])
+        vf.addRow(self._quality_row_lbl, self.quality_level_combo)
+
+        # Target bitrate row – visible only in Constant mode
+        self._bitrate_row_lbl = QLabel("Target Bitrate (Mbps):")
+        self.target_bitrate_combo = QComboBox()
+        self.target_bitrate_combo.addItems([
+            "1", "2.5", "4", "5", "7.5", "8", "12", "16", "24", "40", "60", "120", "180"
+        ])
+        self.target_bitrate_combo.setCurrentText("8")
+        vf.addRow(self._bitrate_row_lbl, self.target_bitrate_combo)
+
+        # Wire up dynamic visibility; initialise to Dynamic mode
+        self.bitrate_mode_combo.currentTextChanged.connect(self._on_bitrate_mode_changed)
+        self._on_bitrate_mode_changed(self.bitrate_mode_combo.currentText())
 
         self.video_backend_combo = QComboBox()
         self.video_backend_combo.addItems(["ffmpeg"])
@@ -1380,6 +1378,14 @@ class MainWindow(QMainWindow):
         """Show the Adjustments pane (idx=0) or Codec settings pane (idx=1)."""
         self._adj_pane.setVisible(idx == 0)
         self._codec_pane.setVisible(idx == 1)
+
+    def _on_bitrate_mode_changed(self, mode: str) -> None:
+        """Toggle Quality Level / Target Bitrate rows based on selected Bitrate Mode."""
+        is_dynamic = "Dynamic" in mode
+        self._quality_row_lbl.setVisible(is_dynamic)
+        self.quality_level_combo.setVisible(is_dynamic)
+        self._bitrate_row_lbl.setVisible(not is_dynamic)
+        self.target_bitrate_combo.setVisible(not is_dynamic)
 
     _FILE_FORMAT_TO_IMAGE_SEQ: dict = {
         "PNG Sequence": "PNG (8-bit)",
@@ -1624,6 +1630,9 @@ class MainWindow(QMainWindow):
             "image_sequence_format_combo": self.image_sequence_format_combo,
             "audio_mode_combo": self.audio_mode_combo,
             "video_backend_combo": self.video_backend_combo,
+            "bitrate_mode_combo": self.bitrate_mode_combo,
+            "quality_level_combo": self.quality_level_combo,
+            "target_bitrate_combo": self.target_bitrate_combo,
             "use_10bit_check": self.use_10bit_check,
             "color_correction_combo": self.color_correction_combo,
             "resolution_spin": self.resolution_spin,
@@ -1650,14 +1659,6 @@ class MainWindow(QMainWindow):
             "vae_decode_tile_overlap_spin": self.vae_decode_tile_overlap_spin,
             "tile_debug_combo": self.tile_debug_combo,
             "attention_mode_combo": self.attention_mode_combo,
-            "compile_dit_check": self.compile_dit_check,
-            "compile_vae_check": self.compile_vae_check,
-            "compile_backend_combo": self.compile_backend_combo,
-            "compile_mode_combo": self.compile_mode_combo,
-            "compile_fullgraph_check": self.compile_fullgraph_check,
-            "compile_dynamic_check": self.compile_dynamic_check,
-            "dynamo_cache_spin": self.dynamo_cache_spin,
-            "dynamo_recompile_spin": self.dynamo_recompile_spin,
             "cache_dit_check": self.cache_dit_check,
             "cache_vae_check": self.cache_vae_check,
             "auto_safeguard_check": self.auto_safeguard_check,
@@ -1742,11 +1743,41 @@ class MainWindow(QMainWindow):
         codec_profile = EXPORT_CODEC_PROFILES.get(container, {}).get(codec, {})
         audio = self.audio_mode_combo.currentText()
         audio_args = AUDIO_PROFILES.get(audio, AUDIO_PROFILES["Copy Audio"])
+
+        # Start with the codec's base ffmpeg args and append bitrate/quality args.
+        base_video_args = list(codec_profile.get("ffmpeg", []))
+        bitrate_mode = getattr(self, "bitrate_mode_combo", None)
+        if bitrate_mode is not None and "Dynamic" in bitrate_mode.currentText():
+            # Dynamic (VBR/CRF) mode – map quality level to per-codec CRF/QP values
+            quality = getattr(self, "quality_level_combo", None)
+            qlvl = quality.currentText() if quality is not None else "Medium"
+            _CRF_MAP: dict[str, dict[str, Any]] = {
+                "libx264":    {"High": ["-crf", "18"], "Medium": ["-crf", "23"], "Low": ["-crf", "28"]},
+                "libx265":    {"High": ["-crf", "20"], "Medium": ["-crf", "28"], "Low": ["-crf", "35"]},
+                "libaom-av1": {"High": ["-crf", "28"], "Medium": ["-crf", "40"], "Low": ["-crf", "52"]},
+                "h264_nvenc": {"High": ["-cq", "18"], "Medium": ["-cq", "23"], "Low": ["-cq", "28"]},
+                "av1_nvenc":  {"High": ["-cq", "28"], "Medium": ["-cq", "40"], "Low": ["-cq", "52"]},
+                "libvpx-vp9": {"High": ["-crf", "18", "-b:v", "0"], "Medium": ["-crf", "33", "-b:v", "0"], "Low": ["-crf", "42", "-b:v", "0"]},
+            }
+            # Determine encoder from base args ("-c:v" value)
+            encoder = ""
+            for i, tok in enumerate(base_video_args):
+                if tok == "-c:v" and i + 1 < len(base_video_args):
+                    encoder = base_video_args[i + 1]
+            crf_args = _CRF_MAP.get(encoder, {}).get(qlvl, [])
+            base_video_args = base_video_args + crf_args
+        else:
+            # Constant (CBR) mode – append -b:v <target>M
+            target_bitrate = getattr(self, "target_bitrate_combo", None)
+            if target_bitrate is not None:
+                mbps = target_bitrate.currentText()
+                base_video_args = base_video_args + ["-b:v", f"{mbps}M"]
+
         return {
             "mode": "video",
             "container": container,
             "codec": codec,
-            "video_args": codec_profile.get("ffmpeg", []),
+            "video_args": base_video_args,
             "audio_mode": audio,
             "audio_args": audio_args,
         }
@@ -2300,34 +2331,6 @@ class MainWindow(QMainWindow):
         attn = self.attention_mode_combo.currentText()
         if attn != "sdpa":
             args += ["--attention_mode", attn]
-
-        if self.compile_dit_check.isChecked():
-            args.append("--compile_dit")
-
-        if self.compile_vae_check.isChecked():
-            args.append("--compile_vae")
-
-        cb = self.compile_backend_combo.currentText()
-        if cb != "inductor":
-            args += ["--compile_backend", cb]
-
-        cm = self.compile_mode_combo.currentText()
-        if cm != "default":
-            args += ["--compile_mode", cm]
-
-        if self.compile_fullgraph_check.isChecked():
-            args.append("--compile_fullgraph")
-
-        if self.compile_dynamic_check.isChecked():
-            args.append("--compile_dynamic")
-
-        dc = self.dynamo_cache_spin.value()
-        if dc != 64:
-            args += ["--compile_dynamo_cache_size_limit", str(dc)]
-
-        dr = self.dynamo_recompile_spin.value()
-        if dr != 128:
-            args += ["--compile_dynamo_recompile_limit", str(dr)]
 
         # cache
         if self.cache_dit_check.isChecked():
