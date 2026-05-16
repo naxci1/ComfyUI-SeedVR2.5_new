@@ -1454,6 +1454,19 @@ class MainWindow(QMainWindow):
             "debug_check": self.debug_check,
         }
 
+    # Codecs that have fixed/required container associations (codec name → required container key)
+    _CODEC_LOCKED_CONTAINER: dict[str, str] = {
+        "ProRes 422 Proxy": "MOV",
+        "ProRes 422 LT": "MOV",
+        "ProRes 422": "MOV",
+        "ProRes 422 HQ": "MOV",
+        "ProRes 4444 XQ": "MOV",
+        "QuickTime Animation (Alpha)": "MOV",
+        "Uncompressed RGB (R210)": "MOV",
+        "Uncompressed YUV (V210)": "MKV",
+        "FFV1 (Lossless 8/10/12-bit)": "MKV",
+    }
+
     def _update_export_controls(self, *_: object) -> None:
         container = self.container_combo.currentText()
         prev_codec = self.video_codec_combo.currentText()
@@ -1468,6 +1481,20 @@ class MainWindow(QMainWindow):
         self.video_codec_combo.setEnabled(not exporting_sequence)
         self.container_combo.setEnabled(not exporting_sequence)
         self.image_sequence_format_combo.setEnabled(exporting_sequence)
+
+        # Lock container if the currently selected codec requires one
+        selected_codec = self.video_codec_combo.currentText()
+        required_container = self._CODEC_LOCKED_CONTAINER.get(selected_codec)
+        if required_container and not exporting_sequence:
+            idx = self.container_combo.findText(required_container)
+            if idx >= 0 and self.container_combo.currentIndex() != idx:
+                self.container_combo.blockSignals(True)
+                self.container_combo.setCurrentIndex(idx)
+                self.container_combo.blockSignals(False)
+            # Prevent user from changing away from the required container
+            self.container_combo.setEnabled(False)
+        elif not exporting_sequence:
+            self.container_combo.setEnabled(True)
 
     def _selected_export_extension(self) -> str:
         if self.export_image_sequence_check.isChecked():
@@ -1839,17 +1866,37 @@ class MainWindow(QMainWindow):
             args += ["--model_dir", md]
 
         # output format mapping for SeedVR2 CLI:
-        # - video export modes map to CLI output_format=mp4
-        # - image sequence modes map to CLI output_format=png (CLI image-sequence path)
+        # - image sequence modes map to CLI output_format=png
+        # - video export modes map to the selected container name (mov, mkv, webm, mp4)
         if self.export_image_sequence_check.isChecked():
             args += ["--output_format", "png"]
+        elif self._is_preview_run:
+            # Preview always produces a single PNG image regardless of export settings
+            args += ["--output_format", "png"]
         else:
-            args += ["--output_format", "mp4"]
+            container = self.container_combo.currentText().lower()
+            args += ["--output_format", container or "mp4"]
 
         # video backend
-        vb = self.video_backend_combo.currentText()
-        if vb != "opencv":
-            args += ["--video_backend", vb]
+        # Video backend + custom codec args
+        # Emit ffmpeg_video_args when a custom (non-default) video codec is selected and we
+        # are running an actual export (not a preview PNG run).
+        if not self._is_preview_run and not self.export_image_sequence_check.isChecked():
+            profile = self._selected_export_profile_to_ffmpeg_args()
+            video_codec_args = profile.get("video_args", [])
+            if video_codec_args:
+                import json as _json
+                args += ["--ffmpeg_video_args", _json.dumps(video_codec_args)]
+                # custom codecs always need the ffmpeg backend
+                args += ["--video_backend", "ffmpeg"]
+            else:
+                vb = self.video_backend_combo.currentText()
+                if vb != "opencv":
+                    args += ["--video_backend", vb]
+        else:
+            vb = self.video_backend_combo.currentText()
+            if vb != "opencv":
+                args += ["--video_backend", vb]
 
         # 10-bit: either explicitly requested or implied by selected export profile
         if self.use_10bit_check.isChecked() or self._selected_profile_is_10bit():
@@ -2144,6 +2191,7 @@ class MainWindow(QMainWindow):
         frame_img = None
         self._preview_original_input_path = self._settings_win.input_edit.text().strip()
         self._preview_original_input_mode = self._settings_win.input_mode_combo.currentText()
+        self._preview_original_output_path = self._settings_win.output_edit.text().strip()
         self._preview_saved_batch_size = self.batch_size_spin.value()
         if self._input_player is not None:
             self._preview_original_position = self._input_player.position()
@@ -2221,8 +2269,14 @@ class MainWindow(QMainWindow):
 
         self._on_log(f"ℹ  Preview: captured frame → {self._preview_temp_path}")
 
-        # Point input to the temp file, set batch size to 1, mark as preview run
+        # Point input to the temp file, set batch size to 1, mark as preview run.
+        # Also set an explicit output PNG path so the CLI never tries to create a video from
+        # a single-image input (which caused the cv2.imwrite crash on .mp4 extension).
         self._settings_win.input_edit.setText(self._preview_temp_path)
+        preview_out_png = str(Path(self._preview_temp_path).with_name(
+            Path(self._preview_temp_path).stem + "_upscaled.png"
+        ))
+        self._settings_win.output_edit.setText(preview_out_png)
         self.batch_size_spin.setValue(1)
         self._is_preview_run = True
 
@@ -2796,6 +2850,10 @@ class MainWindow(QMainWindow):
         self._is_preview_run = False
         if was_preview and self.batch_size_spin.value() == 1 and self._preview_saved_batch_size:
             self.batch_size_spin.setValue(self._preview_saved_batch_size)
+        # Restore output path that was overridden during preview (but keep the input field
+        # pointing at the original path so the user still sees the correct input displayed).
+        if was_preview and hasattr(self, "_preview_original_output_path"):
+            self._settings_win.output_edit.setText(self._preview_original_output_path)
         self._worker = None
         self._thread = None
 
