@@ -633,7 +633,7 @@ class MainWindow(QMainWindow):
             pass
 
         super().__init__()
-        self.setWindowTitle("SeedVR2.5 GUI by HB2k v.1.4 beta")
+        self.setWindowTitle("SeedVR2.5 GUI by HB2k v1.5b")
         self.resize(1100, 900)
 
         # Create settings window first – it loads saved paths in its __init__
@@ -888,78 +888,78 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(self._viewer_stack, stretch=1)
 
-        # ── Action buttons (Preview + Export) directly under viewer ────
-        _preview_action_sep = QWidget()
-        _preview_action_sep.setFixedHeight(1)
-        _preview_action_sep.setStyleSheet("background:#272A2D;")
-        layout.addWidget(_preview_action_sep)
+        # ── Thin separator between viewer and under-viewer controls ───
+        _under_sep = QWidget()
+        _under_sep.setFixedHeight(1)
+        _under_sep.setStyleSheet("background:#272A2D;")
+        layout.addWidget(_under_sep)
 
-        _action_row = QHBoxLayout()
-        _action_row.setContentsMargins(0, 4, 0, 4)
-        _action_row.setSpacing(8)
-        _action_row.addWidget(self.preview_btn)
-        _action_row.addStretch(1)
-        _action_row.addWidget(self.run_btn)
-        layout.addLayout(_action_row)
-
-        # ── File metadata label ────────────────────────────────────────
+        # ── Single strict horizontal row: all controls under preview ───
+        # Contains: ⏮ ◀ ⏸ ⏭ | timecode | seek slider | Preview | Export | Split | Open Output
         self._current_input_is_image: bool = False
-        self._meta_label = QLabel("")
-        self._meta_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._meta_label.setStyleSheet("color:#888; font-size:11px; padding:2px 0;")
-        layout.addWidget(self._meta_label)
 
-        # ── Seek slider ────────────────────────────────────────────────
-        self._seek_slider = QSlider(Qt.Orientation.Horizontal)
-        self._seek_slider.setRange(0, 0)
-        self._seek_slider.setEnabled(_MULTIMEDIA_AVAILABLE)
-        self._seek_slider.sliderMoved.connect(self._on_seek)
-        layout.addWidget(self._seek_slider)
+        under_row = QHBoxLayout()
+        under_row.setContentsMargins(0, 3, 0, 3)
+        under_row.setSpacing(4)
 
-        # ── Control bar ────────────────────────────────────────────────
-        ctrl = QHBoxLayout()
+        self._frame_back_btn = QPushButton("⏮")
+        self._frame_back_btn.setFixedWidth(30)
+        self._frame_back_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
+        self._frame_back_btn.clicked.connect(lambda: self._step_frame(-1))
 
         self._play_btn = QPushButton("▶")
-        self._play_btn.setFixedWidth(36)
+        self._play_btn.setFixedWidth(30)
         self._play_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
         self._play_btn.clicked.connect(self._on_play_pause)
 
         self._pause_btn = QPushButton("⏸")
-        self._pause_btn.setFixedWidth(36)
+        self._pause_btn.setFixedWidth(30)
         self._pause_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
         self._pause_btn.clicked.connect(self._pause_playback)
 
-        self._frame_back_btn = QPushButton("⏮")
-        self._frame_back_btn.setFixedWidth(36)
-        self._frame_back_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
-        self._frame_back_btn.clicked.connect(lambda: self._step_frame(-1))
-
         self._frame_forward_btn = QPushButton("⏭")
-        self._frame_forward_btn.setFixedWidth(36)
+        self._frame_forward_btn.setFixedWidth(30)
         self._frame_forward_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
         self._frame_forward_btn.clicked.connect(lambda: self._step_frame(1))
 
-        self._time_lbl = QLabel("0:00 / 0:00")
-        self._time_lbl.setMinimumWidth(100)
-        self._time_lbl.setStyleSheet("color:#888; font-size:11px;")
+        self._time_lbl = QLabel("0:00/0:00")
+        self._time_lbl.setFixedWidth(72)
+        self._time_lbl.setStyleSheet("color:#888; font-size:10px;")
 
-        self._split_toggle = QCheckBox("Split View")
+        self._seek_slider = QSlider(Qt.Orientation.Horizontal)
+        self._seek_slider.setRange(0, 0)
+        self._seek_slider.setEnabled(_MULTIMEDIA_AVAILABLE)
+        self._seek_slider.sliderMoved.connect(self._on_seek)
+
+        self._split_toggle = QCheckBox("⊣⊢")
+        self._split_toggle.setToolTip("Split View")
         self._split_toggle.setEnabled(_MULTIMEDIA_AVAILABLE)
+        self._split_toggle.setMaximumWidth(50)
         self._split_toggle.toggled.connect(self._on_split_toggle_changed)
 
-        self._open_output_btn = QPushButton("Open Output…")
+        self._open_output_btn = QPushButton("Out…")
+        self._open_output_btn.setToolTip("Open Output file…")
+        self._open_output_btn.setFixedWidth(46)
         self._open_output_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
         self._open_output_btn.clicked.connect(self._browse_output_video)
 
-        ctrl.addWidget(self._frame_back_btn)
-        ctrl.addWidget(self._play_btn)
-        ctrl.addWidget(self._pause_btn)
-        ctrl.addWidget(self._frame_forward_btn)
-        ctrl.addWidget(self._time_lbl)
-        ctrl.addStretch(1)
-        ctrl.addWidget(self._split_toggle)
-        ctrl.addWidget(self._open_output_btn)
-        layout.addLayout(ctrl)
+        under_row.addWidget(self._frame_back_btn)
+        under_row.addWidget(self._play_btn)
+        under_row.addWidget(self._pause_btn)
+        under_row.addWidget(self._frame_forward_btn)
+        under_row.addWidget(self._time_lbl)
+        under_row.addWidget(self._seek_slider, stretch=1)
+        under_row.addWidget(self.preview_btn)
+        under_row.addWidget(self.run_btn)
+        under_row.addWidget(self._split_toggle)
+        under_row.addWidget(self._open_output_btn)
+        layout.addLayout(under_row)
+
+        # ── File metadata label ────────────────────────────────────────
+        self._meta_label = QLabel("")
+        self._meta_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._meta_label.setStyleSheet("color:#888; font-size:11px; padding:1px 0;")
+        layout.addWidget(self._meta_label)
 
         return panel
 
@@ -973,34 +973,6 @@ class MainWindow(QMainWindow):
         outer_layout = QVBoxLayout(outer)
         outer_layout.setContentsMargins(0, 0, 0, 0)
         outer_layout.setSpacing(0)
-
-        # ── File Format selector (replaces Video/Image Sequence mode toggle) ──
-        _fmt_bar = QWidget()
-        _fmt_bar.setObjectName("mode_bar")
-        _fmt_bar.setFixedHeight(38)
-        _fmt_layout = QHBoxLayout(_fmt_bar)
-        _fmt_layout.setContentsMargins(8, 0, 8, 0)
-        _fmt_layout.setSpacing(8)
-
-        _fmt_lbl = QLabel("File Format:")
-        _fmt_lbl.setStyleSheet("color:#B0B3B8; font-size:12px;")
-        _fmt_layout.addWidget(_fmt_lbl)
-
-        self.file_format_combo = QComboBox()
-        self.file_format_combo.addItems([
-            "MP4", "MOV", "MKV", "WEBM",
-            "PNG Sequence", "TIFF Sequence", "DPX Sequence", "EXR Sequence",
-        ])
-        self.file_format_combo.setCurrentText("MP4")
-        self.file_format_combo.currentTextChanged.connect(self._on_file_format_changed)
-        _fmt_layout.addWidget(self.file_format_combo, stretch=1)
-
-        _fmt_sep = QWidget()
-        _fmt_sep.setFixedHeight(1)
-        _fmt_sep.setStyleSheet("background:#272A2D;")
-
-        outer_layout.addWidget(_fmt_bar)
-        outer_layout.addWidget(_fmt_sep)
 
         # ── Tab header bar (Adjustments | Codec settings) ───────────────
         _TAB_SS = (
@@ -1305,9 +1277,26 @@ class MainWindow(QMainWindow):
         codec_layout.setContentsMargins(10, 10, 10, 10)
         codec_layout.setSpacing(8)
 
+        # ── File Format selector (first item in Codec pane) ────────────
+        _ff_row = QHBoxLayout()
+        _ff_row.setContentsMargins(0, 0, 0, 4)
+        _ff_row.setSpacing(8)
+        _ff_lbl = QLabel("File Format:")
+        _ff_lbl.setStyleSheet("color:#B0B3B8; font-size:12px;")
+        _ff_row.addWidget(_ff_lbl)
+        self.file_format_combo = QComboBox()
+        self.file_format_combo.addItems([
+            "MP4", "MOV", "MKV", "WEBM",
+            "PNG Sequence", "TIFF Sequence", "DPX Sequence", "EXR Sequence",
+        ])
+        self.file_format_combo.setCurrentText("MP4")
+        self.file_format_combo.currentTextChanged.connect(self._on_file_format_changed)
+        _ff_row.addWidget(self.file_format_combo, stretch=1)
+        codec_layout.addLayout(_ff_row)
+
         # Invisible backing state — read by _build_args, _selected_export_extension,
         # _selected_export_profile_to_ffmpeg_args, and preset load/save.
-        # Driven by the top-level mode switcher; also accepts setChecked() from preset restore.
+        # Driven by the file_format_combo; also accepts setChecked() from preset restore.
         self.export_image_sequence_check = QCheckBox()
         self.export_image_sequence_check.toggled.connect(self._update_export_controls)
         self.export_image_sequence_check.toggled.connect(self._on_image_sequence_toggled)
@@ -1357,11 +1346,16 @@ class MainWindow(QMainWindow):
 
         # Constrain input widgets: comboboxes fill available width; spinboxes
         # are capped at 80 px so they never stretch across the full panel.
+        # Checkboxes are constrained to a compact width (~40 px) to eliminate
+        # excess empty spacing around the bare toggle indicator.
         for _cw in _host.findChildren(QComboBox):
             _cw.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         for _cw in _host.findChildren(QSpinBox):
             _cw.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
             _cw.setMaximumWidth(80)
+        for _cw in _host.findChildren(QCheckBox):
+            _cw.setMaximumWidth(40)
+            _cw.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
         scroll.setWidget(_host)
         outer_layout.addWidget(scroll, stretch=1)
@@ -1575,7 +1569,7 @@ class MainWindow(QMainWindow):
             "About SeedVR2 GUI",
             (
                 "<b>SeedVR2.5 GUI by HB2k</b><br>"
-                "Version: v1.4 beta<br><br>"
+                "Version: v1.5b<br><br>"
                 "Topaz-style wrapper for SeedVR2 inference_cli.py.<br>"
                 "License: Apache-2.0<br><br>"
                 '<a href="https://github.com/naxci1/ComfyUI-SeedVR2.5_new">'
