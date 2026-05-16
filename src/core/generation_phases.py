@@ -931,19 +931,20 @@ def decode_all_batches(
             debug.log(f"Decoding batch {decode_idx+1}/{num_valid_latents}", category="vae", force=True)
             debug.start_timer(f"decode_batch_{decode_idx+1}")
             
-            # ── Pre-emptive VRAM headroom check (ComfyUI dynamic paging) ─────
+            # ── Pre-emptive VRAM headroom check + dynamic micro-chunk paging ──
             # Windows pages silently into Shared System RAM instead of raising an
             # OOM exception, so we probe free memory BEFORE moving the tensor to
-            # the VAE device.  If the estimated pixel-space output would consume
-            # more than 90 % of remaining VRAM we soft-flush and warn; the caller
-            # can also enable --vae_decode_tiled to engage spatial tiling.
+            # the VAE device.  If the estimated pixel-space output exceeds 90 % of
+            # remaining VRAM we flush the ComfyUI soft cache and, if still tight,
+            # automatically subdivide the latent into micro-chunks of 4 or 2 frames
+            # so each decode pass fits inside physical VRAM.
+            _micro_chunk_size: int = 0  # 0 = decode whole batch at once
             try:
                 import comfy.model_management as _mm
                 free_bytes = _mm.get_free_memory(ctx['vae_device'])
                 # Conservative pixel-space estimate: T × H × W × 3ch × 2 bytes (fp16)
-                est_bytes = (
-                    upscaled_latent.shape[0] * true_h * true_w * 3 * 2
-                )
+                num_frames = upscaled_latent.shape[0]
+                est_bytes = num_frames * true_h * true_w * 3 * 2
                 if free_bytes > 0 and est_bytes > free_bytes * 0.90:
                     debug.log(
                         f"VRAM headroom low: {free_bytes / (1024**3):.1f} GB free, "
@@ -952,6 +953,22 @@ def decode_all_batches(
                         category="memory", force=True
                     )
                     _mm.soft_empty_cache()
+                    # Re-query free VRAM after the flush
+                    free_bytes = _mm.get_free_memory(ctx['vae_device'])
+                    # Per-frame cost estimate
+                    bytes_per_frame = true_h * true_w * 3 * 2
+                    # Try micro-chunk of 4 frames first, fall back to 2
+                    for _cs in (4, 2):
+                        if bytes_per_frame * _cs <= free_bytes * 0.85:
+                            _micro_chunk_size = _cs
+                            break
+                    if _micro_chunk_size > 0:
+                        debug.log(
+                            f"Activating micro-chunk VAE decode: "
+                            f"{_micro_chunk_size} frames per pass "
+                            f"({num_frames} frames total)",
+                            category="memory", force=True
+                        )
             except Exception:
                 pass  # ComfyUI not installed – fall through to tiled decode path
 
@@ -965,20 +982,44 @@ def decode_all_batches(
                 reason="VAE decoding",
                 indent_level=1
             )
-            
-            # Decode latent
+
+            # Decode latent — whole batch or micro-chunked if VRAM is tight
             debug.start_timer("vae_decode")
-            samples = runner.vae_decode([upscaled_latent])
-            debug.end_timer("vae_decode", "VAE decode")
-            
-            # Process samples - get the single decoded sample
-            debug.start_timer("optimized_video_rearrange")
-            samples = optimized_video_rearrange(samples)
-            debug.end_timer("optimized_video_rearrange", "Video rearrange")
-            
-            # Get the decoded sample (always single-element list)
-            sample = samples[0]
-            del samples
+            if _micro_chunk_size > 0:
+                import torch as _torch
+                _chunk_parts: list = []
+                _total_frames = upscaled_latent.shape[0]
+                _start = 0
+                while _start < _total_frames:
+                    _end = min(_start + _micro_chunk_size, _total_frames)
+                    _chunk_lat = upscaled_latent[_start:_end]
+                    debug.log(
+                        f"  micro-chunk decode frames {_start}–{_end - 1}",
+                        category="memory", indent_level=2
+                    )
+                    _chunk_decoded = runner.vae_decode([_chunk_lat])
+                    _chunk_decoded = optimized_video_rearrange(_chunk_decoded)
+                    _chunk_parts.append(_chunk_decoded[0])
+                    del _chunk_lat, _chunk_decoded
+                    try:
+                        import comfy.model_management as _mm2
+                        _mm2.soft_empty_cache()
+                    except Exception:
+                        pass
+                    _start = _end
+                sample = _torch.cat(_chunk_parts, dim=0)
+                del _chunk_parts
+            else:
+                samples = runner.vae_decode([upscaled_latent])
+                debug.end_timer("vae_decode", "VAE decode")
+
+                # Process samples - get the single decoded sample
+                debug.start_timer("optimized_video_rearrange")
+                samples = optimized_video_rearrange(samples)
+                debug.end_timer("optimized_video_rearrange", "Video rearrange")
+
+                sample = samples[0]
+                del samples
             
             # Get original length for this batch (before any padding was added)
             ori_length = ctx['all_ori_lengths'][decode_idx] if decode_idx < len(ctx['all_ori_lengths']) else sample.shape[0]

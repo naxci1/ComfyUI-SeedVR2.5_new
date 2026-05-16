@@ -55,7 +55,6 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
-    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -246,8 +245,12 @@ EXPORT_CODEC_PROFILES: dict[str, dict[str, dict[str, Any]]] = {
         "ProRes 422": {"ffmpeg": ["-c:v", "prores_ks", "-profile:v", "2", "-pix_fmt", "yuv422p10le"], "is_10bit": True},
         "ProRes 422 HQ": {"ffmpeg": ["-c:v", "prores_ks", "-profile:v", "3", "-pix_fmt", "yuv422p10le"], "is_10bit": True},
         "ProRes 4444 XQ": {"ffmpeg": ["-c:v", "prores_ks", "-profile:v", "5", "-pix_fmt", "yuva444p12le"], "is_10bit": True},
-        "QuickTime Animation (Alpha)": {"ffmpeg": ["-c:v", "qtrle", "-pix_fmt", "argb"], "is_10bit": False},
+        "H.264 High (8-bit)": {"ffmpeg": ["-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p"], "is_10bit": False},
+        "H.265 (HEVC) Main (8-bit)": {"ffmpeg": ["-c:v", "libx265", "-profile:v", "main", "-pix_fmt", "yuv420p"], "is_10bit": False},
+        "H.265 (HEVC) Main10 (10-bit)": {"ffmpeg": ["-c:v", "libx265", "-profile:v", "main10", "-pix_fmt", "yuv420p10le"], "is_10bit": True},
+        "Uncompressed YUV (V210)": {"ffmpeg": ["-c:v", "v210"], "is_10bit": True},
         "Uncompressed RGB (R210)": {"ffmpeg": ["-c:v", "r210"], "is_10bit": True},
+        "QuickTime Animation (Alpha)": {"ffmpeg": ["-c:v", "qtrle", "-pix_fmt", "argb"], "is_10bit": False},
     },
     "MKV": {
         "H.264 High (8-bit)": {"ffmpeg": ["-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p"], "is_10bit": False},
@@ -255,6 +258,8 @@ EXPORT_CODEC_PROFILES: dict[str, dict[str, dict[str, Any]]] = {
         "H.265 (HEVC) Main10 (10-bit)": {"ffmpeg": ["-c:v", "libx265", "-profile:v", "main10", "-pix_fmt", "yuv420p10le"], "is_10bit": True},
         "AV1 (8-bit)": {"ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p"], "is_10bit": False},
         "AV1 (10-bit)": {"ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p10le"], "is_10bit": True},
+        "VP9 (Good)": {"ffmpeg": ["-c:v", "libvpx-vp9", "-deadline", "good"], "is_10bit": False},
+        "VP9 (Best)": {"ffmpeg": ["-c:v", "libvpx-vp9", "-deadline", "best"], "is_10bit": False},
         "FFV1 (Lossless 8/10/12-bit)": {"ffmpeg": ["-c:v", "ffv1", "-level", "3"], "is_10bit": True},
         "Uncompressed YUV (V210)": {"ffmpeg": ["-c:v", "v210"], "is_10bit": True},
     },
@@ -1465,18 +1470,6 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(bar)
         layout.setContentsMargins(0, 4, 0, 0)
         layout.setSpacing(4)
-
-        # Progress bars are kept as invisible backing objects so that existing
-        # signal handlers (_on_global_progress, _on_batch_progress, _on_finished,
-        # _reset_progress_bars) continue to work unchanged.  Progress text is
-        # surfaced through status_label instead of a visible bar widget.
-        self.global_progress = QProgressBar()
-        self.global_progress.setRange(0, 100)
-        self.global_progress.hide()
-
-        self.batch_progress = QProgressBar()
-        self.batch_progress.setRange(0, 100)
-        self.batch_progress.hide()
 
         # Status + primary actions
         # Note: run_btn and preview_btn are created in _build_right_panel (action bar at bottom
@@ -3062,13 +3055,8 @@ class MainWindow(QMainWindow):
         self.console.append(f"[{ts}] {line}")
 
     def _reset_progress_bars(self) -> None:
-        self.global_progress.setRange(0, 100)
-        self.global_progress.setValue(0)
-        self.global_progress.setFormat("Total Progress: idle")
-        self.batch_progress.setRange(0, 100)
-        self.batch_progress.setValue(0)
-        self.batch_progress.setFormat("Batch Progress: idle")
         self.fps_label.setText("0.0 fps")
+        self.status_label.setText("Ready")
 
     def _format_seconds(self, seconds: float) -> str:
         total = max(0, int(seconds))
@@ -3077,9 +3065,6 @@ class MainWindow(QMainWindow):
     def _on_global_progress(self, cur: int, tot: int) -> None:
         if tot <= 0:
             return
-        self.global_progress.setRange(0, tot)
-        self.global_progress.setValue(max(0, min(cur, tot)))
-        self.global_progress.setFormat(f"Total Progress: {cur}/{tot}")
 
         elapsed = 0.0 if self._run_started_at is None else (time.time() - self._run_started_at)
         eta_text = "estimating…"
@@ -3097,9 +3082,10 @@ class MainWindow(QMainWindow):
     def _on_batch_progress(self, cur: int, tot: int) -> None:
         if tot <= 0:
             return
-        self.batch_progress.setRange(0, tot)
-        self.batch_progress.setValue(max(0, min(cur, tot)))
-        self.batch_progress.setFormat(f"Batch Progress: {cur}/{tot}")
+        self.status_label.setText(
+            self.status_label.text().split("  |  batch")[0]
+            + f"  |  batch {cur}/{tot}"
+        )
 
     def _set_latest_output_path(self, path: Optional[Path]) -> None:
         self._latest_output_path = path
@@ -3143,10 +3129,6 @@ class MainWindow(QMainWindow):
                 self._on_mode_button(2, True)
         else:
             self.status_label.setText(f"⚠  {msg}")
-        if self.batch_progress.maximum() == self.batch_progress.value():
-            self.batch_progress.setFormat("Batch Progress: complete")
-        if self.global_progress.maximum() == self.global_progress.value():
-            self.global_progress.setFormat("Total Progress: complete")
         if getattr(self, "_tray_icon", None) is not None:
             self._tray_icon.showMessage(
                 "SeedVR2 GUI",
