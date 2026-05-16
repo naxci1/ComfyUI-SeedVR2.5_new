@@ -24,6 +24,7 @@ from PyQt6.QtGui import (
     QColor,
     QDesktopServices,
     QDragEnterEvent,
+    QDragLeaveEvent,
     QDropEvent,
     QFont,
     QIcon,
@@ -216,6 +217,74 @@ try:
 except ImportError:
     from styles import DARK_STYLESHEET  # type: ignore[no-redef]
     from worker import create_worker_thread, resolve_paths, DEFAULT_PYTHON_EXE  # type: ignore[no-redef]
+
+SUPPORTED_VIDEO_EXTS = {
+    ".mp4", ".mov", ".mkv", ".avi", ".webm", ".mpeg", ".mpg",
+    ".m4v", ".wmv", ".flv", ".mts", ".m2ts",
+}
+SUPPORTED_IMAGE_EXTS = {
+    ".png", ".tif", ".tiff", ".jpg", ".jpeg", ".dpx", ".exr",
+}
+MIN_SEQUENCE_FRAMES = 5
+
+INPUT_DIALOG_FILTER = (
+    "Supported Media (*.mp4 *.mov *.mkv *.avi *.webm *.mpeg *.mpg *.m4v *.wmv *.flv *.mts *.m2ts "
+    "*.png *.tif *.tiff *.jpg *.jpeg *.dpx *.exr);;All Files (*)"
+)
+
+EXPORT_CODEC_PROFILES: dict[str, dict[str, dict[str, Any]]] = {
+    "MP4": {
+        "H.264 High (8-bit)": {"ffmpeg": ["-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p"], "is_10bit": False},
+        "H.265 (HEVC) Main (8-bit)": {"ffmpeg": ["-c:v", "libx265", "-profile:v", "main", "-pix_fmt", "yuv420p"], "is_10bit": False},
+        "H.265 (HEVC) Main10 (10-bit)": {"ffmpeg": ["-c:v", "libx265", "-profile:v", "main10", "-pix_fmt", "yuv420p10le"], "is_10bit": True},
+        "AV1 (8-bit)": {"ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p"], "is_10bit": False},
+        "AV1 (10-bit)": {"ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p10le"], "is_10bit": True},
+    },
+    "MOV": {
+        "ProRes 422 Proxy": {"ffmpeg": ["-c:v", "prores_ks", "-profile:v", "0", "-pix_fmt", "yuv422p10le"], "is_10bit": True},
+        "ProRes 422 LT": {"ffmpeg": ["-c:v", "prores_ks", "-profile:v", "1", "-pix_fmt", "yuv422p10le"], "is_10bit": True},
+        "ProRes 422": {"ffmpeg": ["-c:v", "prores_ks", "-profile:v", "2", "-pix_fmt", "yuv422p10le"], "is_10bit": True},
+        "ProRes 422 HQ": {"ffmpeg": ["-c:v", "prores_ks", "-profile:v", "3", "-pix_fmt", "yuv422p10le"], "is_10bit": True},
+        "ProRes 4444 XQ": {"ffmpeg": ["-c:v", "prores_ks", "-profile:v", "5", "-pix_fmt", "yuva444p12le"], "is_10bit": True},
+        "QuickTime Animation (Alpha)": {"ffmpeg": ["-c:v", "qtrle", "-pix_fmt", "argb"], "is_10bit": False},
+        "Uncompressed RGB (R210)": {"ffmpeg": ["-c:v", "r210"], "is_10bit": True},
+    },
+    "MKV": {
+        "H.264 High (8-bit)": {"ffmpeg": ["-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p"], "is_10bit": False},
+        "H.265 (HEVC) Main (8-bit)": {"ffmpeg": ["-c:v", "libx265", "-profile:v", "main", "-pix_fmt", "yuv420p"], "is_10bit": False},
+        "H.265 (HEVC) Main10 (10-bit)": {"ffmpeg": ["-c:v", "libx265", "-profile:v", "main10", "-pix_fmt", "yuv420p10le"], "is_10bit": True},
+        "AV1 (8-bit)": {"ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p"], "is_10bit": False},
+        "AV1 (10-bit)": {"ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p10le"], "is_10bit": True},
+        "FFV1 (Lossless 8/10/12-bit)": {"ffmpeg": ["-c:v", "ffv1", "-level", "3"], "is_10bit": True},
+        "Uncompressed YUV (V210)": {"ffmpeg": ["-c:v", "v210"], "is_10bit": True},
+    },
+    "WEBM": {
+        "VP9 (Good)": {"ffmpeg": ["-c:v", "libvpx-vp9", "-deadline", "good"], "is_10bit": False},
+        "VP9 (Best)": {"ffmpeg": ["-c:v", "libvpx-vp9", "-deadline", "best"], "is_10bit": False},
+        "AV1 (8-bit)": {"ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p"], "is_10bit": False},
+        "AV1 (10-bit)": {"ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p10le"], "is_10bit": True},
+    },
+}
+
+IMAGE_SEQUENCE_PROFILES: dict[str, dict[str, Any]] = {
+    "TIFF (8-bit)": {"ext": ".tiff", "ffmpeg": ["-f", "image2", "-pix_fmt", "rgb24"], "is_10bit": False},
+    "TIFF (16-bit)": {"ext": ".tiff", "ffmpeg": ["-f", "image2", "-pix_fmt", "rgb48le"], "is_10bit": True},
+    "PNG (8-bit)": {"ext": ".png", "ffmpeg": ["-f", "image2", "-pix_fmt", "rgb24"], "is_10bit": False},
+    "PNG (16-bit)": {"ext": ".png", "ffmpeg": ["-f", "image2", "-pix_fmt", "rgb48le"], "is_10bit": True},
+    "JPEG (8-bit)": {"ext": ".jpg", "ffmpeg": ["-f", "image2", "-pix_fmt", "yuvj420p"], "is_10bit": False},
+    "DPX (10-bit)": {"ext": ".dpx", "ffmpeg": ["-f", "image2", "-pix_fmt", "gbrp10le"], "is_10bit": True},
+    "DPX (12-bit)": {"ext": ".dpx", "ffmpeg": ["-f", "image2", "-pix_fmt", "gbrp12le"], "is_10bit": True},
+    "EXR": {"ext": ".exr", "ffmpeg": ["-f", "image2", "-pix_fmt", "gbrpf32le"], "is_10bit": True},
+}
+
+AUDIO_PROFILES: dict[str, list[str]] = {
+    "Copy Audio": ["-c:a", "copy"],
+    "AAC": ["-c:a", "aac", "-b:a", "192k"],
+    "PCM": ["-c:a", "pcm_s24le"],
+    "AC3": ["-c:a", "ac3", "-b:a", "448k"],
+    "FLAC": ["-c:a", "flac"],
+    "No Audio": ["-an"],
+}
 
 
 # ---------------------------------------------------------------------------
@@ -578,6 +647,7 @@ class MainWindow(QMainWindow):
         self._queue_entry_counter: int = 0
         self._force_exit: bool = False
         self._tray_tip_shown: bool = False
+        self._drop_highlight_count: int = 0
 
         self._build_ui()
         self._build_menu_bar()
@@ -587,9 +657,10 @@ class MainWindow(QMainWindow):
         if not icon_path.exists():
             icon_path = Path(get_resource_path("icon.ico"))
         self.setWindowIcon(QIcon(str(icon_path)))
-        self.setAcceptDrops(True)
+        self._enable_global_drop_targets()
         self._setup_system_tray()
         self._persistable_widgets = self._build_persistable_widget_map()
+        self._update_export_controls()
         self._load_model_settings()
         self._prompt_load_last_preset()
 
@@ -609,6 +680,20 @@ class MainWindow(QMainWindow):
         root_layout = QVBoxLayout(root)
         root_layout.setContentsMargins(10, 8, 10, 8)
         root_layout.setSpacing(6)
+        self._drop_overlay = QLabel("Drop supported media anywhere to import", root)
+        self._drop_overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._drop_overlay.setStyleSheet(
+            "QLabel {"
+            "background-color: rgba(17,18,20,230);"
+            "border: 2px dashed #0052CC;"
+            "border-radius: 14px;"
+            "color: #E3E4E6;"
+            "font-size: 18px;"
+            "font-weight: 600;"
+            "padding: 18px;"
+            "}"
+        )
+        self._drop_overlay.hide()
 
         # ── 1. Header ──────────────────────────────────────────────────
         header_widget = QWidget()
@@ -657,6 +742,8 @@ class MainWindow(QMainWindow):
 
         # ── 3. Bottom controls bar ─────────────────────────────────────
         root_layout.addWidget(self._build_bottom_bar())
+        self._drop_overlay.raise_()
+        self._sync_drop_overlay_geometry()
 
     # ── Left panel (comparison player) ────────────────────────────────
 
@@ -699,7 +786,7 @@ class MainWindow(QMainWindow):
 
         # "📂 Open" – quick input-file picker aligned to the far right of the mode bar
         self._open_input_btn = QPushButton("📂 Open")
-        self._open_input_btn.setToolTip("Open an input video or image file")
+        self._open_input_btn.setToolTip("Open a supported input video or image file")
         self._open_input_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
         self._open_input_btn.clicked.connect(self._browse_input_for_player)
         mode_bar.addWidget(self._open_input_btn)
@@ -898,24 +985,25 @@ class MainWindow(QMainWindow):
 
         # ── Output Settings ────────────────────────────────────────────
         g, f = _make_group("Output Settings")
-        self.output_format_combo = QComboBox()
-        self.output_format_combo.addItems([
-            "Auto-detect",
-            # ── Video codecs ──────────────────────
-            "H.264 / mp4 (AVC)",
-            "H.265 / mp4 (HEVC)",
-            "AV1 / mp4",
-            # ── Image sequences ───────────────────
-            "PNG",
-            "JPG",
-            "WEBP",
-            "TIFF",
-        ])
-        self.output_format_combo.setToolTip(
-            "H.265 automatically enables the --10bit flag for x265 encoding.\n"
-            "JPG / WEBP / TIFF map to 'png' container in the current CLI."
-        )
-        f.addRow("Output Format:", self.output_format_combo)
+        self.container_combo = QComboBox()
+        self.container_combo.addItems(list(EXPORT_CODEC_PROFILES.keys()))
+        self.container_combo.currentTextChanged.connect(self._update_export_controls)
+        f.addRow("Container:", self.container_combo)
+
+        self.video_codec_combo = QComboBox()
+        f.addRow("Video Codec:", self.video_codec_combo)
+
+        self.export_image_sequence_check = QCheckBox()
+        self.export_image_sequence_check.toggled.connect(self._update_export_controls)
+        f.addRow("Export as Image Sequence:", self.export_image_sequence_check)
+
+        self.image_sequence_format_combo = QComboBox()
+        self.image_sequence_format_combo.addItems(list(IMAGE_SEQUENCE_PROFILES.keys()))
+        f.addRow("Image Sequence Format:", self.image_sequence_format_combo)
+
+        self.audio_mode_combo = QComboBox()
+        self.audio_mode_combo.addItems(list(AUDIO_PROFILES.keys()))
+        f.addRow("Audio:", self.audio_mode_combo)
 
         self.video_backend_combo = QComboBox()
         self.video_backend_combo.addItems(["opencv", "ffmpeg"])
@@ -1182,7 +1270,9 @@ class MainWindow(QMainWindow):
         btn_row = QHBoxLayout()
         self.status_label = QLabel("Ready")
         self.status_label.setMinimumWidth(200)
-        self.run_btn = QPushButton("▶  Run")
+        self.fps_label = QLabel("0.0 fps")
+        self.fps_label.setMinimumWidth(80)
+        self.run_btn = QPushButton("▶  Export Video")
         self.run_btn.setObjectName("primary_button")
         self.run_btn.clicked.connect(self._run)
 
@@ -1209,6 +1299,7 @@ class MainWindow(QMainWindow):
         self.open_output_folder_btn.clicked.connect(self._open_output_folder)
 
         btn_row.addWidget(self.status_label)
+        btn_row.addWidget(self.fps_label)
         btn_row.addStretch(1)
         btn_row.addWidget(self.run_btn)
         btn_row.addWidget(self.preview_btn)
@@ -1310,7 +1401,11 @@ class MainWindow(QMainWindow):
     def _build_persistable_widget_map(self) -> dict[str, QWidget]:
         return {
             "dit_model_combo": self.dit_model_combo,
-            "output_format_combo": self.output_format_combo,
+            "container_combo": self.container_combo,
+            "video_codec_combo": self.video_codec_combo,
+            "export_image_sequence_check": self.export_image_sequence_check,
+            "image_sequence_format_combo": self.image_sequence_format_combo,
+            "audio_mode_combo": self.audio_mode_combo,
             "video_backend_combo": self.video_backend_combo,
             "use_10bit_check": self.use_10bit_check,
             "color_correction_combo": self.color_correction_combo,
@@ -1351,6 +1446,66 @@ class MainWindow(QMainWindow):
             "debug_check": self.debug_check,
         }
 
+    def _update_export_controls(self, *_: object) -> None:
+        container = self.container_combo.currentText()
+        prev_codec = self.video_codec_combo.currentText()
+        self.video_codec_combo.blockSignals(True)
+        self.video_codec_combo.clear()
+        self.video_codec_combo.addItems(list(EXPORT_CODEC_PROFILES.get(container, {}).keys()))
+        keep_idx = self.video_codec_combo.findText(prev_codec)
+        self.video_codec_combo.setCurrentIndex(keep_idx if keep_idx >= 0 else 0)
+        self.video_codec_combo.blockSignals(False)
+
+        exporting_sequence = self.export_image_sequence_check.isChecked()
+        self.video_codec_combo.setEnabled(not exporting_sequence)
+        self.container_combo.setEnabled(not exporting_sequence)
+        self.image_sequence_format_combo.setEnabled(exporting_sequence)
+
+    def _selected_export_extension(self) -> str:
+        if self.export_image_sequence_check.isChecked():
+            fmt = self.image_sequence_format_combo.currentText()
+            profile = IMAGE_SEQUENCE_PROFILES.get(fmt, {})
+            return str(profile.get("ext", ".png"))
+        container = self.container_combo.currentText().strip().lower()
+        return "." + container if container else ".mp4"
+
+    def _selected_export_profile_to_ffmpeg_args(self) -> dict[str, Any]:
+        """Return a backend mapping of current export choices to FFmpeg arguments."""
+        if self.export_image_sequence_check.isChecked():
+            image_fmt = self.image_sequence_format_combo.currentText()
+            image_profile = IMAGE_SEQUENCE_PROFILES.get(image_fmt, {})
+            return {
+                "mode": "image_sequence",
+                "container": "image2",
+                "image_format": image_fmt,
+                "video_args": image_profile.get("ffmpeg", []),
+                "audio_args": ["-an"],
+            }
+
+        container = self.container_combo.currentText()
+        codec = self.video_codec_combo.currentText()
+        codec_profile = EXPORT_CODEC_PROFILES.get(container, {}).get(codec, {})
+        audio = self.audio_mode_combo.currentText()
+        audio_args = AUDIO_PROFILES.get(audio, AUDIO_PROFILES["Copy Audio"])
+        return {
+            "mode": "video",
+            "container": container,
+            "codec": codec,
+            "video_args": codec_profile.get("ffmpeg", []),
+            "audio_mode": audio,
+            "audio_args": audio_args,
+        }
+
+    def _selected_profile_is_10bit(self) -> bool:
+        if self.export_image_sequence_check.isChecked():
+            fmt = self.image_sequence_format_combo.currentText()
+            profile = IMAGE_SEQUENCE_PROFILES.get(fmt, {})
+            return bool(profile.get("is_10bit", False))
+        container = self.container_combo.currentText()
+        codec = self.video_codec_combo.currentText()
+        profile = EXPORT_CODEC_PROFILES.get(container, {}).get(codec, {})
+        return bool(profile.get("is_10bit", False))
+
     def _serialize_model_settings(self) -> dict[str, Any]:
         data: dict[str, Any] = {}
         for key, widget in self._persistable_widgets.items():
@@ -1382,6 +1537,7 @@ class MainWindow(QMainWindow):
                     continue
             elif isinstance(widget, QCheckBox):
                 widget.setChecked(bool(value))
+        self._update_export_controls()
 
     def _save_model_settings(self) -> None:
         s = QSettings(self._SETTINGS_ORG, self._SETTINGS_APP)
@@ -1562,7 +1718,7 @@ class MainWindow(QMainWindow):
         pre-loaded into the SplitViewWidget for image comparison.
         Video files are fed to the input player (page 0).
         """
-        _IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp", ".gif"}
+        _IMAGE_SUFFIXES = set(SUPPORTED_IMAGE_EXTS) | {".bmp", ".webp", ".gif"}
         suffix = Path(path).suffix.lower()
         if suffix in _IMAGE_SUFFIXES:
             self._current_input_is_image = True
@@ -1672,34 +1828,21 @@ class MainWindow(QMainWindow):
         if md:
             args += ["--model_dir", md]
 
-        # output format + codec mapping
-        # Maps UI display name → (--output_format value, force_10bit)
-        # JPG/WEBP/TIFF map to "png" because the current CLI only accepts "mp4"/"png".
-        _FMT_MAP: dict[str, tuple[str, bool]] = {
-            "Auto-detect":       ("",    False),
-            "H.264 / mp4 (AVC)": ("mp4", False),
-            "H.265 / mp4 (HEVC)": ("mp4", True),   # force --10bit for x265
-            "AV1 / mp4":         ("mp4", False),
-            "PNG":               ("png", False),
-            "JPG":               ("png", False),
-            "WEBP":              ("png", False),
-            "TIFF":              ("png", False),
-        }
-        fmt_val, fmt_10bit = _FMT_MAP.get(self.output_format_combo.currentText(), ("", False))
-        if fmt_val:
-            args += ["--output_format", fmt_val]
-        # H.265 forces 10-bit encoding; only append here if the checkbox hasn't
-        # already done so (avoids duplicate --10bit flags).
-        if fmt_10bit and not self.use_10bit_check.isChecked():
-            args.append("--10bit")
+        # output format mapping for SeedVR2 CLI:
+        # - video export modes map to CLI output_format=mp4
+        # - image sequence modes map to CLI output_format=png (CLI image-sequence path)
+        if self.export_image_sequence_check.isChecked():
+            args += ["--output_format", "png"]
+        else:
+            args += ["--output_format", "mp4"]
 
         # video backend
         vb = self.video_backend_combo.currentText()
         if vb != "opencv":
             args += ["--video_backend", vb]
 
-        # 10-bit
-        if self.use_10bit_check.isChecked():
+        # 10-bit: either explicitly requested or implied by selected export profile
+        if self.use_10bit_check.isChecked() or self._selected_profile_is_10bit():
             args.append("--10bit")
 
         # dit model
@@ -1899,6 +2042,8 @@ class MainWindow(QMainWindow):
         self._set_latest_output_path(None)
 
         args = self._build_args()
+        ffmpeg_profile = self._selected_export_profile_to_ffmpeg_args()
+        self._on_log(f"🎬  Export Profile: {json.dumps(ffmpeg_profile, ensure_ascii=False)}")
 
         self._thread, self._worker = create_worker_thread(cli_script, args, python_exe)
         self._worker.log_line.connect(self._on_log)
@@ -2211,14 +2356,11 @@ class MainWindow(QMainWindow):
         start_dir = self._settings_win.input_edit.text().strip() or ""
         path, _ = QFileDialog.getOpenFileName(
             self, "Select Input File", start_dir,
-            "Videos & Images "
-            "(*.mp4 *.avi *.mov *.mkv *.webm *.png *.jpg *.jpeg *.bmp *.tiff)"
-            ";;All Files (*)",
+            INPUT_DIALOG_FILTER,
         )
         if path:
-            self._settings_win.input_edit.setText(path)
-            self._load_preview(path)
-            self._mode_input_btn.setChecked(True)
+            if not self._apply_dropped_path(Path(path)):
+                self._on_log(f"⚠  Unsupported input format: {path}")
 
     def _try_auto_load_output(self) -> None:
         out = self._settings_win.output_edit.text().strip()
@@ -2226,8 +2368,8 @@ class MainWindow(QMainWindow):
             return
         out_path = Path(out)
 
-        _image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
-        _video_exts = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+        _image_exts = set(SUPPORTED_IMAGE_EXTS) | {".bmp", ".webp"}
+        _video_exts = set(SUPPORTED_VIDEO_EXTS)
 
         # ── Image input: construct output path directly (mirrors inference_cli.generate_output_path) ──
         if self._current_input_is_image and self._split_view is not None:
@@ -2237,12 +2379,12 @@ class MainWindow(QMainWindow):
             inp_path = Path(inp)
             inp_stem = inp_path.stem
 
-            # Determine the expected output extension from the UI combo.
-            _FMT_EXT: dict[str, str] = {
-                "PNG": ".png", "JPG": ".jpg", "WEBP": ".webp", "TIFF": ".tiff",
-            }
-            _fmt_sel = self.output_format_combo.currentText()
-            _preferred_ext: Optional[str] = _FMT_EXT.get(_fmt_sel)  # None for Auto/video
+            # Determine expected extension from current export profile.
+            _preferred_ext: Optional[str] = (
+                self._selected_export_extension()
+                if self.export_image_sequence_check.isChecked()
+                else None
+            )
 
             def _find_image_output() -> Optional[Path]:
                 # Build ordered list of extensions to try: preferred ext first, then all others.
@@ -2414,6 +2556,7 @@ class MainWindow(QMainWindow):
         self.batch_progress.setRange(0, 100)
         self.batch_progress.setValue(0)
         self.batch_progress.setFormat("Batch Progress: idle")
+        self.fps_label.setText("0.0 fps")
 
     def _format_seconds(self, seconds: float) -> str:
         total = max(0, int(seconds))
@@ -2428,9 +2571,13 @@ class MainWindow(QMainWindow):
 
         elapsed = 0.0 if self._run_started_at is None else (time.time() - self._run_started_at)
         eta_text = "estimating…"
+        fps_text = "0.0 fps"
         if cur > 0:
             remaining = (elapsed / cur) * max(0, tot - cur)
             eta_text = f"≈ {self._format_seconds(remaining)} remaining"
+            if elapsed > 0:
+                fps_text = f"{(cur / elapsed):.1f} fps"
+        self.fps_label.setText(fps_text)
         self.status_label.setText(
             f"Processing {cur}/{tot}  |  {self._format_seconds(elapsed)} elapsed  |  {eta_text}"
         )
@@ -2520,32 +2667,138 @@ class MainWindow(QMainWindow):
         if hasattr(self, "queue_run_btn"):
             self.queue_run_btn.setEnabled(not running)
 
-    def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # type: ignore[override]
+    def _enable_global_drop_targets(self) -> None:
+        self.setAcceptDrops(True)
+        self.installEventFilter(self)
+        cw = self.centralWidget()
+        if cw is not None:
+            cw.setAcceptDrops(True)
+            cw.installEventFilter(self)
+            for w in cw.findChildren(QWidget):
+                w.setAcceptDrops(True)
+                w.installEventFilter(self)
+
+    def _sync_drop_overlay_geometry(self) -> None:
+        cw = self.centralWidget()
+        if cw is None:
+            return
+        margin = 18
+        self._drop_overlay.setGeometry(
+            margin,
+            margin,
+            max(100, cw.width() - (2 * margin)),
+            max(80, cw.height() - (2 * margin)),
+        )
+
+    def _set_drop_overlay_visible(self, visible: bool) -> None:
+        if visible:
+            self._sync_drop_overlay_geometry()
+            self._drop_overlay.raise_()
+            self._drop_overlay.show()
+        else:
+            self._drop_overlay.hide()
+
+    def _extract_first_local_path(self, event: Any) -> Optional[Path]:
         mime = event.mimeData()
-        if mime.hasUrls():
-            for url in mime.urls():
-                if url.isLocalFile():
+        if not mime.hasUrls():
+            return None
+        for url in mime.urls():
+            if url.isLocalFile():
+                return Path(url.toLocalFile())
+        return None
+
+    def _sequence_frame_candidates(self, folder: Path) -> list[Path]:
+        try:
+            files = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in SUPPORTED_IMAGE_EXTS]
+        except OSError:
+            return []
+        return sorted(files, key=lambda p: p.name.lower())
+
+    def _is_supported_drop_path(self, path: Path) -> bool:
+        if path.is_file():
+            return path.suffix.lower() in SUPPORTED_VIDEO_EXTS | SUPPORTED_IMAGE_EXTS
+        if path.is_dir():
+            return len(self._sequence_frame_candidates(path)) >= MIN_SEQUENCE_FRAMES
+        return False
+
+    def _apply_dropped_path(self, path: Path) -> bool:
+        if not self._is_supported_drop_path(path):
+            return False
+        if path.is_dir():
+            frames = self._sequence_frame_candidates(path)
+            self._settings_win.input_mode_combo.setCurrentText("Folder")
+            self._settings_win.input_edit.setText(str(path))
+            if frames:
+                self._load_preview(str(frames[0]))
+                self._mode_input_btn.setChecked(True)
+            self._on_log(f"📂  Loaded image-sequence folder ({len(frames)} frames): {path}")
+            return True
+        self._settings_win.input_mode_combo.setCurrentText("File")
+        self._settings_win.input_edit.setText(str(path))
+        self._load_preview(str(path))
+        self._mode_input_btn.setChecked(True)
+        self._on_log(f"📂  Input file set from drag-drop: {path}")
+        return True
+
+    def eventFilter(self, watched: object, event: object) -> bool:
+        if isinstance(event, QEvent) and event.type() == QEvent.Type.DragMove:
+            path = self._extract_first_local_path(event)  # type: ignore[arg-type]
+            if path is not None and self._is_supported_drop_path(path):
+                self._set_drop_overlay_visible(True)
+                event.acceptProposedAction()  # type: ignore[attr-defined]
+                return True
+            event.ignore()  # type: ignore[attr-defined]
+            return True
+        if isinstance(event, (QDragEnterEvent, QDropEvent)):
+            if isinstance(event, QDragEnterEvent):
+                path = self._extract_first_local_path(event)
+                if path is not None and self._is_supported_drop_path(path):
+                    self._drop_highlight_count += 1
+                    self._set_drop_overlay_visible(True)
                     event.acceptProposedAction()
-                    return
+                    return True
+                self._set_drop_overlay_visible(False)
+                event.ignore()
+                return True
+            if isinstance(event, QDropEvent):
+                path = self._extract_first_local_path(event)
+                self._drop_highlight_count = 0
+                self._set_drop_overlay_visible(False)
+                if path is not None and self._apply_dropped_path(path):
+                    event.acceptProposedAction()
+                    return True
+                event.ignore()
+                return True
+
+        if isinstance(event, QDragLeaveEvent):
+            self._drop_highlight_count = max(0, self._drop_highlight_count - 1)
+            if self._drop_highlight_count == 0:
+                self._set_drop_overlay_visible(False)
+        return super().eventFilter(watched, event)
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # type: ignore[override]
+        path = self._extract_first_local_path(event)
+        if path is not None and self._is_supported_drop_path(path):
+            self._set_drop_overlay_visible(True)
+            event.acceptProposedAction()
+            return
         event.ignore()
 
     def dropEvent(self, event: QDropEvent) -> None:  # type: ignore[override]
-        urls = [u for u in event.mimeData().urls() if u.isLocalFile()]
-        if not urls:
-            event.ignore()
+        self._set_drop_overlay_visible(False)
+        path = self._extract_first_local_path(event)
+        if path is not None and self._apply_dropped_path(path):
+            event.acceptProposedAction()
             return
-        path = Path(urls[0].toLocalFile())
-        if path.is_dir():
-            self._settings_win.input_mode_combo.setCurrentText("Folder")
-            self._settings_win.input_edit.setText(str(path))
-            self._on_log(f"📂  Input folder set from drag-drop: {path}")
-        elif path.is_file():
-            self._settings_win.input_mode_combo.setCurrentText("File")
-            self._settings_win.input_edit.setText(str(path))
-            self._load_preview(str(path))
-            self._mode_input_btn.setChecked(True)
-            self._on_log(f"📂  Input file set from drag-drop: {path}")
-        event.acceptProposedAction()
+        event.ignore()
+
+    def dragLeaveEvent(self, event: QDragLeaveEvent) -> None:  # type: ignore[override]
+        self._set_drop_overlay_visible(False)
+        super().dragLeaveEvent(event)
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._sync_drop_overlay_geometry()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._save_model_settings()

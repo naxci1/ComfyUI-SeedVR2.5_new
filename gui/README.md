@@ -37,3 +37,4 @@ The .exe will be created in `dist/SeedVR2_GUI.exe`.
 - Presets can be saved/loaded as JSON from the right panel.
 - A job queue panel can enqueue multiple jobs for sequential execution.
 - System tray integration keeps the app running in the background and shows completion notifications.
+- Output settings now include container-aware codec choices, image-sequence export modes, and audio profiles with FFmpeg mapping metadata logged per run.
