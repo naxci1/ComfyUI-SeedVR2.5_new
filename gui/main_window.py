@@ -1652,7 +1652,6 @@ class MainWindow(QMainWindow):
         "ProRes 4444 XQ": "MOV",
         "QuickTime Animation (Alpha)": "MOV",
         "Uncompressed RGB (R210)": "MOV",
-        "Uncompressed YUV (V210)": "MKV",
         "FFV1 (Lossless 8/10/12-bit)": "MKV",
     }
 
