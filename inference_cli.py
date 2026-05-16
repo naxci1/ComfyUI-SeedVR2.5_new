@@ -485,9 +485,54 @@ def ensure_unique_output_path(path: Path | str) -> Path:
         counter += 1
 
 
-def process_single_file(input_path: str, args: argparse.Namespace, device_list: List[str], 
-                       output_path: Optional[str] = None, format_auto_detected: bool = False,
-                       runner_cache: Optional[Dict[str, Any]] = None) -> int:
+def _resolve_effective_resolution(args: "argparse.Namespace", input_width: int, input_height: int) -> int:
+    """Compute the effective target resolution from pre_downscale + resolution_mode settings.
+
+    Steps:
+    1. Apply pre-downscale factor to determine the *processing baseline* dimensions.
+    2. If resolution_mode == 'xtimes', multiply the baseline short-side by resolution_scale.
+    3. If resolution_mode == 'pixel', return args.resolution unchanged (it is already the
+       pixel target; the engine's own geometry logic will handle aspect ratio).
+
+    Returns:
+        Target short-side resolution in pixels to pass as args.resolution.
+    """
+    ds = getattr(args, "pre_downscale", 1) or 1
+    baseline_h = input_height // ds
+    baseline_w = input_width // ds
+    short_side = min(baseline_h, baseline_w)
+
+    mode = getattr(args, "resolution_mode", "pixel") or "pixel"
+    if mode == "xtimes":
+        scale = getattr(args, "resolution_scale", 2) or 2
+        return short_side * scale
+    # pixel mode
+    return getattr(args, "resolution", 1080)
+
+
+def _apply_lanczos_downscale(frames_tensor: "torch.Tensor", factor: int) -> "torch.Tensor":
+    """Downscale a float32 [T, H, W, C] tensor by *factor* using Lanczos filtering.
+
+    Uses cv2.INTER_LANCZOS4 on each frame independently.  Returns a new tensor of shape
+    [T, H//factor, W//factor, C] with values still in [0, 1].
+    """
+    import cv2 as _cv2
+    frames_np = (frames_tensor.cpu().numpy() * 255.0).astype("uint8")  # [T,H,W,C]
+    T, H, W, C = frames_np.shape
+    new_h, new_w = H // factor, W // factor
+    out = []
+    for frame in frames_np:
+        frame_bgr = _cv2.cvtColor(frame, _cv2.COLOR_RGB2BGR)
+        resized = _cv2.resize(frame_bgr, (new_w, new_h), interpolation=_cv2.INTER_LANCZOS4)
+        out.append(_cv2.cvtColor(resized, _cv2.COLOR_BGR2RGB))
+    import numpy as _np
+    import torch as _torch
+    return _torch.from_numpy(_np.stack(out, axis=0).astype("float32") / 255.0)
+
+
+def process_single_file(input_path: str, args: "argparse.Namespace", device_list: "List[str]",
+                       output_path: "Optional[str]" = None, format_auto_detected: bool = False,
+                       runner_cache: "Optional[Dict[str, Any]]" = None) -> int:
     """
     Process a single video or image file with optional model caching.
     
@@ -578,6 +623,17 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
                      level="WARNING", category="file", force=True)
             cap.release()
             return 0
+
+        # --- Pre-downscale & X-Times resolution math ---
+        ds_factor = getattr(args, "pre_downscale", 1) or 1
+        if ds_factor > 1:
+            debug.log(
+                f"Pre-Downscale {ds_factor}:1 → processing baseline: "
+                f"{width // ds_factor}×{height // ds_factor} px",
+                category="info", force=True, indent_level=1,
+            )
+        args.resolution = _resolve_effective_resolution(args, width, height)
+        debug.log(f"Effective target resolution: {args.resolution} px (short side)", category="info", force=True, indent_level=1)
         
         # Streaming mode: process in chunks
         chunk_size = args.chunk_size if args.chunk_size > 0 else frames_to_process
@@ -588,7 +644,9 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
             debug.log(f"Streaming mode: chunks of {chunk_size} frames, overlap={args.temporal_overlap}", 
                      category="info", force=True, indent_level=1)
         
-        is_png = args.output_format == "png"
+        # Image sequences: detect by format extension, not just "png"
+        _image_seq_exts = {"png", "tif", "tiff", "jpg", "jpeg", "dpx", "exr"}
+        is_png = (args.output_format or "").lower() in _image_seq_exts
         video_writer = None
         overlap = args.temporal_overlap
         frames_written = 0
@@ -607,6 +665,8 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
                 'frames_to_process': frames_to_process,
             }
             result = _gpu_processing(None, device_list, args, video_info=video_info)
+            if ds_factor > 1:
+                result = _apply_lanczos_downscale(result, ds_factor)
             
             # Save result
             if is_png:
@@ -637,10 +697,14 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
                 cleanup_timer_name="chunk_cleanup"
             ):
                 chunk_count += 1
-                
+                # Apply pre-downscale Lanczos if requested
+                if ds_factor > 1:
+                    result = _apply_lanczos_downscale(result, ds_factor)
                 # Save output
                 if is_png:
-                    save_frames_to_image(result, output_path, base_name, start_index=frames_written)
+                    save_frames_to_image(result, output_path, base_name,
+                                         start_index=frames_written,
+                                         image_format=args.output_format)
                 else:
                     video_writer = save_frames_to_video(result, output_path, fps, writer=video_writer,
                         video_backend=args.video_backend, use_10bit=args.use_10bit,
@@ -1462,7 +1526,8 @@ Examples:
     io_group.add_argument("--output", type=str, default=None,
                         help="Output path (default: auto-generated in 'output/' directory)")
     io_group.add_argument("--output_format", type=str, default=None,
-                        help="Output format/container: 'png' (image sequence), 'mp4', 'mov', 'mkv', 'webm'. "
+                        help="Output format/container: 'png' (image sequence), 'mp4', 'mov', 'mkv', 'webm', "
+                             "'tiff', 'tif', 'jpg', 'jpeg', 'dpx', 'exr'. "
                              "Default: auto-detect from input type")
     io_group.add_argument("--video_backend", type=str, default="ffmpeg", choices=["ffmpeg", "opencv"],
                         help="Video encoder backend: 'ffmpeg' (recommended, requires ffmpeg in PATH) or "
@@ -1476,7 +1541,16 @@ Examples:
                              "When supplied, implies --video_backend ffmpeg and overrides --10bit codec defaults.")
     io_group.add_argument("--model_dir", type=str, default=None,
                         help=f"Model directory (default: ./models/{SEEDVR2_FOLDER_NAME})")
-    
+    io_group.add_argument("--pre_downscale", type=int, default=1, choices=[1, 2, 3],
+                        help="Pre-downscale input by this factor before upscaling using Lanczos filtering. "
+                             "1 = no downscale (default), 2 = halve dimensions, 3 = reduce to 1/3.")
+    io_group.add_argument("--resolution_mode", type=str, default="pixel", choices=["pixel", "xtimes"],
+                        help="Resolution computation mode. 'pixel' (default): use --resolution as the target "
+                             "short-side pixel count. 'xtimes': multiply the pre-downscaled input height "
+                             "by --resolution_scale.")
+    io_group.add_argument("--resolution_scale", type=int, default=2,
+                        help="Multiplier used when --resolution_mode xtimes is active (default: 2).")
+
     # Model Selection
     model_group = parser.add_argument_group('Model selection')
     model_group.add_argument("--dit_model", type=str, default=DEFAULT_DIT,

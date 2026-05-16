@@ -1097,10 +1097,55 @@ class MainWindow(QMainWindow):
 
         # Processing Settings
         g, f = _make_group("Processing Settings")
+
+        # --- Pre-Downscale ---
+        self.pre_downscale_combo = QComboBox()
+        self.pre_downscale_combo.addItems(["1:1", "2:1", "3:1"])
+        self.pre_downscale_combo.setToolTip(
+            "Downscale the input before upscaling.\n"
+            "1:1 = no downscale (passthrough)\n"
+            "2:1 = halve input dimensions via Lanczos before feeding the model\n"
+            "3:1 = reduce to 1/3 input dimensions via Lanczos"
+        )
+        f.addRow("Pre-Downscale:", self.pre_downscale_combo)
+
+        # --- Resolution Mode (X Times / Pixel) + value control ---
+        _res_mode_row = QHBoxLayout()
+        _res_mode_row.setSpacing(4)
+        self.resolution_mode_combo = QComboBox()
+        self.resolution_mode_combo.addItems(["Pixel", "X Times"])
+        self.resolution_mode_combo.setToolTip(
+            "Pixel: target the output at an exact pixel height.\n"
+            "X Times: multiply the (pre-downscaled) input height by this factor."
+        )
+        _res_mode_row.addWidget(self.resolution_mode_combo)
+
+        # Pixel mode: plain spinbox
         self.resolution_spin = QSpinBox()
         self.resolution_spin.setRange(128, 7680)
         self.resolution_spin.setValue(720)
-        f.addRow("Resolution:", self.resolution_spin)
+        self.resolution_spin.setSingleStep(1)
+
+        # X Times mode: combo with preset multipliers
+        self.resolution_times_combo = QComboBox()
+        self.resolution_times_combo.addItems(["1x", "2x", "3x", "4x", "5x"])
+        self.resolution_times_combo.setCurrentText("2x")
+
+        _res_mode_row.addWidget(self.resolution_spin, stretch=1)
+        _res_mode_row.addWidget(self.resolution_times_combo, stretch=1)
+
+        # Wire up visibility
+        def _update_res_mode(text: str) -> None:
+            pixel = (text == "Pixel")
+            self.resolution_spin.setVisible(pixel)
+            self.resolution_times_combo.setVisible(not pixel)
+
+        self.resolution_mode_combo.currentTextChanged.connect(_update_res_mode)
+        _update_res_mode(self.resolution_mode_combo.currentText())
+
+        _res_mode_container = QWidget()
+        _res_mode_container.setLayout(_res_mode_row)
+        f.addRow("Resolution:", _res_mode_container)
 
         self.max_resolution_spin = QSpinBox()
         self.max_resolution_spin.setRange(0, 7680)
@@ -1110,6 +1155,7 @@ class MainWindow(QMainWindow):
 
         self.batch_size_spin = QSpinBox()
         self.batch_size_spin.setRange(1, 10001)
+        self.batch_size_spin.setSingleStep(4)
         self.batch_size_spin.setValue(81)
         self.batch_size_spin.setToolTip(
             "Must be 4k+1: 1, 5, 9, 13, … (automatically snapped when typed)"
@@ -1618,6 +1664,9 @@ class MainWindow(QMainWindow):
             "target_bitrate_combo": self.target_bitrate_combo,
             "use_10bit_check": self.use_10bit_check,
             "color_correction_combo": self.color_correction_combo,
+            "pre_downscale_combo": self.pre_downscale_combo,
+            "resolution_mode_combo": self.resolution_mode_combo,
+            "resolution_times_combo": self.resolution_times_combo,
             "resolution_spin": self.resolution_spin,
             "max_resolution_spin": self.max_resolution_spin,
             "batch_size_spin": self.batch_size_spin,
@@ -2167,12 +2216,19 @@ class MainWindow(QMainWindow):
             args += ["--model_dir", md]
 
         # output format mapping for SeedVR2 CLI:
-        # - image sequence modes map to CLI output_format=png
+        # - image sequence modes map to CLI output_format=<actual ext without dot>
         # - video-mode preview maps to the selected container (mov/mp4/mkv/webm)
         # - image-mode preview maps to png (single frame, legacy)
         # - normal video export maps to the selected container
         if self.export_image_sequence_check.isChecked():
-            args += ["--output_format", "png"]
+            # Pass the real extension so the CLI writes TIFF/DPX/EXR/JPEG correctly,
+            # not always PNG.  Use the profile ext but strip the leading dot.
+            img_fmt = self.image_sequence_format_combo.currentText()
+            img_ext = IMAGE_SEQUENCE_PROFILES.get(img_fmt, {}).get("ext", ".png")
+            # The CLI treats "png" as an image sequence trigger; for other formats
+            # we pass the bare extension name (e.g. "tiff", "jpg", "dpx", "exr").
+            cli_fmt = img_ext.lstrip(".") if img_ext else "png"
+            args += ["--output_format", cli_fmt]
         elif self._is_preview_run and not self._is_preview_video_mode:
             # Image-mode preview: always a single PNG regardless of export settings.
             args += ["--output_format", "png"]
@@ -2200,9 +2256,27 @@ class MainWindow(QMainWindow):
         # dit model
         args += ["--dit_model", self.dit_model_combo.currentText()]
 
-        # resolution – always emit so the CLI uses the GUI value regardless of its own default
-        res = self.resolution_spin.value()
-        args += ["--resolution", str(res)]
+        # pre-downscale (preprocessing factor before upscaling)
+        pre_ds_text = self.pre_downscale_combo.currentText()  # "1:1", "2:1", "3:1"
+        pre_ds_factor = int(pre_ds_text.split(":")[0])  # 1, 2, or 3
+        if pre_ds_factor > 1:
+            args += ["--pre_downscale", str(pre_ds_factor)]
+
+        # resolution – compute final target from mode + pre-downscale factor
+        res_mode = self.resolution_mode_combo.currentText()  # "Pixel" or "X Times"
+        if res_mode == "X Times":
+            # Multiplier applied to the (already pre-downscaled) input height.
+            # We don't know the actual input dimension at arg-build time, so we
+            # pass a special combined flag that the CLI interprets: negative value
+            # signals "X times" mode.  We encode as --resolution_mode xtimes
+            # and --resolution_scale <N> for the CLI to interpret.
+            times_text = self.resolution_times_combo.currentText()  # "1x".."5x"
+            times_val = int(times_text.rstrip("x"))
+            args += ["--resolution_mode", "xtimes", "--resolution_scale", str(times_val)]
+        else:
+            # Pixel mode: direct target resolution
+            res = self.resolution_spin.value()
+            args += ["--resolution", str(res)]
 
         max_res = self.max_resolution_spin.value()
         if max_res != 0:
