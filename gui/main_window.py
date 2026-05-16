@@ -652,6 +652,8 @@ class MainWindow(QMainWindow):
         self._preview_original_position: int = 0
         self._preview_compare_active: bool = False
         self._preview_saved_batch_size: int = 81
+        # True when the current/last preview run processed a VIDEO clip (not a PNG frame)
+        self._is_preview_video_mode: bool = False
 
         self._build_ui()
         self._build_menu_bar()
@@ -1893,11 +1895,19 @@ class MainWindow(QMainWindow):
         # output
         out = self._settings_win.output_edit.text().strip()
         if self._is_preview_run:
-            # Preview must write to an explicit PNG file in the selected export directory.
             export_dir = self._resolve_export_output_dir()
-            preview_out = self._ensure_unique_file_path(
-                export_dir / "preview_upscaled_frame_001.png"
-            )
+            if self._is_preview_video_mode:
+                # BUG 1 fix: video-mode preview outputs a real video clip with the
+                # correct container extension (e.g. .mov for ProRes, .mp4 for H.265).
+                container_ext = self._selected_export_extension()
+                preview_out = self._ensure_unique_file_path(
+                    export_dir / f"preview_upscaled_frame_001{container_ext}"
+                )
+            else:
+                # Image-mode preview: single PNG frame (legacy behaviour).
+                preview_out = self._ensure_unique_file_path(
+                    export_dir / "preview_upscaled_frame_001.png"
+                )
             self._settings_win.output_edit.setText(str(preview_out))
             args += ["--output", str(preview_out)]
         elif out:
@@ -1910,11 +1920,13 @@ class MainWindow(QMainWindow):
 
         # output format mapping for SeedVR2 CLI:
         # - image sequence modes map to CLI output_format=png
-        # - video export modes map to the selected container name (mov, mkv, webm, mp4)
+        # - video-mode preview maps to the selected container (mov/mp4/mkv/webm)
+        # - image-mode preview maps to png (single frame, legacy)
+        # - normal video export maps to the selected container
         if self.export_image_sequence_check.isChecked():
             args += ["--output_format", "png"]
-        elif self._is_preview_run:
-            # Preview always produces a single PNG image regardless of export settings
+        elif self._is_preview_run and not self._is_preview_video_mode:
+            # Image-mode preview: always a single PNG regardless of export settings.
             args += ["--output_format", "png"]
         else:
             container = self.container_combo.currentText().lower()
@@ -1922,9 +1934,10 @@ class MainWindow(QMainWindow):
 
         # video backend (FFmpeg-only)
         args += ["--video_backend", "ffmpeg"]
-        # Emit ffmpeg_video_args when a custom (non-default) video codec is selected and we
-        # are running an actual export (not a preview PNG run).
-        if not self._is_preview_run and not self.export_image_sequence_check.isChecked():
+        # Emit ffmpeg_video_args for any video export (including video-mode preview).
+        # Skip only for image-mode preview PNG runs and image sequence exports.
+        _is_png_preview = self._is_preview_run and not self._is_preview_video_mode
+        if not _is_png_preview and not self.export_image_sequence_check.isChecked():
             profile = self._selected_export_profile_to_ffmpeg_args()
             video_codec_args = profile.get("video_args", [])
             if video_codec_args:
@@ -1962,7 +1975,11 @@ class MainWindow(QMainWindow):
             args += ["--skip_first_frames", str(skip)]
 
         load_cap = self.load_cap_spin.value()
-        if load_cap:
+        if self._is_preview_run and self._is_preview_video_mode:
+            # BUG 1 fix: cap at 81 frames for a fast video-mode preview; always
+            # override whatever the user has set in the load_cap spinbox.
+            args += ["--load_cap", "81"]
+        elif load_cap:
             args += ["--load_cap", str(load_cap)]
 
         chunk = self.chunk_size_spin.value()
@@ -2043,6 +2060,12 @@ class MainWindow(QMainWindow):
             dec_ov = self.vae_decode_tile_overlap_spin.value()
             if dec_ov != 128:
                 args += ["--vae_decode_tile_overlap", str(dec_ov)]
+        elif batch >= 81:
+            # BUG 5 fix: auto-enable aggressive VAE decode tiling when batch_size >= 81
+            # to prevent the 2.44 GB VRAM overflow observed during VAE decoding on 16 GB GPUs.
+            # tile_size=512 keeps peak VRAM usage within the physical GPU limit.
+            args.append("--vae_decode_tiled")
+            args += ["--vae_decode_tile_size", "512"]
 
         tile_dbg = self.tile_debug_combo.currentText()
         if tile_dbg != "false":
@@ -2220,12 +2243,25 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             app.quit()
-        raise SystemExit(0)
+        sys.exit(0)
 
     def _preview_run(self) -> None:
-        """Capture the currently displayed video frame, save to a temp PNG,
-        set batch size=1 and input to that file, then start an upscale run."""
-        frame_img = None
+        """Run a short preview of the current input.
+
+        Video input + video export mode (BUG 1 fix)
+        ─────────────────────────────────────────────
+        Do NOT capture a single PNG frame.  Instead run the real pipeline on
+        the first 81 frames of the source video, outputting a short clip in
+        the selected container/codec.  The resulting video is shown in Split
+        View so the user can compare original vs upscaled.  Clicking Play
+        afterwards resumes the full original video (BUG 2 fix).
+
+        Image input or image-sequence export mode (legacy)
+        ───────────────────────────────────────────────────
+        Capture the currently displayed frame as a PNG, upscale it as a
+        single image, and display the result in Split View.
+        """
+        # Save the caller's state so _on_finished can restore it.
         self._preview_original_input_path = self._settings_win.input_edit.text().strip()
         self._preview_original_input_mode = self._settings_win.input_mode_combo.currentText()
         self._preview_original_output_path = self._settings_win.output_edit.text().strip()
@@ -2234,6 +2270,46 @@ class MainWindow(QMainWindow):
             self._preview_original_position = self._input_player.position()
         self._preview_compare_active = False
 
+        # ── BUG 1: decide preview mode ─────────────────────────────────
+        # Video-mode preview: original input is a video file AND the export
+        # profile is a video container (not image sequence).
+        is_video_input = (
+            not getattr(self, "_current_input_is_image", False)
+            and self._preview_original_input_path
+            and Path(self._preview_original_input_path).suffix.lower()
+            in SUPPORTED_VIDEO_EXTS
+        )
+        is_video_export = not self.export_image_sequence_check.isChecked()
+
+        if is_video_input and is_video_export:
+            # ── VIDEO-mode preview ──────────────────────────────────────
+            # Process the first 81 frames of the original video as a short
+            # clip in the selected container; batch size is kept at its
+            # current value (81 by default).  _build_args injects
+            # --load_cap 81 and uses the proper container/codec args.
+            self._is_preview_video_mode = True
+            self._is_preview_run = True
+
+            # Pause players so there is no file-lock contention.
+            if _MULTIMEDIA_AVAILABLE:
+                if self._input_player is not None:
+                    self._input_player.pause()
+                if self._output_player is not None:
+                    self._output_player.pause()
+
+            self._on_log(
+                "ℹ  Preview (video mode): will process first 81 frames of "
+                f"{self._preview_original_input_path}"
+            )
+            # _build_args will compute the output path and write it into
+            # output_edit; we don't touch it here.
+            self._run()
+            return
+
+        # ── IMAGE-mode preview (single-frame PNG, legacy behaviour) ────
+        self._is_preview_video_mode = False
+
+        frame_img = None
         if _MULTIMEDIA_AVAILABLE and self._input_player is not None:
             # Step 1: pause the video so the frame buffer is stable
             self._input_player.pause()
@@ -2378,8 +2454,13 @@ class MainWindow(QMainWindow):
             self._split_toggle.setChecked(True)
             self._split_toggle.blockSignals(False)
             if self._preview_compare_active:
+                # Output player always shows the preview clip on the right side.
                 if self._output_player is not None:
                     self._output_player.setVideoOutput(self._split_view.output_sink)
+                # BUG 2 fix: for video-mode preview also route the input player to the
+                # split view so the left side shows the original video for comparison.
+                if self._is_preview_video_mode and self._input_player is not None:
+                    self._input_player.setVideoOutput(self._split_view.input_sink)
             elif self._current_input_is_image:
                 # Image input: feed directly into SplitViewWidget; no video sink needed.
                 inp_path = self._settings_win.input_edit.text().strip()
@@ -2887,6 +2968,8 @@ class MainWindow(QMainWindow):
                 4000,
             )
         self._is_preview_run = False
+        # Reset video-mode preview flag AFTER _on_mode_button has had a chance to read it.
+        self._is_preview_video_mode = False
         if was_preview and self.batch_size_spin.value() == 1 and self._preview_saved_batch_size:
             self.batch_size_spin.setValue(self._preview_saved_batch_size)
         # Restore output path that was overridden during preview (but keep the input field
