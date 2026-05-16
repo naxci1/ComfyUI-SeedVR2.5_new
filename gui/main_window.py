@@ -934,7 +934,7 @@ class MainWindow(QMainWindow):
         self._split_toggle = QCheckBox("⊣⊢")
         self._split_toggle.setToolTip("Split View")
         self._split_toggle.setEnabled(_MULTIMEDIA_AVAILABLE)
-        self._split_toggle.setMaximumWidth(50)
+        self._split_toggle.setMaximumWidth(18)
         self._split_toggle.toggled.connect(self._on_split_toggle_changed)
 
         self._open_output_btn = QPushButton("Out…")
@@ -950,7 +950,6 @@ class MainWindow(QMainWindow):
         under_row.addWidget(self._time_lbl)
         under_row.addWidget(self._seek_slider, stretch=1)
         under_row.addWidget(self.preview_btn)
-        under_row.addWidget(self.run_btn)
         under_row.addWidget(self._split_toggle)
         under_row.addWidget(self._open_output_btn)
         layout.addLayout(under_row)
@@ -1354,7 +1353,7 @@ class MainWindow(QMainWindow):
             _cw.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
             _cw.setMaximumWidth(80)
         for _cw in _host.findChildren(QCheckBox):
-            _cw.setMaximumWidth(40)
+            _cw.setMaximumWidth(18)
             _cw.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
         scroll.setWidget(_host)
@@ -1363,10 +1362,10 @@ class MainWindow(QMainWindow):
         # Preview and Export buttons are added to the left panel (under viewer) in _build_left_panel.
         # Create them here as instance attributes so they exist before left panel is built.
         self.preview_btn = QPushButton("⚡ Preview")
+        self.preview_btn.setMinimumWidth(90)
         self.preview_btn.setToolTip(
-            "Video input + video container: process first 81 frames as a short clip.\n"
-            "Image input: upscale the current frame as a single PNG preview.\n"
-            "Load Cap is temporarily set to 81 for video-mode preview and restored on completion."
+            "Capture the current frame from the timeline, upscale it as a single PNG,\n"
+            "and display original vs upscaled side-by-side in Split View."
         )
         self.preview_btn.clicked.connect(self._preview_run)
 
@@ -1518,6 +1517,7 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self.status_label)
         btn_row.addWidget(self.fps_label)
         btn_row.addStretch(1)
+        btn_row.addWidget(self.run_btn)
         btn_row.addWidget(self.abort_btn)
         layout.addLayout(btn_row)
 
@@ -2499,48 +2499,7 @@ class MainWindow(QMainWindow):
             self._preview_original_position = self._input_player.position()
         self._preview_compare_active = False
 
-        # ── BUG 1: decide preview mode ─────────────────────────────────
-        # Video-mode preview: original input is a video file AND the export
-        # profile is a video container (not image sequence).
-        is_video_input = (
-            not getattr(self, "_current_input_is_image", False)
-            and self._preview_original_input_path
-            and Path(self._preview_original_input_path).suffix.lower()
-            in SUPPORTED_VIDEO_EXTS
-        )
-        is_video_export = not self.export_image_sequence_check.isChecked()
-
-        if is_video_input and is_video_export:
-            # ── VIDEO-mode preview ──────────────────────────────────────
-            # Process the first 81 frames of the original video as a short
-            # clip in the selected container; batch size is kept at its
-            # current value (81 by default).  _build_args injects
-            # --load_cap 81 and uses the proper container/codec args.
-            self._is_preview_video_mode = True
-            self._is_preview_run = True
-
-            # Pause players so there is no file-lock contention.
-            if _MULTIMEDIA_AVAILABLE:
-                if self._input_player is not None:
-                    self._input_player.pause()
-                if self._output_player is not None:
-                    self._output_player.pause()
-
-            self._on_log(
-                "ℹ  Preview (video mode): will process first 81 frames of "
-                f"{self._preview_original_input_path}"
-            )
-            # Instead of hardcoding --load_cap 81 in _build_args, write the value
-            # into the GUI widget so _build_args reads it dynamically (CORE LAW: no
-            # hardcoded pipeline parameters anywhere in the execution loop).
-            self._preview_saved_load_cap = self.load_cap_spin.value()
-            self.load_cap_spin.setValue(81)
-            # _build_args will compute the output path and write it into
-            # output_edit; we don't touch it here.
-            self._run()
-            return
-
-        # ── IMAGE-mode preview (single-frame PNG, legacy behaviour) ────
+        # ── Always use single-frame PNG capture (never trigger video pipeline) ──
         self._is_preview_video_mode = False
 
         frame_img = None
