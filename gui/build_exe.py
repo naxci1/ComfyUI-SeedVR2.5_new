@@ -78,10 +78,10 @@ def main() -> None:
     dist_dir: Path = args.output_dir or (repo_root / "dist")
 
     entry_point = str(gui_dir / "app.py")
-    # Prefer icon.ico at the gui root; fall back to assets/icon.ico
-    icon_path = gui_dir / "icon.ico"
+    # Prefer assets/icon.ico; fall back to gui/icon.ico for legacy layouts
+    icon_path = gui_dir / "assets" / "icon.ico"
     if not icon_path.exists():
-        icon_path = gui_dir / "assets" / "icon.ico"
+        icon_path = gui_dir / "icon.ico"
 
     # ── PyInstaller command ──────────────────────────────────────────────
     cmd: list[str] = [

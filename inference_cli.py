@@ -145,7 +145,7 @@ class FFMPEGVideoWriter:
     
     Provides cv2.VideoWriter-compatible interface (write, isOpened, release) while
     using ffmpeg for encoding. Enables 10-bit output (yuv420p10le with x265) which
-    reduces banding artifacts in gradients compared to 8-bit opencv output.
+    reduces banding artifacts in gradients compared to standard 8-bit encodes.
     
     Args:
         path: Output video file path
@@ -154,6 +154,11 @@ class FFMPEGVideoWriter:
         fps: Frames per second
         use_10bit: If True, uses x265 codec with yuv420p10le pixel format.
                    If False, uses x264 with yuv420p (default: False)
+        custom_video_args: Optional list of ffmpeg video encoding args to use instead of
+                           the default H264/H265 codec selection. When provided, ``use_10bit``
+                           is ignored for codec/pix_fmt selection (but you may still rely on it
+                           elsewhere). Example: ["-c:v", "prores_ks", "-profile:v", "3",
+                           "-pix_fmt", "yuv422p10le"]
     
     Raises:
         RuntimeError: If ffmpeg is not found in system PATH
@@ -163,14 +168,19 @@ class FFMPEGVideoWriter:
         Internally converts to RGB for ffmpeg rawvideo input.
     """
     
-    def __init__(self, path: str, width: int, height: int, fps: float, use_10bit: bool = False):
-        pix_fmt = 'yuv420p10le' if use_10bit else 'yuv420p'
-        codec = 'libx265' if use_10bit else 'libx264'
+    def __init__(self, path: str, width: int, height: int, fps: float, use_10bit: bool = False,
+                 custom_video_args: Optional[List[str]] = None):
+        if custom_video_args:
+            video_enc_args = custom_video_args
+        else:
+            pix_fmt = 'yuv420p10le' if use_10bit else 'yuv420p'
+            codec = 'libx265' if use_10bit else 'libx264'
+            video_enc_args = ['-c:v', codec, '-pix_fmt', pix_fmt, '-preset', 'medium', '-crf', '12']
         
         self.proc = subprocess.Popen(
             ['ffmpeg', '-y', '-f', 'rawvideo', '-pix_fmt', 'rgb24',
              '-s', f'{width}x{height}', '-r', str(fps), '-i', '-',
-             '-c:v', codec, '-pix_fmt', pix_fmt, '-preset', 'medium', '-crf', '12', path],
+             *video_enc_args, path],
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
     
@@ -377,6 +387,16 @@ def get_input_type(input_path: str) -> Literal['video', 'image', 'directory', 'u
         return "unknown"
 
 
+_IMAGE_OUTPUT_EXTS = frozenset({".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp"})
+_VIDEO_CONTAINER_EXTS: Dict[str, str] = {
+    "mp4": ".mp4",
+    "mov": ".mov",
+    "mkv": ".mkv",
+    "webm": ".webm",
+    "avi": ".avi",
+}
+
+
 def generate_output_path(input_path: str, output_format: str, output_dir: Optional[str] = None, 
                         input_type: Optional[str] = None, from_directory: bool = False) -> str:
     """
@@ -384,7 +404,7 @@ def generate_output_path(input_path: str, output_format: str, output_dir: Option
     
     Args:
         input_path: Source file path
-        output_format: "mp4" or "png"
+        output_format: "mp4", "mov", "mkv", "webm", "png", or any video container name
         output_dir: Optional output directory (overrides default behavior)
         input_type: Optional input type ("image", "video", "directory")
         from_directory: True if processing files from a directory (batch mode)
@@ -413,16 +433,49 @@ def generate_output_path(input_path: str, output_format: str, output_dir: Option
     # Build filename with optional suffix
     file_suffix = "_upscaled" if add_suffix else ""
     
+    # Image input always produces an image output regardless of the video format flag
+    if input_type == "image":
+        output_path = base_dir / f"{input_name}{file_suffix}.png"
+        return str(ensure_unique_output_path(output_path).resolve())
+
     # Generate output path based on format
     if output_format == "png":
-        if input_type == "image":
-            output_path = base_dir / f"{input_name}{file_suffix}.png"
-        else:
-            output_path = base_dir / f"{input_name}{file_suffix}"
+        # PNG sequence: output is a directory, not a file
+        output_path = base_dir / f"{input_name}{file_suffix}"
     else:
-        output_path = base_dir / f"{input_name}{file_suffix}.mp4"
+        # Video output: pick the container extension
+        fmt_lower = (output_format or "mp4").lower()
+        ext = _VIDEO_CONTAINER_EXTS.get(fmt_lower, f".{fmt_lower}")
+        output_path = base_dir / f"{input_name}{file_suffix}{ext}"
     
-    return str(output_path.resolve())
+    return str(ensure_unique_output_path(output_path).resolve())
+
+
+def ensure_unique_output_path(path: Path | str) -> Path:
+    """Return a non-conflicting file or directory path by appending a numeric suffix."""
+    candidate = Path(path)
+    if not candidate.exists():
+        return candidate
+
+    if candidate.suffix:
+        stem = candidate.stem
+        suffix = candidate.suffix
+        parent = candidate.parent
+        counter = 1
+        while True:
+            probe = parent / f"{stem}_{counter}{suffix}"
+            if not probe.exists():
+                return probe
+            counter += 1
+
+    parent = candidate.parent
+    name = candidate.name
+    counter = 1
+    while True:
+        probe = parent / f"{name}_{counter}"
+        if not probe.exists():
+            return probe
+        counter += 1
 
 
 def process_single_file(input_path: str, args: argparse.Namespace, device_list: List[str], 
@@ -460,6 +513,12 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
         # No extension or PNG sequence → treat as directory, generate filename
         output_path = generate_output_path(input_path, args.output_format, 
                                          output_dir=output_path, input_type=input_type)
+    else:
+        output_path = str(ensure_unique_output_path(output_path).resolve())
+    
+    # Guard: image inputs must never write to a video-extension path (OpenCV imwrite crash)
+    if input_type == "image" and Path(output_path).suffix.lower() not in _IMAGE_OUTPUT_EXTS:
+        output_path = str(Path(output_path).with_suffix(".png").resolve())
     
     # Show format with auto-detection indicator
     format_prefix = "Auto-detected" if format_auto_detected else "Requested"
@@ -514,6 +573,9 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
         chunk_idx = 0
         base_name = Path(input_path).stem
         
+        # Extract custom ffmpeg video args if supplied
+        custom_video_args: Optional[List[str]] = getattr(args, "ffmpeg_video_args", None) or None
+        
         # Multi-GPU: workers stream their own segments
         if len(device_list) > 1:
             cap.release()  # Workers will reopen
@@ -529,7 +591,8 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
                 save_frames_to_image(result, output_path, base_name)
             else:
                 video_writer = save_frames_to_video(result, output_path, fps, 
-                    video_backend=args.video_backend, use_10bit=args.use_10bit)
+                    video_backend=args.video_backend, use_10bit=args.use_10bit,
+                    custom_video_args=custom_video_args)
                 if video_writer is not None:
                     video_writer.release()
             
@@ -558,7 +621,8 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
                     save_frames_to_image(result, output_path, base_name, start_index=frames_written)
                 else:
                     video_writer = save_frames_to_video(result, output_path, fps, writer=video_writer,
-                        video_backend=args.video_backend, use_10bit=args.use_10bit)
+                        video_backend=args.video_backend, use_10bit=args.use_10bit,
+                        custom_video_args=custom_video_args)
                 
                 frames_written += result.shape[0]
                 del result
@@ -742,14 +806,15 @@ def save_frames_to_video(
     output_path: str, 
     fps: float = 30.0,
     writer: Optional[cv2.VideoWriter] = None,
-    video_backend: str = "opencv",
-    use_10bit: bool = False
+    video_backend: str = "ffmpeg",
+    use_10bit: bool = False,
+    custom_video_args: Optional[List[str]] = None,
 ) -> Optional[cv2.VideoWriter]:
     """
-    Save frames tensor to MP4 video file.
+    Save frames tensor to a video file.
     
     Converts tensor from Float32 [0,1] to uint8 [0,255], RGB to BGR for OpenCV,
-    and writes to video file using mp4v codec. Supports streaming mode where
+    and writes to video file. Supports streaming mode where
     an existing writer is passed and kept open for subsequent chunks.
     
     Args:
@@ -757,6 +822,10 @@ def save_frames_to_video(
         output_path: Output video file path (directory created if doesn't exist)
         fps: Frames per second for output video (default: 30.0)
         writer: Existing VideoWriter for streaming (if None, creates new one)
+        video_backend: reserved for backwards compatibility (FFmpeg-only export path)
+        use_10bit: When video_backend=ffmpeg and custom_video_args is None, use x265/10-bit
+        custom_video_args: Optional list of ffmpeg video encoding args (overrides codec/pix_fmt
+                           defaults). Implies video_backend=ffmpeg.
     
     Returns:
         VideoWriter if streaming mode (caller must close), None if standalone mode
@@ -767,14 +836,14 @@ def save_frames_to_video(
     frames_np = (frames_tensor.cpu().numpy() * 255.0).astype(np.uint8)
     T, H, W, C = frames_np.shape
     
+    # FFmpeg-only export backend (OpenCV VideoWriter path intentionally removed)
+    effective_backend = "ffmpeg"
+    
     if writer is None:
-        debug.log(f"Saving {T} frames to video: {output_path} (backend={video_backend})", category="file")
+        debug.log(f"Saving {T} frames to video: {output_path} (backend={effective_backend})", category="file")
         os.makedirs(Path(output_path).parent, exist_ok=True)
-        if video_backend == "ffmpeg":
-            writer = FFMPEGVideoWriter(output_path, W, H, fps, use_10bit)
-        else:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            writer = cv2.VideoWriter(output_path, fourcc, fps, (W, H))
+        writer = FFMPEGVideoWriter(output_path, W, H, fps, use_10bit,
+                                   custom_video_args=custom_video_args)
         if not writer.isOpened():
             raise ValueError(f"Cannot create video writer for: {output_path}")
     
@@ -1353,13 +1422,18 @@ Examples:
                         help="Input: video file (.mp4, .avi, etc.), image file (.png, .jpg, etc.), or directory")
     io_group.add_argument("--output", type=str, default=None,
                         help="Output path (default: auto-generated in 'output/' directory)")
-    io_group.add_argument("--output_format", type=str, default=None, choices=["mp4", "png", None],
-                        help="Output format: 'mp4' (video) or 'png' (image sequence). Default: auto-detect from input type")
-    io_group.add_argument("--video_backend", type=str, default="opencv", choices=["opencv", "ffmpeg"],
-                        help="Video encoder backend: 'opencv' (default) or 'ffmpeg' (requires ffmpeg in PATH)")
+    io_group.add_argument("--output_format", type=str, default=None,
+                        help="Output format/container: 'png' (image sequence), 'mp4', 'mov', 'mkv', 'webm'. "
+                             "Default: auto-detect from input type")
+    io_group.add_argument("--video_backend", type=str, default="ffmpeg", choices=["ffmpeg"],
+                        help="Video encoder backend (FFmpeg-only). Requires ffmpeg in PATH.")
     io_group.add_argument("--10bit", dest="use_10bit", action="store_true",
                         help="Save 10-bit video with x265 codec (reduces banding). Without this flag, "
                          "ffmpeg uses x264 for maximum compatibility. Requires --video_backend ffmpeg")
+    io_group.add_argument("--ffmpeg_video_args", type=str, default=None,
+                        help="JSON array of custom FFmpeg video encoding args, e.g. "
+                             '\'["-c:v","prores_ks","-profile:v","3","-pix_fmt","yuv422p10le"]\'. '
+                             "When supplied, implies --video_backend ffmpeg and overrides --10bit codec defaults.")
     io_group.add_argument("--model_dir", type=str, default=None,
                         help=f"Model directory (default: ./models/{SEEDVR2_FOLDER_NAME})")
     
@@ -1375,10 +1449,10 @@ Examples:
                         help="Target short-side resolution in pixels (default: 1080)")
     process_group.add_argument("--max_resolution", type=int, default=0,
                         help="Maximum resolution for any edge. Scales down if exceeded. 0 = no limit (default: 0)")
-    process_group.add_argument("--batch_size", type=int, default=5,
+    process_group.add_argument("--batch_size", type=int, default=81,
                         help="Frames per batch (must follow 4n+1: 1, 5, 9, 13, 17, 21,...). "
-                         "Ideally matches shot length for best temporal consistency. Higher values improve "
-                         "quality and speed but require more VRAM. Default: 5")
+                          "Ideally matches shot length for best temporal consistency. Higher values improve "
+                         "quality and speed but require more VRAM. Default: 81")
     process_group.add_argument("--uniform_batch_size", action="store_true",
                         help="Pad final batch to match batch_size. Prevents temporal artifacts caused by small "
                          "final batches. Add extra compute but recommended for optimal quality.")
@@ -1536,9 +1610,22 @@ def main() -> None:
         debug.log(f"VAE decode tile overlap ({args.vae_decode_tile_overlap}) must be smaller than tile size ({args.vae_decode_tile_size})", level="ERROR", category="vae", force=True)
         sys.exit(1)
     
-    # Validate ffmpeg availability if selected
+    # Validate ffmpeg availability if selected or needed for custom video args
+    if args.ffmpeg_video_args:
+        try:
+            import json as _json
+            parsed_ffmpeg_args = _json.loads(args.ffmpeg_video_args)
+            if not isinstance(parsed_ffmpeg_args, list):
+                raise ValueError("must be a JSON array")
+            args.ffmpeg_video_args = parsed_ffmpeg_args  # replace string with list
+        except Exception as exc:
+            debug.log(f"--ffmpeg_video_args JSON parse error: {exc}", level="ERROR", category="setup", force=True)
+            sys.exit(1)
+        # Force ffmpeg backend when custom args are given
+        args.video_backend = "ffmpeg"
+    
     if args.video_backend == "ffmpeg" and shutil.which("ffmpeg") is None:
-        debug.log("--video_backend ffmpeg requires ffmpeg in PATH. Install ffmpeg or use --video_backend opencv", 
+        debug.log("--video_backend ffmpeg requires ffmpeg in PATH. Install ffmpeg and retry.", 
                  level="ERROR", category="setup", force=True)
         sys.exit(1)
     

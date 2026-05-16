@@ -254,8 +254,9 @@ class SettingsWindow(QDialog):
                 self,
                 "Select Input File",
                 "",
-                "Videos & Images "
-                "(*.mp4 *.avi *.mov *.mkv *.webm *.png *.jpg *.jpeg *.bmp *.tiff)"
+                "Supported Media "
+                "(*.mp4 *.mov *.mkv *.avi *.webm *.mpeg *.mpg *.m4v *.wmv *.flv *.mts *.m2ts "
+                "*.png *.tif *.tiff *.jpg *.jpeg *.dpx *.exr)"
                 ";;All Files (*)",
             )
             if path:

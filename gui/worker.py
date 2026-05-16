@@ -10,6 +10,7 @@ from __future__ import annotations
 import subprocess
 import os
 import sys
+import signal
 from pathlib import Path
 from typing import List, Optional
 
@@ -22,6 +23,7 @@ from PyQt6.QtCore import QObject, QThread, pyqtSignal
 # Suppress the console window that would appear on Windows when launching
 # a subprocess from a --noconsole PyInstaller bundle or a windowed app.
 _CREATE_NO_WINDOW: int = 0x08000000 if sys.platform == "win32" else 0
+_CREATE_NEW_PROCESS_GROUP: int = 0x00000200 if sys.platform == "win32" else 0
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +180,8 @@ class InferenceWorker(QObject):
                 errors="replace",
                 bufsize=1,
                 env=env,
-                creationflags=_CREATE_NO_WINDOW,
+                creationflags=_CREATE_NO_WINDOW | _CREATE_NEW_PROCESS_GROUP,
+                start_new_session=(sys.platform != "win32"),
             )
         except FileNotFoundError:
             self.log_line.emit(
@@ -238,6 +241,28 @@ class InferenceWorker(QObject):
         self._abort = True
         if self._process and self._process.poll() is None:
             self._process.terminate()
+
+    def force_kill(self) -> None:
+        """Forcefully terminate the subprocess tree."""
+        self._abort = True
+        if not self._process or self._process.poll() is not None:
+            return
+        try:
+            if sys.platform == "win32":
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(self._process.pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    creationflags=_CREATE_NO_WINDOW,
+                )
+            else:
+                os.killpg(os.getpgid(self._process.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                self._process.kill()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
