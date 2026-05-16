@@ -63,7 +63,6 @@ from PyQt6.QtWidgets import (
     QSplitter,
     QSplitterHandle,
     QStackedWidget,
-    QSystemTrayIcon,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -677,7 +676,6 @@ class MainWindow(QMainWindow):
             icon_path = Path(get_resource_path("icon.ico"))
         self.setWindowIcon(QIcon(str(icon_path)))
         self._enable_global_drop_targets()
-        self._setup_system_tray()
         self._persistable_widgets = self._build_persistable_widget_map()
         self._update_export_controls()
         self._load_model_settings()
@@ -1583,44 +1581,6 @@ class MainWindow(QMainWindow):
             ),
         )
 
-    def _setup_system_tray(self) -> None:
-        if not QSystemTrayIcon.isSystemTrayAvailable():
-            self._tray_icon = None
-            return
-
-        icon = self.windowIcon()
-        if icon.isNull():
-            path = Path(get_resource_path("assets/icon.ico"))
-            if not path.exists():
-                path = Path(get_resource_path("icon.ico"))
-            icon = QIcon(str(path))
-        self._tray_icon = QSystemTrayIcon(icon, self)
-        self._tray_icon.setToolTip("SeedVR2.5 GUI")
-        self._tray_icon.activated.connect(self._on_tray_activated)
-
-        tray_menu = QMenu()
-        show_action = tray_menu.addAction("Show")
-        show_action.triggered.connect(self._restore_from_tray)
-        exit_action = tray_menu.addAction("Exit")
-        exit_action.triggered.connect(self._exit_from_tray)
-        self._tray_icon.setContextMenu(tray_menu)
-        self._tray_icon.show()
-
-    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
-        if reason in (
-            QSystemTrayIcon.ActivationReason.Trigger,
-            QSystemTrayIcon.ActivationReason.DoubleClick,
-        ):
-            self._restore_from_tray()
-
-    def _restore_from_tray(self) -> None:
-        self.show()
-        self.raise_()
-        self.activateWindow()
-
-    def _exit_from_tray(self) -> None:
-        self._force_shutdown()
-
     def _build_persistable_widget_map(self) -> dict[str, QWidget]:
         return {
             "dit_model_combo": self.dit_model_combo,
@@ -2060,8 +2020,6 @@ class MainWindow(QMainWindow):
         suffix = Path(path).suffix.lower()
         if suffix in _IMAGE_SUFFIXES:
             self._current_input_is_image = True
-            # Auto-set batch size to 1 for single image inputs
-            self.batch_size_spin.setValue(1)
             # Dimensions via QImageReader (no full decode needed)
             reader = QImageReader(path)
             size = reader.size()
@@ -2469,9 +2427,6 @@ class MainWindow(QMainWindow):
             pass
         self._pause_playback()
         self._release_cuda_resources()
-        if getattr(self, "_tray_icon", None) is not None:
-            self._tray_icon.hide()
-            self._tray_icon.deleteLater()
         app = QApplication.instance()
         if app is not None:
             app.quit()
@@ -3183,13 +3138,6 @@ class MainWindow(QMainWindow):
                 self._on_mode_button(2, True)
         else:
             self.status_label.setText(f"⚠  {msg}")
-        if getattr(self, "_tray_icon", None) is not None:
-            self._tray_icon.showMessage(
-                "SeedVR2 GUI",
-                f"Processing finished: {msg}",
-                QSystemTrayIcon.MessageIcon.Information if success else QSystemTrayIcon.MessageIcon.Warning,
-                4000,
-            )
         self._is_preview_run = False
         # Reset video-mode preview flag AFTER _on_mode_button has had a chance to read it.
         self._is_preview_video_mode = False
