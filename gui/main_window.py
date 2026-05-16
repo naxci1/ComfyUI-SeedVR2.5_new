@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from PyQt6.QtCore import Qt, QRectF, QSettings, QUrl, QEvent, pyqtSignal
+from PyQt6.QtCore import Qt, QRectF, QSettings, QUrl, QEvent, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QColor,
@@ -902,32 +902,51 @@ class MainWindow(QMainWindow):
         self._current_input_is_image: bool = False
 
         under_row = QHBoxLayout()
-        under_row.setContentsMargins(0, 3, 0, 3)
-        under_row.setSpacing(4)
+        under_row.setContentsMargins(0, 4, 0, 4)
+        under_row.setSpacing(3)
+
+        _btn_css = (
+            "QPushButton {"
+            "  min-width: 34px; min-height: 26px;"
+            "  padding: 2px 4px;"
+            "  font-size: 14px;"
+            "  color: #e8e8e8;"
+            "  background: #3a3a3a;"
+            "  border: 1px solid #555;"
+            "  border-radius: 4px;"
+            "}"
+            "QPushButton:hover  { background: #505050; border-color: #888; }"
+            "QPushButton:pressed { background: #222; }"
+            "QPushButton:disabled { color: #555; background: #2a2a2a; border-color: #3a3a3a; }"
+        )
 
         self._frame_back_btn = QPushButton("⏮")
-        self._frame_back_btn.setFixedWidth(30)
+        self._frame_back_btn.setToolTip("Previous frame")
+        self._frame_back_btn.setStyleSheet(_btn_css)
         self._frame_back_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
         self._frame_back_btn.clicked.connect(lambda: self._step_frame(-1))
 
         self._play_btn = QPushButton("▶")
-        self._play_btn.setFixedWidth(30)
+        self._play_btn.setToolTip("Play")
+        self._play_btn.setStyleSheet(_btn_css)
         self._play_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
         self._play_btn.clicked.connect(self._on_play_pause)
 
         self._pause_btn = QPushButton("⏸")
-        self._pause_btn.setFixedWidth(30)
+        self._pause_btn.setToolTip("Pause")
+        self._pause_btn.setStyleSheet(_btn_css)
         self._pause_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
         self._pause_btn.clicked.connect(self._pause_playback)
 
         self._frame_forward_btn = QPushButton("⏭")
-        self._frame_forward_btn.setFixedWidth(30)
+        self._frame_forward_btn.setToolTip("Next frame")
+        self._frame_forward_btn.setStyleSheet(_btn_css)
         self._frame_forward_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
         self._frame_forward_btn.clicked.connect(lambda: self._step_frame(1))
 
         self._time_lbl = QLabel("0:00/0:00")
-        self._time_lbl.setFixedWidth(72)
-        self._time_lbl.setStyleSheet("color:#888; font-size:10px;")
+        self._time_lbl.setMinimumWidth(72)
+        self._time_lbl.setStyleSheet("color:#aaa; font-size:10px; padding: 0 2px;")
 
         self._seek_slider = QSlider(Qt.Orientation.Horizontal)
         self._seek_slider.setRange(0, 0)
@@ -937,12 +956,13 @@ class MainWindow(QMainWindow):
         self._split_toggle = QCheckBox("⊣⊢")
         self._split_toggle.setToolTip("Split View")
         self._split_toggle.setEnabled(_MULTIMEDIA_AVAILABLE)
-        self._split_toggle.setMaximumWidth(18)
+        self._split_toggle.setMaximumWidth(22)
         self._split_toggle.toggled.connect(self._on_split_toggle_changed)
 
-        self._open_output_btn = QPushButton("Out…")
-        self._open_output_btn.setToolTip("Open Output file…")
-        self._open_output_btn.setFixedWidth(46)
+        _out_css = _btn_css.replace("min-width: 34px", "min-width: 60px")
+        self._open_output_btn = QPushButton("📂 Out")
+        self._open_output_btn.setToolTip("Select Output Video…")
+        self._open_output_btn.setStyleSheet(_out_css)
         self._open_output_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
         self._open_output_btn.clicked.connect(self._browse_output_video)
 
@@ -1311,8 +1331,11 @@ class MainWindow(QMainWindow):
         self._on_bitrate_mode_changed(self.bitrate_mode_combo.currentText())
 
         self.video_backend_combo = QComboBox()
-        self.video_backend_combo.addItems(["ffmpeg"])
-        self.video_backend_combo.setEnabled(False)
+        self.video_backend_combo.addItems(["ffmpeg", "opencv"])
+        self.video_backend_combo.setToolTip(
+            "ffmpeg: high-quality encoding via FFmpeg (recommended)\n"
+            "opencv: fallback OpenCV VideoWriter (mp4/avi only, no 10-bit)"
+        )
         vf.addRow("Video Backend:", self.video_backend_combo)
         codec_layout.addWidget(self._video_export_group)
 
@@ -2157,12 +2180,13 @@ class MainWindow(QMainWindow):
             container = self.container_combo.currentText().lower()
             args += ["--output_format", container or "mp4"]
 
-        # video backend (FFmpeg-only)
-        args += ["--video_backend", "ffmpeg"]
-        # Emit ffmpeg_video_args for any video export (including video-mode preview).
-        # Skip only for image-mode preview PNG runs and image sequence exports.
+        # video backend – user-selectable (ffmpeg or opencv)
+        video_backend = self.video_backend_combo.currentText() or "ffmpeg"
+        args += ["--video_backend", video_backend]
+        # Emit ffmpeg_video_args only when ffmpeg backend is selected.
+        # Skip for image-mode preview PNG runs and image sequence exports.
         _is_png_preview = self._is_preview_run and not self._is_preview_video_mode
-        if not _is_png_preview and not self.export_image_sequence_check.isChecked():
+        if not _is_png_preview and not self.export_image_sequence_check.isChecked() and video_backend == "ffmpeg":
             profile = self._selected_export_profile_to_ffmpeg_args()
             video_codec_args = profile.get("video_args", [])
             if video_codec_args:
@@ -2819,6 +2843,10 @@ class MainWindow(QMainWindow):
     def _load_input_video(self, path: str) -> None:
         if self._input_player:
             self._input_player.setSource(QUrl.fromLocalFile(path))
+            # Force the decoder to render the first frame immediately so the
+            # viewer shows a static preview instead of a black rectangle.
+            self._input_player.play()
+            QTimer.singleShot(150, self._input_player.pause)
 
     def _load_output_video(self, path: str) -> None:
         if self._output_player:
@@ -3131,6 +3159,17 @@ class MainWindow(QMainWindow):
             # After a Preview run, automatically switch to Split View for comparison
             if was_preview and _MULTIMEDIA_AVAILABLE:
                 self._preview_compare_active = self._latest_output_path is not None
+                # For image-mode preview: load the captured input frame into the left
+                # side of the split view BEFORE restoring the input_edit path so the
+                # viewer shows original-vs-upscaled rather than blank-vs-upscaled.
+                preview_temp = getattr(self, "_preview_temp_path", None)
+                if preview_temp and self._split_view is not None and not self._is_preview_video_mode:
+                    try:
+                        pix = QPixmap(preview_temp)
+                        if not pix.isNull():
+                            self._split_view.set_input_image(pix.toImage())
+                    except Exception:
+                        pass
                 if self._preview_original_input_path:
                     self._settings_win.input_mode_combo.setCurrentText(self._preview_original_input_mode)
                     self._settings_win.input_edit.setText(self._preview_original_input_path)

@@ -857,24 +857,38 @@ def save_frames_to_video(
     """
     frames_np = (frames_tensor.cpu().numpy() * 255.0).astype(np.uint8)
     T, H, W, C = frames_np.shape
-    
-    # FFmpeg-only export backend (OpenCV VideoWriter path intentionally removed)
-    effective_backend = "ffmpeg"
-    
+
+    effective_backend = video_backend if video_backend in ("ffmpeg", "opencv") else "ffmpeg"
+
     if writer is None:
         debug.log(f"Saving {T} frames to video: {output_path} (backend={effective_backend})", category="file")
         os.makedirs(Path(output_path).parent, exist_ok=True)
-        writer = FFMPEGVideoWriter(output_path, W, H, fps, use_10bit,
-                                   custom_video_args=custom_video_args)
-        if not writer.isOpened():
-            raise ValueError(f"Cannot create video writer for: {output_path}")
-    
+        if effective_backend == "opencv":
+            # OpenCV VideoWriter: select a codec based on the output extension.
+            ext = Path(output_path).suffix.lower()
+            if ext in (".mp4", ".m4v"):
+                fourcc = cv2.VideoWriter.fourcc(*"mp4v")
+            elif ext in (".avi",):
+                fourcc = cv2.VideoWriter.fourcc(*"XVID")
+            elif ext in (".mov",):
+                fourcc = cv2.VideoWriter.fourcc(*"mp4v")
+            else:
+                fourcc = cv2.VideoWriter.fourcc(*"mp4v")
+            writer = cv2.VideoWriter(output_path, fourcc, fps, (W, H))
+            if not writer.isOpened():
+                raise ValueError(f"cv2.VideoWriter cannot open: {output_path}")
+        else:
+            writer = FFMPEGVideoWriter(output_path, W, H, fps, use_10bit,
+                                       custom_video_args=custom_video_args)
+            if not writer.isOpened():
+                raise ValueError(f"Cannot create video writer for: {output_path}")
+
     for i, frame in enumerate(frames_np):
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         writer.write(frame_bgr)
         if debug.enabled and (i + 1) % 100 == 0:
             debug.log(f"Written {i + 1}/{T} frames", category="file")
-    
+
     return writer  # Caller always closes
 
 
@@ -1450,8 +1464,9 @@ Examples:
     io_group.add_argument("--output_format", type=str, default=None,
                         help="Output format/container: 'png' (image sequence), 'mp4', 'mov', 'mkv', 'webm'. "
                              "Default: auto-detect from input type")
-    io_group.add_argument("--video_backend", type=str, default="ffmpeg", choices=["ffmpeg"],
-                        help="Video encoder backend (FFmpeg-only). Requires ffmpeg in PATH.")
+    io_group.add_argument("--video_backend", type=str, default="ffmpeg", choices=["ffmpeg", "opencv"],
+                        help="Video encoder backend: 'ffmpeg' (recommended, requires ffmpeg in PATH) or "
+                             "'opencv' (fallback, mp4/avi output only, no 10-bit support).")
     io_group.add_argument("--10bit", dest="use_10bit", action="store_true",
                         help="Save 10-bit video with x265 codec (reduces banding). Without this flag, "
                          "ffmpeg uses x264 for maximum compatibility. Requires --video_backend ffmpeg")
