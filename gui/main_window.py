@@ -888,6 +888,20 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(self._viewer_stack, stretch=1)
 
+        # ── Action buttons (Preview + Export) directly under viewer ────
+        _preview_action_sep = QWidget()
+        _preview_action_sep.setFixedHeight(1)
+        _preview_action_sep.setStyleSheet("background:#272A2D;")
+        layout.addWidget(_preview_action_sep)
+
+        _action_row = QHBoxLayout()
+        _action_row.setContentsMargins(0, 4, 0, 4)
+        _action_row.setSpacing(8)
+        _action_row.addWidget(self.preview_btn)
+        _action_row.addStretch(1)
+        _action_row.addWidget(self.run_btn)
+        layout.addLayout(_action_row)
+
         # ── File metadata label ────────────────────────────────────────
         self._current_input_is_image: bool = False
         self._meta_label = QLabel("")
@@ -960,50 +974,33 @@ class MainWindow(QMainWindow):
         outer_layout.setContentsMargins(0, 0, 0, 0)
         outer_layout.setSpacing(0)
 
-        # ── Mode switcher: Video Mode | Image Sequence Mode ─────────────
-        _MODE_SS = (
-            "QPushButton{"
-            "  background:transparent; border:none;"
-            "  border-bottom:2px solid transparent;"
-            "  color:#888; padding:6px 14px; font-size:13px;"
-            "}"
-            "QPushButton:checked{ color:#E3E4E6; border-bottom:2px solid #0052CC; }"
-            "QPushButton:hover:!checked{ color:#BFC3CA; }"
-        )
-        mode_bar = QWidget()
-        mode_bar.setObjectName("mode_bar")
-        mode_bar.setFixedHeight(38)
-        mb_layout = QHBoxLayout(mode_bar)
-        mb_layout.setContentsMargins(6, 0, 6, 0)
-        mb_layout.setSpacing(0)
+        # ── File Format selector (replaces Video/Image Sequence mode toggle) ──
+        _fmt_bar = QWidget()
+        _fmt_bar.setObjectName("mode_bar")
+        _fmt_bar.setFixedHeight(38)
+        _fmt_layout = QHBoxLayout(_fmt_bar)
+        _fmt_layout.setContentsMargins(8, 0, 8, 0)
+        _fmt_layout.setSpacing(8)
 
-        self._mode_video_btn = QPushButton("Video Mode")
-        self._mode_video_btn.setCheckable(True)
-        self._mode_video_btn.setChecked(True)
-        self._mode_video_btn.setStyleSheet(_MODE_SS)
+        _fmt_lbl = QLabel("File Format:")
+        _fmt_lbl.setStyleSheet("color:#B0B3B8; font-size:12px;")
+        _fmt_layout.addWidget(_fmt_lbl)
 
-        self._mode_imgseq_btn = QPushButton("Image Sequence")
-        self._mode_imgseq_btn.setCheckable(True)
-        self._mode_imgseq_btn.setStyleSheet(_MODE_SS)
+        self.file_format_combo = QComboBox()
+        self.file_format_combo.addItems([
+            "MP4", "MOV", "MKV", "WEBM",
+            "PNG Sequence", "TIFF Sequence", "DPX Sequence", "EXR Sequence",
+        ])
+        self.file_format_combo.setCurrentText("MP4")
+        self.file_format_combo.currentTextChanged.connect(self._on_file_format_changed)
+        _fmt_layout.addWidget(self.file_format_combo, stretch=1)
 
-        _mode_grp = QButtonGroup(outer)
-        _mode_grp.setExclusive(True)
-        _mode_grp.addButton(self._mode_video_btn, 0)
-        _mode_grp.addButton(self._mode_imgseq_btn, 1)
-        _mode_grp.idToggled.connect(
-            lambda idx, checked: self._update_output_mode(idx) if checked else None
-        )
+        _fmt_sep = QWidget()
+        _fmt_sep.setFixedHeight(1)
+        _fmt_sep.setStyleSheet("background:#272A2D;")
 
-        mb_layout.addWidget(self._mode_video_btn)
-        mb_layout.addWidget(self._mode_imgseq_btn)
-        mb_layout.addStretch(1)
-
-        mode_sep = QWidget()
-        mode_sep.setFixedHeight(1)
-        mode_sep.setStyleSheet("background:#272A2D;")
-
-        outer_layout.addWidget(mode_bar)
-        outer_layout.addWidget(mode_sep)
+        outer_layout.addWidget(_fmt_bar)
+        outer_layout.addWidget(_fmt_sep)
 
         # ── Tab header bar (Adjustments | Codec settings) ───────────────
         _TAB_SS = (
@@ -1100,6 +1097,7 @@ class MainWindow(QMainWindow):
         _idx = self.dit_model_combo.findText("seedvr2_ema_3b-Q8_0.gguf")
         if _idx >= 0:
             self.dit_model_combo.setCurrentIndex(_idx)
+        self.dit_model_combo.setMinimumWidth(240)
         f.addRow("DiT Model:", self.dit_model_combo)
         adj_layout.addWidget(g)
 
@@ -1116,7 +1114,14 @@ class MainWindow(QMainWindow):
         self.max_resolution_spin.setToolTip("0 = no limit")
         f.addRow("Max Resolution:", self.max_resolution_spin)
 
-        f.addRow("Batch Size:", self._build_batch_stepper())
+        self.batch_size_spin = QSpinBox()
+        self.batch_size_spin.setRange(1, 10001)
+        self.batch_size_spin.setValue(81)
+        self.batch_size_spin.setToolTip(
+            "Must be 4k+1: 1, 5, 9, 13, … (automatically snapped when typed)"
+        )
+        self.batch_size_spin.valueChanged.connect(self._snap_batch_size)
+        f.addRow("Batch Size:", self.batch_size_spin)
 
         self.uniform_batch_check = QCheckBox()
         f.addRow("Uniform Batch Size:", self.uniform_batch_check)
@@ -1167,6 +1172,7 @@ class MainWindow(QMainWindow):
             "Auto/CPU are exclusive; multiple GPU N items may be checked together\n"
             "for multi-GPU inference (--cuda_device 0,1,…)."
         )
+        self.gpu_device_combo.setMinimumWidth(240)
         f.addRow("GPU Device:", self.gpu_device_combo)
 
         self.dit_offload_combo = QComboBox()
@@ -1237,6 +1243,7 @@ class MainWindow(QMainWindow):
         _attn_idx = self.attention_mode_combo.findText("sageattn_3")
         if _attn_idx >= 0:
             self.attention_mode_combo.setCurrentIndex(_attn_idx)
+        self.attention_mode_combo.setMinimumWidth(240)
         f.addRow("Attention Mode:", self.attention_mode_combo)
 
         self.compile_dit_check = QCheckBox()
@@ -1289,35 +1296,6 @@ class MainWindow(QMainWindow):
         f.addRow("Verbose Debug:", self.debug_check)
         adj_layout.addWidget(g)
 
-        # Job Queue (collapsible group)
-        qg = QGroupBox("Job Queue")
-        qg.setCheckable(True)
-        qg.setChecked(False)
-        qv = QVBoxLayout(qg)
-        qv.setContentsMargins(8, 8, 8, 8)
-        qv.setSpacing(6)
-
-        self.queue_list = QListWidget()
-        self.queue_list.setMinimumHeight(120)
-        qv.addWidget(self.queue_list)
-
-        queue_btns_row = QHBoxLayout()
-        self.queue_add_btn = QPushButton("Add Current")
-        self.queue_add_btn.clicked.connect(self._queue_add_current_job)
-        self.queue_remove_btn = QPushButton("Remove Selected")
-        self.queue_remove_btn.clicked.connect(self._queue_remove_selected)
-        self.queue_clear_btn = QPushButton("Clear")
-        self.queue_clear_btn.clicked.connect(self._queue_clear_all)
-        queue_btns_row.addWidget(self.queue_add_btn)
-        queue_btns_row.addWidget(self.queue_remove_btn)
-        queue_btns_row.addWidget(self.queue_clear_btn)
-        qv.addLayout(queue_btns_row)
-
-        self.queue_run_btn = QPushButton("Run Queue")
-        self.queue_run_btn.clicked.connect(self._queue_run)
-        qv.addWidget(self.queue_run_btn)
-
-        adj_layout.addWidget(qg)
         adj_layout.addStretch(1)
 
         # ── Codec settings pane ────────────────────────────────────────
@@ -1336,10 +1314,10 @@ class MainWindow(QMainWindow):
 
         # ── Video export group (visible when Video Mode is active) ──────
         self._video_export_group, vf = _make_group("Video Export")
+        # container_combo is the backing store – driven by file_format_combo; not shown as a row
         self.container_combo = QComboBox()
         self.container_combo.addItems(list(EXPORT_CODEC_PROFILES.keys()))
         self.container_combo.currentTextChanged.connect(self._update_export_controls)
-        vf.addRow("Container:", self.container_combo)
 
         self.video_codec_combo = QComboBox()
         vf.addRow("Video Codec:", self.video_codec_combo)
@@ -1388,19 +1366,8 @@ class MainWindow(QMainWindow):
         scroll.setWidget(_host)
         outer_layout.addWidget(scroll, stretch=1)
 
-        # ── Bottom action bar: Preview + Export ─────────────────────────
-        _action_sep = QWidget()
-        _action_sep.setFixedHeight(1)
-        _action_sep.setStyleSheet("background:#272A2D;")
-        outer_layout.addWidget(_action_sep)
-
-        action_bar = QWidget()
-        action_bar.setObjectName("action_bar")
-        action_bar.setFixedHeight(52)
-        ab_layout = QHBoxLayout(action_bar)
-        ab_layout.setContentsMargins(8, 8, 8, 8)
-        ab_layout.setSpacing(8)
-
+        # Preview and Export buttons are added to the left panel (under viewer) in _build_left_panel.
+        # Create them here as instance attributes so they exist before left panel is built.
         self.preview_btn = QPushButton("⚡ Preview")
         self.preview_btn.setToolTip(
             "Video input + video container: process first 81 frames as a short clip.\n"
@@ -1414,17 +1381,52 @@ class MainWindow(QMainWindow):
         self.run_btn.setMinimumWidth(110)
         self.run_btn.clicked.connect(self._run)
 
-        ab_layout.addWidget(self.preview_btn)
-        ab_layout.addStretch(1)
-        ab_layout.addWidget(self.run_btn)
-        outer_layout.addWidget(action_bar)
-
         return outer
 
     def _switch_right_tab(self, idx: int) -> None:
         """Show the Adjustments pane (idx=0) or Codec settings pane (idx=1)."""
         self._adj_pane.setVisible(idx == 0)
         self._codec_pane.setVisible(idx == 1)
+
+    _FILE_FORMAT_TO_IMAGE_SEQ: dict = {
+        "PNG Sequence": "PNG (8-bit)",
+        "TIFF Sequence": "TIFF (8-bit)",
+        "DPX Sequence": "DPX (10-bit)",
+        "EXR Sequence": "EXR",
+    }
+    _IMAGE_SEQ_TO_FILE_FORMAT: dict = {
+        "PNG (8-bit)": "PNG Sequence", "PNG (16-bit)": "PNG Sequence",
+        "TIFF (8-bit)": "TIFF Sequence", "TIFF (16-bit)": "TIFF Sequence",
+        "DPX (10-bit)": "DPX Sequence", "DPX (12-bit)": "DPX Sequence",
+        "EXR": "EXR Sequence",
+    }
+
+    def _on_file_format_changed(self, fmt: str) -> None:
+        """Handle File Format dropdown changes, coupling codec group and backing state."""
+        if getattr(self, "_updating_output_mode", False):
+            return
+        self._updating_output_mode = True
+        try:
+            if fmt in self._FILE_FORMAT_TO_IMAGE_SEQ:
+                # Image sequence format selected
+                self.export_image_sequence_check.setChecked(True)
+                img_key = self._FILE_FORMAT_TO_IMAGE_SEQ[fmt]
+                idx = self.image_sequence_format_combo.findText(img_key)
+                if idx >= 0:
+                    self.image_sequence_format_combo.setCurrentIndex(idx)
+                self._video_export_group.setVisible(False)
+                self._image_export_group.setVisible(True)
+            else:
+                # Video format selected
+                self.export_image_sequence_check.setChecked(False)
+                cidx = self.container_combo.findText(fmt)
+                if cidx >= 0:
+                    self.container_combo.setCurrentIndex(cidx)
+                self._video_export_group.setVisible(True)
+                self._image_export_group.setVisible(False)
+        finally:
+            self._updating_output_mode = False
+        self._update_export_controls()
 
     def _update_output_mode(self, idx: int) -> None:
         """Switch between Video Mode (idx=0) and Image Sequence Mode (idx=1).
@@ -1438,6 +1440,20 @@ class MainWindow(QMainWindow):
         self._updating_output_mode = True
         try:
             self.export_image_sequence_check.setChecked(is_image_seq)
+            if hasattr(self, "file_format_combo"):
+                self.file_format_combo.blockSignals(True)
+                if is_image_seq:
+                    img_fmt = self.image_sequence_format_combo.currentText()
+                    ff_text = self._IMAGE_SEQ_TO_FILE_FORMAT.get(img_fmt, "PNG Sequence")
+                    fidx = self.file_format_combo.findText(ff_text)
+                    if fidx >= 0:
+                        self.file_format_combo.setCurrentIndex(fidx)
+                else:
+                    container = self.container_combo.currentText()
+                    fidx = self.file_format_combo.findText(container)
+                    if fidx >= 0:
+                        self.file_format_combo.setCurrentIndex(fidx)
+                self.file_format_combo.blockSignals(False)
         finally:
             self._updating_output_mode = False
         self._video_export_group.setVisible(not is_image_seq)
@@ -1445,21 +1461,29 @@ class MainWindow(QMainWindow):
         self._update_export_controls()
 
     def _on_image_sequence_toggled(self, is_seq: bool) -> None:
-        """Sync the mode switcher buttons when the backing checkbox is set externally.
+        """Sync the file_format_combo when the backing checkbox is set externally.
 
         This is called when preset load/save restores ``export_image_sequence_check``
-        (via the persistable widget map) so the mode switcher buttons stay in sync
+        (via the persistable widget map) so the file format combo stays in sync
         even without user interaction.
         """
         if getattr(self, "_updating_output_mode", False):
             return
-        # Update button group (blockSignals to avoid re-entering _update_output_mode)
-        self._mode_video_btn.blockSignals(True)
-        self._mode_imgseq_btn.blockSignals(True)
-        self._mode_video_btn.setChecked(not is_seq)
-        self._mode_imgseq_btn.setChecked(is_seq)
-        self._mode_video_btn.blockSignals(False)
-        self._mode_imgseq_btn.blockSignals(False)
+        # Sync file_format_combo
+        if hasattr(self, "file_format_combo"):
+            self.file_format_combo.blockSignals(True)
+            if is_seq:
+                img_fmt = self.image_sequence_format_combo.currentText()
+                ff_text = getattr(self, "_IMAGE_SEQ_TO_FILE_FORMAT", {}).get(img_fmt, "PNG Sequence")
+                fidx = self.file_format_combo.findText(ff_text)
+                if fidx >= 0:
+                    self.file_format_combo.setCurrentIndex(fidx)
+            else:
+                container = self.container_combo.currentText()
+                fidx = self.file_format_combo.findText(container)
+                if fidx >= 0:
+                    self.file_format_combo.setCurrentIndex(fidx)
+            self.file_format_combo.blockSignals(False)
         # Sync group visibility
         self._video_export_group.setVisible(not is_seq)
         self._image_export_group.setVisible(is_seq)
@@ -1474,8 +1498,8 @@ class MainWindow(QMainWindow):
         layout.setSpacing(4)
 
         # Status + primary actions
-        # Note: run_btn and preview_btn are created in _build_right_panel (action bar at bottom
-        # of the right panel, matching Topaz Video AI v5 layout). Only Abort lives here.
+        # Note: run_btn and preview_btn are placed under the viewer in _build_left_panel.
+        # Only Abort lives here.
         btn_row = QHBoxLayout()
         self.status_label = QLabel("Ready")
         self.status_label.setMinimumWidth(200)
@@ -1644,6 +1668,7 @@ class MainWindow(QMainWindow):
             "cache_vae_check": self.cache_vae_check,
             "auto_safeguard_check": self.auto_safeguard_check,
             "debug_check": self.debug_check,
+            "file_format_combo": self.file_format_combo,
         }
 
     # Codecs that have fixed/required container associations (codec name → required container key)
@@ -1667,6 +1692,16 @@ class MainWindow(QMainWindow):
         keep_idx = self.video_codec_combo.findText(prev_codec)
         self.video_codec_combo.setCurrentIndex(keep_idx if keep_idx >= 0 else 0)
         self.video_codec_combo.blockSignals(False)
+
+        # Keep file_format_combo in sync when container changes directly
+        if hasattr(self, "file_format_combo") and not getattr(self, "_updating_output_mode", False):
+            exporting_sequence = self.export_image_sequence_check.isChecked()
+            if not exporting_sequence:
+                self.file_format_combo.blockSignals(True)
+                fidx = self.file_format_combo.findText(container)
+                if fidx >= 0:
+                    self.file_format_combo.setCurrentIndex(fidx)
+                self.file_format_combo.blockSignals(False)
 
         exporting_sequence = self.export_image_sequence_check.isChecked()
         self.video_codec_combo.setEnabled(not exporting_sequence)
@@ -1765,6 +1800,22 @@ class MainWindow(QMainWindow):
             if not candidate.exists():
                 return candidate
             counter += 1
+
+    @staticmethod
+    def _generate_export_output_path(ext: str, output_dir: Path, part_idx: int = 1) -> Path:
+        """Return a unique output path using padded numerical indexing.
+
+        Format: ``output_part_NNN_MMMMM<ext>``  (e.g. ``output_part_001_00001.mp4``).
+        *part_idx* is the chunk/part number (1-based); the file counter increments
+        until a non-existing path is found.
+        """
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for file_idx in range(1, 100_000):
+            stem = f"output_part_{part_idx:03d}_{file_idx:05d}"
+            candidate = output_dir / f"{stem}{ext}"
+            if not candidate.exists():
+                return candidate
+        return output_dir / f"output_part_{part_idx:03d}_99999{ext}"
 
     def _serialize_model_settings(self) -> dict[str, Any]:
         data: dict[str, Any] = {}
@@ -2009,6 +2060,8 @@ class MainWindow(QMainWindow):
         else:
             self._current_input_is_image = False
             self._meta_label.setText("Loading…")
+            # Extract and display the first frame immediately for instant preview
+            self._try_extract_first_frame(path)
             self._load_input_video(path)
             self._viewer_stack.setCurrentIndex(0)
 
@@ -2085,21 +2138,22 @@ class MainWindow(QMainWindow):
         if self._is_preview_run:
             export_dir = self._resolve_export_output_dir()
             if self._is_preview_video_mode:
-                # BUG 1 fix: video-mode preview outputs a real video clip with the
-                # correct container extension (e.g. .mov for ProRes, .mp4 for H.265).
+                # Video-mode preview: short clip in the selected container.
                 container_ext = self._selected_export_extension()
-                preview_out = self._ensure_unique_file_path(
-                    export_dir / f"preview_upscaled_frame_001{container_ext}"
-                )
+                preview_out = self._generate_export_output_path(container_ext, export_dir)
             else:
-                # Image-mode preview: single PNG frame (legacy behaviour).
-                preview_out = self._ensure_unique_file_path(
-                    export_dir / "preview_upscaled_frame_001.png"
-                )
+                # Image-mode preview: single PNG frame.
+                preview_out = self._generate_export_output_path(".png", export_dir)
             self._settings_win.output_edit.setText(str(preview_out))
             args += ["--output", str(preview_out)]
         elif out:
             args += ["--output", out]
+        else:
+            # No output path set: auto-generate with padded numerical naming convention.
+            export_dir = self._resolve_export_output_dir()
+            auto_ext = self._selected_export_extension()
+            auto_out = self._generate_export_output_path(auto_ext, export_dir)
+            args += ["--output", str(auto_out)]
 
         # model dir
         md = self._settings_win.model_dir_edit.text().strip()
@@ -2812,6 +2866,44 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Video source loading
     # ------------------------------------------------------------------
+
+    def _try_extract_first_frame(self, video_path: str) -> None:
+        """Extract the first frame from *video_path* via ffmpeg and display it immediately.
+
+        Falls back silently if ffmpeg is unavailable or extraction fails.
+        The static frame is also loaded into the SplitViewWidget input side so
+        Split View mode has an immediate preview without waiting for the player.
+        """
+        import tempfile
+        try:
+            fd, tmp_path = tempfile.mkstemp(suffix="_frame0.png", prefix="seedvr2_preview_")
+            import os as _os
+            _os.close(fd)  # close fd so ffmpeg can write to the path
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-i", video_path,
+                    "-vframes", "1",
+                    "-an",
+                    tmp_path,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=8,
+                creationflags=_CREATE_NO_WINDOW,
+            )
+            if result.returncode == 0 and Path(tmp_path).is_file():
+                pix = QPixmap(tmp_path)
+                if not pix.isNull():
+                    self._image_view.set_pixmap(pix)
+                    if _MULTIMEDIA_AVAILABLE and self._split_view is not None:
+                        self._split_view.set_input_image(pix.toImage())
+                try:
+                    Path(tmp_path).unlink()
+                except Exception:
+                    pass
+        except Exception:
+            pass  # ffmpeg unavailable or extraction failed – normal video loading continues
 
     def _load_input_video(self, path: str) -> None:
         if self._input_player:
