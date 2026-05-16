@@ -223,7 +223,27 @@ class InferenceWorker(QObject):
                             pass
                     break
 
-        self._process.wait()
+        # Give the process a short window to exit cleanly, then force-kill.
+        try:
+            self._process.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            try:
+                if sys.platform == "win32":
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(self._process.pid)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                        creationflags=_CREATE_NO_WINDOW,
+                    )
+                else:
+                    os.killpg(os.getpgid(self._process.pid), signal.SIGKILL)
+            except Exception:
+                try:
+                    self._process.kill()
+                except Exception:
+                    pass
+            self._process.wait()
         rc = self._process.returncode
 
         if self._abort:
@@ -237,10 +257,11 @@ class InferenceWorker(QObject):
             self.finished.emit(False, f"Exit code {rc}.")
 
     def request_abort(self) -> None:
-        """Ask the worker to terminate the subprocess gracefully."""
+        """Immediately force-kill the subprocess tree and signal the worker to stop."""
         self._abort = True
-        if self._process and self._process.poll() is None:
-            self._process.terminate()
+        # Use force_kill directly so the process is terminated even when it is stuck
+        # inside a GPU/VAE loop that does not respond to SIGTERM.
+        self.force_kill()
 
     def force_kill(self) -> None:
         """Forcefully terminate the subprocess tree."""

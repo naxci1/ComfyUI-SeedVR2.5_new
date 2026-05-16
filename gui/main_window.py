@@ -1577,7 +1577,7 @@ class MainWindow(QMainWindow):
         self.clear_log_btn.clicked.connect(lambda: self.console.clear())
 
         self.open_output_folder_btn = QPushButton("Open Output Folder")
-        self.open_output_folder_btn.setEnabled(False)
+        self.open_output_folder_btn.setEnabled(True)
         self.open_output_folder_btn.clicked.connect(self._open_output_folder)
 
         btn_row.addWidget(self.status_label)
@@ -2209,11 +2209,16 @@ class MainWindow(QMainWindow):
             args += ["--model_dir", md]
 
         # output format mapping for SeedVR2 CLI:
+        # - image-mode preview ALWAYS maps to png (single frame) — highest priority
         # - image sequence modes map to CLI output_format=<actual ext without dot>
-        # - video-mode preview maps to the selected container (mov/mp4/mkv/webm)
-        # - image-mode preview maps to png (single frame, legacy)
         # - normal video export maps to the selected container
-        if self.export_image_sequence_check.isChecked():
+        _is_png_preview = self._is_preview_run and not self._is_preview_video_mode
+        if _is_png_preview:
+            # Image-mode preview: always a single PNG regardless of any export settings.
+            # This must take priority over the image-sequence checkbox so that the CLI
+            # never interprets the single-frame capture as a video pipeline run.
+            args += ["--output_format", "png"]
+        elif self.export_image_sequence_check.isChecked():
             # Pass the real extension so the CLI writes TIFF/DPX/EXR/JPEG correctly,
             # not always PNG.  Use the profile ext but strip the leading dot.
             img_fmt = self.image_sequence_format_combo.currentText()
@@ -2222,9 +2227,6 @@ class MainWindow(QMainWindow):
             # we pass the bare extension name (e.g. "tiff", "jpg", "dpx", "exr").
             cli_fmt = img_ext.lstrip(".") if img_ext else "png"
             args += ["--output_format", cli_fmt]
-        elif self._is_preview_run and not self._is_preview_video_mode:
-            # Image-mode preview: always a single PNG regardless of export settings.
-            args += ["--output_format", "png"]
         else:
             container = self.container_combo.currentText().lower()
             args += ["--output_format", container or "mp4"]
@@ -2234,7 +2236,6 @@ class MainWindow(QMainWindow):
         args += ["--video_backend", video_backend]
         # Emit ffmpeg_video_args only when ffmpeg backend is selected.
         # Skip for image-mode preview PNG runs and image sequence exports.
-        _is_png_preview = self._is_preview_run and not self._is_preview_video_mode
         if not _is_png_preview and not self.export_image_sequence_check.isChecked() and video_backend == "ffmpeg":
             profile = self._selected_export_profile_to_ffmpeg_args()
             video_codec_args = profile.get("video_args", [])
@@ -2289,9 +2290,14 @@ class MainWindow(QMainWindow):
         if skip:
             args += ["--skip_first_frames", str(skip)]
 
-        load_cap = self.load_cap_spin.value()
-        if load_cap:
-            args += ["--load_cap", str(load_cap)]
+        # For preview runs, hard-cap to 1 frame so the CLI never feeds more than one
+        # frame through the pipeline (prevents accidental video-pipeline activation).
+        if _is_png_preview:
+            args += ["--load_cap", "1"]
+        else:
+            load_cap = self.load_cap_spin.value()
+            if load_cap:
+                args += ["--load_cap", str(load_cap)]
 
         chunk = self.chunk_size_spin.value()
         if chunk:
@@ -3193,16 +3199,20 @@ class MainWindow(QMainWindow):
 
     def _set_latest_output_path(self, path: Optional[Path]) -> None:
         self._latest_output_path = path
-        self.open_output_folder_btn.setEnabled(path is not None)
+        # Button stays enabled at all times so the user can always open the output folder.
 
     def _open_output_folder(self) -> None:
-        if self._latest_output_path is None:
-            return
-        folder = (
-            self._latest_output_path
-            if self._latest_output_path.is_dir()
-            else self._latest_output_path.parent
-        )
+        # Prefer the most-recently produced output path; fall back to the configured dir.
+        if self._latest_output_path is not None:
+            folder = (
+                self._latest_output_path
+                if self._latest_output_path.is_dir()
+                else self._latest_output_path.parent
+            )
+        else:
+            # No output produced yet — open the configured output directory.
+            folder = self._resolve_export_output_dir()
+
         if not folder.exists():
             self._on_log(f"⚠  Output folder does not exist: {folder}")
             return
