@@ -40,6 +40,7 @@ from PyQt6.QtWidgets import (
     QAbstractSpinBox,
     QButtonGroup,
     QFileDialog,
+    QFrame,
     QGraphicsPixmapItem,
     QGraphicsScene,
     QGraphicsView,
@@ -652,6 +653,7 @@ class MainWindow(QMainWindow):
         self._preview_original_position: int = 0
         self._preview_compare_active: bool = False
         self._preview_saved_batch_size: int = 81
+        self._preview_saved_load_cap: Optional[int] = None  # restored after video-mode preview
         # True when the current/last preview run processed a VIDEO clip (not a PNG frame)
         self._is_preview_video_mode: bool = False
 
@@ -945,19 +947,79 @@ class MainWindow(QMainWindow):
     # ── Right panel ────────────────────────────────────────────────────
 
     def _build_right_panel(self) -> QWidget:
+        # ── Outer container (never scrolls itself) ──────────────────────
+        outer = QWidget()
+        outer.setMinimumWidth(380)
+        outer.setMaximumWidth(520)
+        outer_layout = QVBoxLayout(outer)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+
+        # ── Tab header bar (Adjustments | Codec settings) ───────────────
+        _TAB_SS = (
+            "QPushButton{"
+            "  background:transparent; border:none;"
+            "  border-bottom:2px solid transparent;"
+            "  color:#888; padding:6px 14px; font-size:13px;"
+            "}"
+            "QPushButton:checked{ color:#E3E4E6; border-bottom:2px solid #0052CC; }"
+            "QPushButton:hover:!checked{ color:#BFC3CA; }"
+        )
+        tab_header = QWidget()
+        tab_header.setObjectName("tab_bar")
+        tab_header.setFixedHeight(38)
+        th_layout = QHBoxLayout(tab_header)
+        th_layout.setContentsMargins(6, 0, 6, 0)
+        th_layout.setSpacing(0)
+
+        self._tab_adj_btn = QPushButton("Adjustments")
+        self._tab_adj_btn.setCheckable(True)
+        self._tab_adj_btn.setChecked(True)
+        self._tab_adj_btn.setStyleSheet(_TAB_SS)
+
+        self._tab_codec_btn = QPushButton("Codec settings")
+        self._tab_codec_btn.setCheckable(True)
+        self._tab_codec_btn.setStyleSheet(_TAB_SS)
+
+        _tab_grp = QButtonGroup(outer)
+        _tab_grp.setExclusive(True)
+        _tab_grp.addButton(self._tab_adj_btn, 0)
+        _tab_grp.addButton(self._tab_codec_btn, 1)
+        _tab_grp.idToggled.connect(
+            lambda idx, checked: self._switch_right_tab(idx) if checked else None
+        )
+
+        th_layout.addWidget(self._tab_adj_btn)
+        th_layout.addWidget(self._tab_codec_btn)
+        th_layout.addStretch(1)
+
+        tab_sep = QWidget()
+        tab_sep.setFixedHeight(1)
+        tab_sep.setStyleSheet("background:#272A2D;")
+
+        outer_layout.addWidget(tab_header)
+        outer_layout.addWidget(tab_sep)
+
+        # ── Single scroll area that holds BOTH panes ────────────────────
         scroll = QScrollArea()
-        scroll.setMinimumWidth(380)
-        scroll.setMaximumWidth(520)
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
 
-        container = QWidget()
-        container.setMaximumWidth(500)
-        container_layout = QVBoxLayout(container)
-        container_layout.setContentsMargins(10, 10, 10, 10)
-        container_layout.setSpacing(8)
+        # Host: stacks the two panes vertically; only one is visible at a time
+        _host = QWidget()
+        _host_layout = QVBoxLayout(_host)
+        _host_layout.setContentsMargins(0, 0, 0, 0)
+        _host_layout.setSpacing(0)
 
-        # ── Presets ────────────────────────────────────────────────────
+        # ── Adjustments pane ───────────────────────────────────────────
+        self._adj_pane = QWidget()
+        adj_layout = QVBoxLayout(self._adj_pane)
+        adj_layout.setContentsMargins(10, 10, 10, 10)
+        adj_layout.setSpacing(8)
+
+        # Presets bar
         preset_bar = QHBoxLayout()
         self.save_preset_btn = QPushButton("Save Preset…")
         self.save_preset_btn.setToolTip("Save model/processing settings to a JSON preset")
@@ -968,9 +1030,9 @@ class MainWindow(QMainWindow):
         preset_bar.addWidget(self.save_preset_btn)
         preset_bar.addWidget(self.load_preset_btn)
         preset_bar.addStretch(1)
-        container_layout.addLayout(preset_bar)
+        adj_layout.addLayout(preset_bar)
 
-        # ── AI Model ───────────────────────────────────────────────────
+        # AI Model
         g, f = _make_group("AI Model")
         self.dit_model_combo = QComboBox()
         self.dit_model_combo.addItems([
@@ -989,44 +1051,9 @@ class MainWindow(QMainWindow):
         if _idx >= 0:
             self.dit_model_combo.setCurrentIndex(_idx)
         f.addRow("DiT Model:", self.dit_model_combo)
-        container_layout.addWidget(g)
+        adj_layout.addWidget(g)
 
-        # ── Output Settings ────────────────────────────────────────────
-        g, f = _make_group("Export Settings")
-        self.container_combo = QComboBox()
-        self.container_combo.addItems(list(EXPORT_CODEC_PROFILES.keys()))
-        self.container_combo.currentTextChanged.connect(self._update_export_controls)
-        f.addRow("Container:", self.container_combo)
-
-        self.video_codec_combo = QComboBox()
-        f.addRow("Video Codec:", self.video_codec_combo)
-
-        self.export_image_sequence_check = QCheckBox()
-        self.export_image_sequence_check.toggled.connect(self._update_export_controls)
-        f.addRow("Export as Image Sequence:", self.export_image_sequence_check)
-
-        self.image_sequence_format_combo = QComboBox()
-        self.image_sequence_format_combo.addItems(list(IMAGE_SEQUENCE_PROFILES.keys()))
-        f.addRow("Image Sequence Format:", self.image_sequence_format_combo)
-
-        self.audio_mode_combo = QComboBox()
-        self.audio_mode_combo.addItems(list(AUDIO_PROFILES.keys()))
-        f.addRow("Audio:", self.audio_mode_combo)
-
-        self.video_backend_combo = QComboBox()
-        self.video_backend_combo.addItems(["ffmpeg"])
-        self.video_backend_combo.setEnabled(False)
-        f.addRow("Video Backend:", self.video_backend_combo)
-
-        self.use_10bit_check = QCheckBox()
-        f.addRow("10-bit Output:", self.use_10bit_check)
-
-        self.color_correction_combo = QComboBox()
-        self.color_correction_combo.addItems(["lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none"])
-        f.addRow("Color Correction:", self.color_correction_combo)
-        container_layout.addWidget(g)
-
-        # ── Enhancement (Upscaling) ────────────────────────────────────
+        # Processing Settings
         g, f = _make_group("Processing Settings")
         self.resolution_spin = QSpinBox()
         self.resolution_spin.setRange(128, 7680)
@@ -1053,9 +1080,9 @@ class MainWindow(QMainWindow):
         self.prepend_frames_spin.setRange(0, 100)
         self.prepend_frames_spin.setValue(0)
         f.addRow("Prepend Frames:", self.prepend_frames_spin)
-        container_layout.addWidget(g)
+        adj_layout.addWidget(g)
 
-        # ── Processing ─────────────────────────────────────────────────
+        # Preview & Processing
         g, f = _make_group("Preview & Processing")
         self.seed_spin = QSpinBox()
         self.seed_spin.setRange(0, 2147483647)
@@ -1070,7 +1097,7 @@ class MainWindow(QMainWindow):
         self.load_cap_spin = QSpinBox()
         self.load_cap_spin.setRange(0, 99999)
         self.load_cap_spin.setValue(0)
-        self.load_cap_spin.setToolTip("0 = load all frames")
+        self.load_cap_spin.setToolTip("0 = load all frames; Preview auto-sets this to 81 and restores it when done")
         f.addRow("Load Cap:", self.load_cap_spin)
 
         self.chunk_size_spin = QSpinBox()
@@ -1078,13 +1105,13 @@ class MainWindow(QMainWindow):
         self.chunk_size_spin.setValue(0)
         self.chunk_size_spin.setToolTip("0 = process all at once")
         f.addRow("Chunk Size:", self.chunk_size_spin)
-        container_layout.addWidget(g)
+        adj_layout.addWidget(g)
 
-        # ── Device Management ──────────────────────────────────────────
+        # Device Management
         g, f = _make_group("Device Management")
         self.gpu_device_combo = CheckableComboBox()
         self.gpu_device_combo.addItems(_detect_gpus())
-        self.gpu_device_combo.setCurrentText("Auto")  # default: Auto checked
+        self.gpu_device_combo.setCurrentText("Auto")
         self.gpu_device_combo.setToolTip(
             "Select one or more GPUs.\n"
             "Auto/CPU are exclusive; multiple GPU N items may be checked together\n"
@@ -1105,9 +1132,9 @@ class MainWindow(QMainWindow):
         self.tensor_offload_combo = QComboBox()
         self.tensor_offload_combo.addItems(["none", "cpu"])
         f.addRow("Tensor Offload:", self.tensor_offload_combo)
-        container_layout.addWidget(g)
+        adj_layout.addWidget(g)
 
-        # ── Memory (BlockSwap) ─────────────────────────────────────────
+        # Memory (BlockSwap)
         g, f = _make_group("Memory (BlockSwap)")
         self.blocks_to_swap_spin = QSpinBox()
         self.blocks_to_swap_spin.setRange(0, 36)
@@ -1116,9 +1143,9 @@ class MainWindow(QMainWindow):
 
         self.swap_io_check = QCheckBox()
         f.addRow("Swap I/O Components:", self.swap_io_check)
-        container_layout.addWidget(g)
+        adj_layout.addWidget(g)
 
-        # ── VAE Tiling ─────────────────────────────────────────────────
+        # VAE Tiling
         g, f = _make_group("VAE Tiling")
         self.vae_encode_tiled_check = QCheckBox()
         f.addRow("Encode Tiled:", self.vae_encode_tiled_check)
@@ -1149,9 +1176,9 @@ class MainWindow(QMainWindow):
         self.tile_debug_combo = QComboBox()
         self.tile_debug_combo.addItems(["false", "encode", "decode"])
         f.addRow("Tile Debug:", self.tile_debug_combo)
-        container_layout.addWidget(g)
+        adj_layout.addWidget(g)
 
-        # ── Performance ────────────────────────────────────────────────
+        # Performance
         g, f = _make_group("Performance")
         self.attention_mode_combo = QComboBox()
         self.attention_mode_combo.addItems([
@@ -1193,24 +1220,24 @@ class MainWindow(QMainWindow):
         self.dynamo_recompile_spin.setRange(1, 1000)
         self.dynamo_recompile_spin.setValue(128)
         f.addRow("Dynamo Recompile Limit:", self.dynamo_recompile_spin)
-        container_layout.addWidget(g)
+        adj_layout.addWidget(g)
 
-        # ── Model Cache ────────────────────────────────────────────────
+        # Model Cache
         g, f = _make_group("Model Cache")
         self.cache_dit_check = QCheckBox()
         f.addRow("Cache DiT:", self.cache_dit_check)
 
         self.cache_vae_check = QCheckBox()
         f.addRow("Cache VAE:", self.cache_vae_check)
-        container_layout.addWidget(g)
+        adj_layout.addWidget(g)
 
-        # ── Debug ──────────────────────────────────────────────────────
+        # Debug
         g, f = _make_group("Debug")
         self.debug_check = QCheckBox()
         f.addRow("Verbose Debug:", self.debug_check)
-        container_layout.addWidget(g)
+        adj_layout.addWidget(g)
 
-        # ── Job Queue ──────────────────────────────────────────────────
+        # Job Queue (collapsible group)
         qg = QGroupBox("Job Queue")
         qg.setCheckable(True)
         qg.setChecked(False)
@@ -1238,21 +1265,101 @@ class MainWindow(QMainWindow):
         self.queue_run_btn.clicked.connect(self._queue_run)
         qv.addWidget(self.queue_run_btn)
 
-        container_layout.addWidget(qg)
+        adj_layout.addWidget(qg)
+        adj_layout.addStretch(1)
 
-        container_layout.addStretch(1)
+        # ── Codec settings pane ────────────────────────────────────────
+        self._codec_pane = QWidget()
+        self._codec_pane.setVisible(False)
+        codec_layout = QVBoxLayout(self._codec_pane)
+        codec_layout.setContentsMargins(10, 10, 10, 10)
+        codec_layout.setSpacing(8)
 
-        # Constrain input widgets and set flexible size policy to prevent overflow
-        container.setSizePolicy(
-            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.MinimumExpanding
-        )
-        # Make input widgets fill the available horizontal space
-        for _cw in container.findChildren((QComboBox, QSpinBox, QLineEdit)):
-            _cw.setMaximumWidth(16777215)  # Qt default – no cap
+        g, f = _make_group("Export Settings")
+        self.container_combo = QComboBox()
+        self.container_combo.addItems(list(EXPORT_CODEC_PROFILES.keys()))
+        self.container_combo.currentTextChanged.connect(self._update_export_controls)
+        f.addRow("Container:", self.container_combo)
+
+        self.video_codec_combo = QComboBox()
+        f.addRow("Video Codec:", self.video_codec_combo)
+
+        self.export_image_sequence_check = QCheckBox()
+        self.export_image_sequence_check.toggled.connect(self._update_export_controls)
+        f.addRow("Export as Image Sequence:", self.export_image_sequence_check)
+
+        self.image_sequence_format_combo = QComboBox()
+        self.image_sequence_format_combo.addItems(list(IMAGE_SEQUENCE_PROFILES.keys()))
+        f.addRow("Image Sequence Format:", self.image_sequence_format_combo)
+
+        self.audio_mode_combo = QComboBox()
+        self.audio_mode_combo.addItems(list(AUDIO_PROFILES.keys()))
+        f.addRow("Audio:", self.audio_mode_combo)
+
+        self.video_backend_combo = QComboBox()
+        self.video_backend_combo.addItems(["ffmpeg"])
+        self.video_backend_combo.setEnabled(False)
+        f.addRow("Video Backend:", self.video_backend_combo)
+
+        self.use_10bit_check = QCheckBox()
+        f.addRow("10-bit Output:", self.use_10bit_check)
+
+        self.color_correction_combo = QComboBox()
+        self.color_correction_combo.addItems(["lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none"])
+        f.addRow("Color Correction:", self.color_correction_combo)
+        codec_layout.addWidget(g)
+        codec_layout.addStretch(1)
+
+        # Pack both panes into the scroll host
+        _host_layout.addWidget(self._adj_pane)
+        _host_layout.addWidget(self._codec_pane)
+
+        # Constrain input widgets to fill available width
+        for _cw in _host.findChildren((QComboBox, QSpinBox, QLineEdit)):
             _cw.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-        scroll.setWidget(container)
-        return scroll
+        scroll.setWidget(_host)
+        outer_layout.addWidget(scroll, stretch=1)
+
+        # ── Bottom action bar: Preview + Export ─────────────────────────
+        _action_sep = QWidget()
+        _action_sep.setFixedHeight(1)
+        _action_sep.setStyleSheet("background:#272A2D;")
+        outer_layout.addWidget(_action_sep)
+
+        action_bar = QWidget()
+        action_bar.setObjectName("action_bar")
+        action_bar.setFixedHeight(52)
+        ab_layout = QHBoxLayout(action_bar)
+        ab_layout.setContentsMargins(8, 8, 8, 8)
+        ab_layout.setSpacing(8)
+
+        self.preview_btn = QPushButton("⚡ Preview")
+        self.preview_btn.setToolTip(
+            "Video input + video container: process first 81 frames as a short clip.\n"
+            "Image input: upscale the current frame as a single PNG preview.\n"
+            "Load Cap is temporarily set to 81 for video-mode preview and restored on completion."
+        )
+        self.preview_btn.clicked.connect(self._preview_run)
+
+        self.run_btn = QPushButton("▶  Export")
+        self.run_btn.setObjectName("primary_button")
+        self.run_btn.setMinimumWidth(110)
+        self.run_btn.clicked.connect(self._run)
+
+        ab_layout.addWidget(self.preview_btn)
+        ab_layout.addStretch(1)
+        ab_layout.addWidget(self.run_btn)
+        outer_layout.addWidget(action_bar)
+
+        return outer
+
+    def _switch_right_tab(self, idx: int) -> None:
+        """Show the Adjustments pane (idx=0) or Codec settings pane (idx=1)."""
+        self._adj_pane.setVisible(idx == 0)
+        self._codec_pane.setVisible(idx == 1)
+
+
 
     # ── Bottom bar ─────────────────────────────────────────────────────
 
@@ -1276,21 +1383,13 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.batch_progress)
 
         # Status + primary actions
+        # Note: run_btn and preview_btn are created in _build_right_panel (action bar at bottom
+        # of the right panel, matching Topaz Video AI v5 layout). Only Abort lives here.
         btn_row = QHBoxLayout()
         self.status_label = QLabel("Ready")
         self.status_label.setMinimumWidth(200)
         self.fps_label = QLabel("0.0 fps")
         self.fps_label.setMinimumWidth(80)
-        self.run_btn = QPushButton("▶  Export Video")
-        self.run_btn.setObjectName("primary_button")
-        self.run_btn.clicked.connect(self._run)
-
-        self.preview_btn = QPushButton("⚡ Preview")
-        self.preview_btn.setToolTip(
-            "Upscale the current video frame as a single-image preview.\n"
-            "Batch size will be set to 1 automatically."
-        )
-        self.preview_btn.clicked.connect(self._preview_run)
 
         self.abort_btn = QPushButton("⏹  Abort")
         self.abort_btn.setObjectName("danger_button")
@@ -1310,8 +1409,6 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self.status_label)
         btn_row.addWidget(self.fps_label)
         btn_row.addStretch(1)
-        btn_row.addWidget(self.run_btn)
-        btn_row.addWidget(self.preview_btn)
         btn_row.addWidget(self.abort_btn)
         layout.addLayout(btn_row)
 
@@ -1975,11 +2072,7 @@ class MainWindow(QMainWindow):
             args += ["--skip_first_frames", str(skip)]
 
         load_cap = self.load_cap_spin.value()
-        if self._is_preview_run and self._is_preview_video_mode:
-            # BUG 1 fix: cap at 81 frames for a fast video-mode preview; always
-            # override whatever the user has set in the load_cap spinbox.
-            args += ["--load_cap", "81"]
-        elif load_cap:
+        if load_cap:
             args += ["--load_cap", str(load_cap)]
 
         chunk = self.chunk_size_spin.value()
@@ -2060,12 +2153,6 @@ class MainWindow(QMainWindow):
             dec_ov = self.vae_decode_tile_overlap_spin.value()
             if dec_ov != 128:
                 args += ["--vae_decode_tile_overlap", str(dec_ov)]
-        elif batch >= 81:
-            # BUG 5 fix: auto-enable aggressive VAE decode tiling when batch_size >= 81
-            # to prevent the 2.44 GB VRAM overflow observed during VAE decoding on 16 GB GPUs.
-            # tile_size=512 keeps peak VRAM usage within the physical GPU limit.
-            args.append("--vae_decode_tiled")
-            args += ["--vae_decode_tile_size", "512"]
 
         tile_dbg = self.tile_debug_combo.currentText()
         if tile_dbg != "false":
@@ -2301,6 +2388,11 @@ class MainWindow(QMainWindow):
                 "ℹ  Preview (video mode): will process first 81 frames of "
                 f"{self._preview_original_input_path}"
             )
+            # Instead of hardcoding --load_cap 81 in _build_args, write the value
+            # into the GUI widget so _build_args reads it dynamically (CORE LAW: no
+            # hardcoded pipeline parameters anywhere in the execution loop).
+            self._preview_saved_load_cap = self.load_cap_spin.value()
+            self.load_cap_spin.setValue(81)
             # _build_args will compute the output path and write it into
             # output_edit; we don't touch it here.
             self._run()
@@ -2972,6 +3064,10 @@ class MainWindow(QMainWindow):
         self._is_preview_video_mode = False
         if was_preview and self.batch_size_spin.value() == 1 and self._preview_saved_batch_size:
             self.batch_size_spin.setValue(self._preview_saved_batch_size)
+        # Restore load_cap that was temporarily set to 81 during video-mode preview.
+        if was_preview and self._preview_saved_load_cap is not None:
+            self.load_cap_spin.setValue(self._preview_saved_load_cap)
+            self._preview_saved_load_cap = None
         # Restore output path that was overridden during preview (but keep the input field
         # pointing at the original path so the user still sees the correct input displayed).
         if was_preview and hasattr(self, "_preview_original_output_path"):
