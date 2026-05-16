@@ -905,6 +905,16 @@ def decode_all_batches(
         
         debug.log_memory_state("After VAE loading for decoding", detailed_tensors=False)
 
+        # ── ComfyUI dynamic VRAM: soft-empty stale caches before decode loop ───
+        # This frees any cached model buffers that ComfyUI accumulated during the
+        # diffusion phase so the full 16 GB headroom is available for VAE decoding.
+        try:
+            import comfy.model_management as _mm
+            _mm.soft_empty_cache()
+            debug.log("ComfyUI soft cache cleared before VAE decode loop", category="memory")
+        except Exception:
+            pass  # ComfyUI not installed alongside this launcher – skip gracefully
+
         # Initialize tile_boundaries for decoding debug
         if runner.tile_debug == "decode" and runner.decode_tiled:
             debug.decode_tile_boundaries = []
@@ -921,6 +931,30 @@ def decode_all_batches(
             debug.log(f"Decoding batch {decode_idx+1}/{num_valid_latents}", category="vae", force=True)
             debug.start_timer(f"decode_batch_{decode_idx+1}")
             
+            # ── Pre-emptive VRAM headroom check (ComfyUI dynamic paging) ─────
+            # Windows pages silently into Shared System RAM instead of raising an
+            # OOM exception, so we probe free memory BEFORE moving the tensor to
+            # the VAE device.  If the estimated pixel-space output would consume
+            # more than 90 % of remaining VRAM we soft-flush and warn; the caller
+            # can also enable --vae_decode_tiled to engage spatial tiling.
+            try:
+                import comfy.model_management as _mm
+                free_bytes = _mm.get_free_memory(ctx['vae_device'])
+                # Conservative pixel-space estimate: T × H × W × 3ch × 2 bytes (fp16)
+                est_bytes = (
+                    upscaled_latent.shape[0] * true_h * true_w * 3 * 2
+                )
+                if free_bytes > 0 and est_bytes > free_bytes * 0.90:
+                    debug.log(
+                        f"VRAM headroom low: {free_bytes / (1024**3):.1f} GB free, "
+                        f"need ≈{est_bytes / (1024**3):.1f} GB — "
+                        "flushing ComfyUI cache before decode",
+                        category="memory", force=True
+                    )
+                    _mm.soft_empty_cache()
+            except Exception:
+                pass  # ComfyUI not installed – fall through to tiled decode path
+
             # Move to VAE device with correct dtype for decoding (no-op if already there)
             upscaled_latent = manage_tensor(
                 tensor=upscaled_latent,
