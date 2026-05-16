@@ -648,9 +648,15 @@ class MainWindow(QMainWindow):
         self._force_exit: bool = False
         self._tray_tip_shown: bool = False
         self._drop_highlight_count: int = 0
+        self._preview_original_input_path: Optional[str] = None
+        self._preview_original_input_mode: str = "File"
+        self._preview_original_position: int = 0
+        self._preview_compare_active: bool = False
+        self._preview_saved_batch_size: int = 81
 
         self._build_ui()
         self._build_menu_bar()
+        self.menuBar().hide()
 
         # Load window icon (PyInstaller-compatible path)
         icon_path = Path(get_resource_path("assets/icon.ico"))
@@ -698,34 +704,29 @@ class MainWindow(QMainWindow):
         # ── 1. Header ──────────────────────────────────────────────────
         header_widget = QWidget()
         header_layout = QHBoxLayout(header_widget)
-        header_layout.setContentsMargins(0, 0, 0, 0)
-        header_layout.setSpacing(8)
+        header_layout.setContentsMargins(6, 2, 6, 6)
+        header_layout.setSpacing(10)
 
-        title_col = QWidget()
-        title_vlayout = QVBoxLayout(title_col)
-        title_vlayout.setContentsMargins(0, 0, 0, 0)
-        title_vlayout.setSpacing(2)
-        title_lbl = QLabel("SeedVR2.5 GUI by HB2k v.1.4 beta")
-        title_lbl.setObjectName("header_label")
-        sub_lbl = QLabel("Powered by SeedVR2 Diffusion Models")
-        sub_lbl.setObjectName("subheader_label")
-        title_vlayout.addWidget(title_lbl)
-        title_vlayout.addWidget(sub_lbl)
-
-        settings_btn = QPushButton("⚙  Settings")
-        settings_btn.setToolTip("Open Paths & Configuration settings")
-        settings_btn.setMinimumWidth(110)
-        settings_btn.clicked.connect(self._open_settings)
+        help_btn = QPushButton("Help")
+        help_btn.setFlat(True)
+        help_btn.clicked.connect(self._show_about_dialog)
 
         github_btn = QPushButton("GitHub")
+        github_btn.setFlat(True)
         github_btn.setToolTip("Open project on GitHub")
         github_btn.setMinimumWidth(80)
         github_btn.clicked.connect(
             lambda: QDesktopServices.openUrl(QUrl("https://github.com/naxci1/ComfyUI-SeedVR2.5_new"))
         )
 
-        header_layout.addWidget(title_col, stretch=1)
+        settings_btn = QPushButton("⚙  Settings")
+        settings_btn.setToolTip("Open Paths & Configuration settings")
+        settings_btn.setMinimumWidth(110)
+        settings_btn.clicked.connect(self._open_settings)
+
+        header_layout.addWidget(help_btn)
         header_layout.addWidget(github_btn)
+        header_layout.addStretch(1)
         header_layout.addWidget(settings_btn)
         root_layout.addWidget(header_widget)
 
@@ -737,8 +738,9 @@ class MainWindow(QMainWindow):
 
         splitter.addWidget(self._build_left_panel())
         splitter.addWidget(self._build_right_panel())
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(0, 65)
+        splitter.setStretchFactor(1, 35)
+        splitter.setSizes([780, 420])
 
         # ── 3. Bottom controls bar ─────────────────────────────────────
         root_layout.addWidget(self._build_bottom_bar())
@@ -899,38 +901,40 @@ class MainWindow(QMainWindow):
         self._play_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
         self._play_btn.clicked.connect(self._on_play_pause)
 
-        self._stop_btn = QPushButton("⏹")
-        self._stop_btn.setFixedWidth(36)
-        self._stop_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
-        self._stop_btn.clicked.connect(self._on_stop)
+        self._pause_btn = QPushButton("⏸")
+        self._pause_btn.setFixedWidth(36)
+        self._pause_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
+        self._pause_btn.clicked.connect(self._pause_playback)
+
+        self._frame_back_btn = QPushButton("⏮")
+        self._frame_back_btn.setFixedWidth(36)
+        self._frame_back_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
+        self._frame_back_btn.clicked.connect(lambda: self._step_frame(-1))
+
+        self._frame_forward_btn = QPushButton("⏭")
+        self._frame_forward_btn.setFixedWidth(36)
+        self._frame_forward_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
+        self._frame_forward_btn.clicked.connect(lambda: self._step_frame(1))
 
         self._time_lbl = QLabel("0:00 / 0:00")
         self._time_lbl.setMinimumWidth(100)
         self._time_lbl.setStyleSheet("color:#888; font-size:11px;")
 
-        self._mute_btn = QPushButton("\U0001f50a")  # 🔊
-        self._mute_btn.setFixedWidth(36)
-        self._mute_btn.setCheckable(True)
-        self._mute_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
-        self._mute_btn.toggled.connect(self._on_mute_toggled)
-
-        self._volume_slider = QSlider(Qt.Orientation.Horizontal)
-        self._volume_slider.setRange(0, 100)
-        self._volume_slider.setValue(70)
-        self._volume_slider.setMaximumWidth(100)
-        self._volume_slider.setEnabled(_MULTIMEDIA_AVAILABLE)
-        self._volume_slider.valueChanged.connect(self._on_volume_changed)
+        self._split_toggle = QCheckBox("Split View")
+        self._split_toggle.setEnabled(_MULTIMEDIA_AVAILABLE)
+        self._split_toggle.toggled.connect(self._on_split_toggle_changed)
 
         self._open_output_btn = QPushButton("Open Output…")
         self._open_output_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
         self._open_output_btn.clicked.connect(self._browse_output_video)
 
+        ctrl.addWidget(self._frame_back_btn)
         ctrl.addWidget(self._play_btn)
-        ctrl.addWidget(self._stop_btn)
+        ctrl.addWidget(self._pause_btn)
+        ctrl.addWidget(self._frame_forward_btn)
         ctrl.addWidget(self._time_lbl)
         ctrl.addStretch(1)
-        ctrl.addWidget(self._mute_btn)
-        ctrl.addWidget(self._volume_slider)
+        ctrl.addWidget(self._split_toggle)
         ctrl.addWidget(self._open_output_btn)
         layout.addLayout(ctrl)
 
@@ -940,11 +944,13 @@ class MainWindow(QMainWindow):
 
     def _build_right_panel(self) -> QWidget:
         scroll = QScrollArea()
-        scroll.setMinimumWidth(100)
+        scroll.setMinimumWidth(380)
+        scroll.setMaximumWidth(520)
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         container = QWidget()
+        container.setMaximumWidth(500)
         container_layout = QVBoxLayout(container)
         container_layout.setContentsMargins(10, 10, 10, 10)
         container_layout.setSpacing(8)
@@ -1018,7 +1024,7 @@ class MainWindow(QMainWindow):
         container_layout.addWidget(g)
 
         # ── Enhancement (Upscaling) ────────────────────────────────────
-        g, f = _make_group("Enhancement (Upscaling)")
+        g, f = _make_group("Processing Settings")
         self.resolution_spin = QSpinBox()
         self.resolution_spin.setRange(128, 7680)
         self.resolution_spin.setValue(720)
@@ -1047,7 +1053,7 @@ class MainWindow(QMainWindow):
         container_layout.addWidget(g)
 
         # ── Processing ─────────────────────────────────────────────────
-        g, f = _make_group("Processing")
+        g, f = _make_group("Preview & Processing")
         self.seed_spin = QSpinBox()
         self.seed_spin.setRange(0, 2147483647)
         self.seed_spin.setValue(313)
@@ -1266,7 +1272,7 @@ class MainWindow(QMainWindow):
         self.batch_progress.setFormat("Batch Progress: idle")
         layout.addWidget(self.batch_progress)
 
-        # Status + Run / Abort / Copy All / Clear row
+        # Status + primary actions
         btn_row = QHBoxLayout()
         self.status_label = QLabel("Ready")
         self.status_label.setMinimumWidth(200)
@@ -1304,11 +1310,14 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self.run_btn)
         btn_row.addWidget(self.preview_btn)
         btn_row.addWidget(self.abort_btn)
-        btn_row.addWidget(self.open_output_folder_btn)
-        btn_row.addSpacing(12)
-        btn_row.addWidget(self.copy_log_btn)
-        btn_row.addWidget(self.clear_log_btn)
         layout.addLayout(btn_row)
+
+        util_row = QHBoxLayout()
+        util_row.addStretch(1)
+        util_row.addWidget(self.open_output_folder_btn)
+        util_row.addWidget(self.copy_log_btn)
+        util_row.addWidget(self.clear_log_btn)
+        layout.addLayout(util_row)
 
         # Row 4 – Console
         self.console = QTextEdit()
@@ -1395,8 +1404,7 @@ class MainWindow(QMainWindow):
         self.activateWindow()
 
     def _exit_from_tray(self) -> None:
-        self._force_exit = True
-        self.close()
+        self._force_shutdown()
 
     def _build_persistable_widget_map(self) -> dict[str, QWidget]:
         return {
@@ -1718,6 +1726,8 @@ class MainWindow(QMainWindow):
         pre-loaded into the SplitViewWidget for image comparison.
         Video files are fed to the input player (page 0).
         """
+        if path != self._preview_temp_path:
+            self._preview_compare_active = False
         _IMAGE_SUFFIXES = set(SUPPORTED_IMAGE_EXTS) | {".bmp", ".webp", ".gif"}
         suffix = Path(path).suffix.lower()
         if suffix in _IMAGE_SUFFIXES:
@@ -1857,7 +1867,7 @@ class MainWindow(QMainWindow):
             args += ["--max_resolution", str(max_res)]
 
         batch = self.batch_size_spin.value()
-        if batch != 5:
+        if batch != 81:
             args += ["--batch_size", str(batch)]
 
         if self.uniform_batch_check.isChecked():
@@ -2013,6 +2023,8 @@ class MainWindow(QMainWindow):
         if not inp:
             self._on_log("❌  Please specify an input file or directory (⚙ Settings).")
             return
+        if not self._is_preview_run:
+            self._preview_compare_active = False
 
         python_exe = self._settings_win.python_exe_edit.text().strip() or DEFAULT_PYTHON_EXE
         seedvr2_folder = self._settings_win.seedvr2_folder_edit.text().strip()
@@ -2063,10 +2075,79 @@ class MainWindow(QMainWindow):
             self._worker.request_abort()
         self.status_label.setText("Aborting…")
 
+    def _resume_original_video_after_preview(self, *, switch_mode: bool = True) -> bool:
+        original = self._preview_original_input_path
+        if not original or Path(original).suffix.lower() not in SUPPORTED_VIDEO_EXTS:
+            return False
+        self._preview_compare_active = False
+        self._settings_win.input_mode_combo.setCurrentText(self._preview_original_input_mode)
+        self._settings_win.input_edit.setText(original)
+        self._current_input_is_image = False
+        self._input_player.setVideoOutput(self._solo_input_vw)
+        if switch_mode:
+            self._mode_input_btn.setChecked(True)
+            self._on_mode_button(0, True)
+        self._load_input_video(original)
+        self._input_player.setPosition(self._preview_original_position)
+        if self._output_player:
+            self._output_player.pause()
+            self._output_player.setPosition(0)
+        return True
+
+    def _release_cuda_resources(self) -> None:
+        python_exe = self._settings_win.python_exe_edit.text().strip() or DEFAULT_PYTHON_EXE
+        if not os.path.isfile(python_exe):
+            return
+        try:
+            subprocess.run(
+                [
+                    python_exe,
+                    "-c",
+                    (
+                        "import gc; "
+                        "gc.collect(); "
+                        "import torch; "
+                        "torch.cuda.empty_cache() if torch.cuda.is_available() else None; "
+                        "torch.cuda.ipc_collect() if torch.cuda.is_available() else None"
+                    ),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                creationflags=_CREATE_NO_WINDOW,
+            )
+        except Exception:
+            pass
+
+    def _force_shutdown(self) -> None:
+        self._force_exit = True
+        try:
+            if self._worker:
+                self._worker.force_kill()
+        except Exception:
+            pass
+        try:
+            if self._thread:
+                self._thread.quit()
+                self._thread.wait(3000)
+        except Exception:
+            pass
+        self._pause_playback()
+        self._release_cuda_resources()
+        if getattr(self, "_tray_icon", None) is not None:
+            self._tray_icon.hide()
+        QApplication.instance().quit()
+
     def _preview_run(self) -> None:
         """Capture the currently displayed video frame, save to a temp PNG,
         set batch size=1 and input to that file, then start an upscale run."""
         frame_img = None
+        self._preview_original_input_path = self._settings_win.input_edit.text().strip()
+        self._preview_original_input_mode = self._settings_win.input_mode_combo.currentText()
+        self._preview_saved_batch_size = self.batch_size_spin.value()
+        if self._input_player is not None:
+            self._preview_original_position = self._input_player.position()
+        self._preview_compare_active = False
 
         if _MULTIMEDIA_AVAILABLE and self._input_player is not None:
             # Step 1: pause the video so the frame buffer is stable
@@ -2168,6 +2249,11 @@ class MainWindow(QMainWindow):
             return
         self._player_mode = new_mode
         if new_mode == "input":
+            if self._preview_compare_active and self._preview_original_input_path:
+                self._resume_original_video_after_preview(switch_mode=False)
+            self._split_toggle.blockSignals(True)
+            self._split_toggle.setChecked(False)
+            self._split_toggle.blockSignals(False)
             if self._current_input_is_image:
                 # Always re-load input pixmap so the tab shows the original image even
                 # if the previous tab had swapped _image_view to display the output.
@@ -2181,6 +2267,9 @@ class MainWindow(QMainWindow):
                 self._input_player.setVideoOutput(self._solo_input_vw)
                 self._viewer_stack.setCurrentIndex(0)
         elif new_mode == "output":
+            self._split_toggle.blockSignals(True)
+            self._split_toggle.setChecked(False)
+            self._split_toggle.blockSignals(False)
             if self._current_input_is_image:
                 # Use whatever output image is already held by the split view – it was
                 # populated by _try_auto_load_output() when upscaling finished.
@@ -2196,7 +2285,13 @@ class MainWindow(QMainWindow):
                 self._output_player.setVideoOutput(self._solo_output_vw)
                 self._viewer_stack.setCurrentIndex(1)
         else:  # split
-            if self._current_input_is_image:
+            self._split_toggle.blockSignals(True)
+            self._split_toggle.setChecked(True)
+            self._split_toggle.blockSignals(False)
+            if self._preview_compare_active:
+                if self._output_player is not None:
+                    self._output_player.setVideoOutput(self._split_view.output_sink)
+            elif self._current_input_is_image:
                 # Image input: feed directly into SplitViewWidget; no video sink needed.
                 inp_path = self._settings_win.input_edit.text().strip()
                 if inp_path:
@@ -2250,9 +2345,15 @@ class MainWindow(QMainWindow):
         """Return the primary player driving the seek slider."""
         if not _MULTIMEDIA_AVAILABLE:
             return None
-        return self._output_player if self._player_mode == "output" else self._input_player
+        if self._player_mode in {"output", "split"}:
+            return self._output_player if self._output_player and self._output_player.source().isValid() else self._input_player
+        return self._input_player
 
     def _on_play_pause(self) -> None:
+        if self._preview_compare_active and self._resume_original_video_after_preview():
+            if self._input_player:
+                self._input_player.play()
+            return
         p = self._active_player()
         if not p:
             return
@@ -2263,11 +2364,41 @@ class MainWindow(QMainWindow):
             self._output_player.play()
             self._input_player.play()
 
+    def _pause_playback(self) -> None:
+        if self._input_player:
+            self._input_player.pause()
+        if self._output_player:
+            self._output_player.pause()
+
     def _on_stop(self) -> None:
         if self._input_player:
             self._input_player.stop()
         if self._output_player:
             self._output_player.stop()
+
+    def _step_frame(self, direction: int) -> None:
+        p = self._active_player()
+        if not p:
+            return
+        self._pause_playback()
+        frame_ms = int(1000 / 24)
+        try:
+            meta = p.metaData()
+            fps = meta.value(QMediaMetaData.Key.VideoFrameRate)
+            if fps:
+                frame_ms = max(1, int(1000 / float(fps)))
+        except Exception:
+            pass
+        new_pos = max(0, p.position() + (direction * frame_ms))
+        self._on_seek(new_pos)
+
+    def _on_split_toggle_changed(self, checked: bool) -> None:
+        if checked:
+            self._mode_split_btn.setChecked(True)
+            self._on_mode_button(2, True)
+        else:
+            self._mode_input_btn.setChecked(True)
+            self._on_mode_button(0, True)
 
     def _on_seek(self, pos: int) -> None:
         if self._input_player:
@@ -2437,6 +2568,26 @@ class MainWindow(QMainWindow):
                         self._meta_label.setText(combined)
                     self._mode_split_btn.setChecked(True)
                     self._on_mode_button(2, True)
+                return
+
+            # Preview clips can still render as video output (e.g. load_cap previews).
+            search_dir = out_path if out_path.is_dir() else inp_path.parent
+            video_candidates = sorted(
+                (f for f in search_dir.iterdir() if f.suffix.lower() in _video_exts),
+                key=lambda f: f.stat().st_mtime,
+                reverse=True,
+            )
+            preferred_videos = [f for f in video_candidates if f.stem.startswith(inp_stem)]
+            selected_video = preferred_videos[0] if preferred_videos else (video_candidates[0] if video_candidates else None)
+            if selected_video is not None:
+                self._load_output_video(str(selected_video))
+                self._set_latest_output_path(selected_video)
+                self._preview_compare_active = True
+                self._mode_split_btn.setChecked(True)
+                self._on_mode_button(2, True)
+                if self._output_player:
+                    self._output_player.pause()
+                    self._output_player.setPosition(0)
             return
 
         # ── Video input: load into output player as before ──
@@ -2486,7 +2637,7 @@ class MainWindow(QMainWindow):
 
         self.batch_size_spin = QSpinBox()
         self.batch_size_spin.setRange(1, 10001)
-        self.batch_size_spin.setValue(5)
+        self.batch_size_spin.setValue(81)
         # NoButtons: the custom ± buttons handle ±4; manual typing snaps on commit
         self.batch_size_spin.setButtonSymbols(
             QAbstractSpinBox.ButtonSymbols.NoButtons
@@ -2615,13 +2766,18 @@ class MainWindow(QMainWindow):
             self._on_log(f"❌  Failed to open output folder: {exc}")
 
     def _on_finished(self, success: bool, msg: str) -> None:
+        was_preview = self._is_preview_run
         self._set_running(False)
         self._run_started_at = None
         if success:
             self.status_label.setText(f"✅  {msg}")
             self._try_auto_load_output()
             # After a Preview run, automatically switch to Split View for comparison
-            if self._is_preview_run and _MULTIMEDIA_AVAILABLE:
+            if was_preview and _MULTIMEDIA_AVAILABLE:
+                self._preview_compare_active = self._latest_output_path is not None
+                if self._preview_original_input_path:
+                    self._settings_win.input_mode_combo.setCurrentText(self._preview_original_input_mode)
+                    self._settings_win.input_edit.setText(self._preview_original_input_path)
                 self._mode_split_btn.setChecked(True)
                 self._on_mode_button(2, True)
         else:
@@ -2638,6 +2794,8 @@ class MainWindow(QMainWindow):
                 4000,
             )
         self._is_preview_run = False
+        if was_preview and self.batch_size_spin.value() == 1 and self._preview_saved_batch_size:
+            self.batch_size_spin.setValue(self._preview_saved_batch_size)
         self._worker = None
         self._thread = None
 
@@ -2724,6 +2882,7 @@ class MainWindow(QMainWindow):
     def _apply_dropped_path(self, path: Path) -> bool:
         if not self._is_supported_drop_path(path):
             return False
+        self._preview_compare_active = False
         if path.is_dir():
             frames = self._sequence_frame_candidates(path)
             self._settings_win.input_mode_combo.setCurrentText("Folder")
@@ -2802,19 +2961,17 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._save_model_settings()
-        if getattr(self, "_tray_icon", None) is not None and not self._force_exit:
-            self.hide()
-            event.ignore()
-            if not self._tray_tip_shown:
-                self._tray_icon.showMessage(
-                    "SeedVR2 GUI",
-                    "SeedVR2 GUI is still running in the system tray.",
-                    QSystemTrayIcon.MessageIcon.Information,
-                    3500,
-                )
-                self._tray_tip_shown = True
+        if self._force_exit:
+            try:
+                if self._worker:
+                    self._worker.force_kill()
+            except Exception:
+                pass
+            self._release_cuda_resources()
+            event.accept()
             return
-        super().closeEvent(event)
+        event.ignore()
+        self._force_shutdown()
 
 
 # ---------------------------------------------------------------------------

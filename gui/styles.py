@@ -51,8 +51,9 @@ QGroupBox::title {
 }
 
 QScrollArea {
-    border: none;
-    background-color: transparent;
+    border: 1px solid #25282D;
+    border-radius: 8px;
+    background-color: #17191C;
 }
 QScrollBar:vertical, QScrollBar:horizontal {
     background-color: #141619;
@@ -119,6 +120,23 @@ QCheckBox::indicator:checked {
     border-color: #0052CC;
 }
 
+QSlider::groove:horizontal {
+    border: none;
+    height: 4px;
+    background: #2A2D31;
+    border-radius: 2px;
+}
+QSlider::sub-page:horizontal {
+    background: #0052CC;
+    border-radius: 2px;
+}
+QSlider::handle:horizontal {
+    background: #D7DBE0;
+    width: 14px;
+    margin: -5px 0;
+    border-radius: 7px;
+}
+
 QPushButton {
     background-color: #23272D;
     border: 1px solid #2E3339;
@@ -155,6 +173,17 @@ QPushButton#danger_button {
     border-color: #8A2B2B;
     color: #FFFFFF;
 }
+QPushButton[flat="true"] {
+    background: transparent;
+    border: none;
+    color: #B8BDC4;
+    padding: 4px 8px;
+}
+QPushButton[flat="true"]:hover {
+    background: #1A1C1E;
+    border: none;
+    color: #FFFFFF;
+}
 
 QProgressBar {
     border: 1px solid #2A2D31;
@@ -176,6 +205,12 @@ QTextEdit {
     color: #C8E7C8;
     font-family: "Consolas", "Courier New", monospace;
     font-size: 12px;
+}
+
+QVideoWidget, QGraphicsView, QStackedWidget {
+    background-color: #0F1012;
+    border: 1px solid #25282D;
+    border-radius: 8px;
 }
 
 QToolTip {

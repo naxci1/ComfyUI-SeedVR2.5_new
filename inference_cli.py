@@ -422,7 +422,34 @@ def generate_output_path(input_path: str, output_format: str, output_dir: Option
     else:
         output_path = base_dir / f"{input_name}{file_suffix}.mp4"
     
-    return str(output_path.resolve())
+    return str(ensure_unique_output_path(output_path).resolve())
+
+
+def ensure_unique_output_path(path: Path | str) -> Path:
+    """Return a non-conflicting file or directory path by appending a numeric suffix."""
+    candidate = Path(path)
+    if not candidate.exists():
+        return candidate
+
+    if candidate.suffix:
+        stem = candidate.stem
+        suffix = candidate.suffix
+        parent = candidate.parent
+        counter = 1
+        while True:
+            probe = parent / f"{stem}_{counter}{suffix}"
+            if not probe.exists():
+                return probe
+            counter += 1
+
+    parent = candidate.parent
+    name = candidate.name
+    counter = 1
+    while True:
+        probe = parent / f"{name}_{counter}"
+        if not probe.exists():
+            return probe
+        counter += 1
 
 
 def process_single_file(input_path: str, args: argparse.Namespace, device_list: List[str], 
@@ -460,6 +487,8 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
         # No extension or PNG sequence → treat as directory, generate filename
         output_path = generate_output_path(input_path, args.output_format, 
                                          output_dir=output_path, input_type=input_type)
+    else:
+        output_path = str(ensure_unique_output_path(output_path).resolve())
     
     # Show format with auto-detection indicator
     format_prefix = "Auto-detected" if format_auto_detected else "Requested"
@@ -1375,10 +1404,10 @@ Examples:
                         help="Target short-side resolution in pixels (default: 1080)")
     process_group.add_argument("--max_resolution", type=int, default=0,
                         help="Maximum resolution for any edge. Scales down if exceeded. 0 = no limit (default: 0)")
-    process_group.add_argument("--batch_size", type=int, default=5,
+    process_group.add_argument("--batch_size", type=int, default=81,
                         help="Frames per batch (must follow 4n+1: 1, 5, 9, 13, 17, 21,...). "
-                         "Ideally matches shot length for best temporal consistency. Higher values improve "
-                         "quality and speed but require more VRAM. Default: 5")
+                          "Ideally matches shot length for best temporal consistency. Higher values improve "
+                         "quality and speed but require more VRAM. Default: 81")
     process_group.add_argument("--uniform_batch_size", action="store_true",
                         help="Pad final batch to match batch_size. Prevents temporal artifacts caused by small "
                          "final batches. Add extra compute but recommended for optimal quality.")
