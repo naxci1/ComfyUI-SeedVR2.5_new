@@ -23,4 +23,5 @@ src/core/subprocess_runner.py
 models/video_vae_v3_mine_bad/
 src/processing/
 TILE_VAE*
-.DS_Store
+.DS_Storetest_nvfp4.py
+IMPLEMENTATION_SUMMARY.md
