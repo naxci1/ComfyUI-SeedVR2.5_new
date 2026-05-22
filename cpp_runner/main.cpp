@@ -1,653 +1,537 @@
-/**
- * main.cpp – SeedVR2 C++ Runner
- *
- * Standalone Qt6 Widgets application that acts as a Topaz-style "runner.exe":
- *   • Dark-mode charcoal UI (#1A1A1A, border-radius: 10px)
- *   • Launches inference_cli.py through QProcess (non-blocking)
- *   • Dual QProgressBar with HH:MM:SS time estimates
- *   • Real-time async stdout scraping via ProcessEngine
- *
- * Build:  See CMakeLists.txt
- * Target: Windows 10/11, Qt 6.5+, MSVC 2022 or MinGW-w64
- */
-
 #include "ProcessEngine.h"
 
 #include <QApplication>
+#include <QCloseEvent>
+#include <QComboBox>
+#include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFormLayout>
+#include <QFrame>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMainWindow>
-#include <QDoubleSpinBox>
 #include <QMessageBox>
-#include <QPushButton>
+#include <QPlainTextEdit>
 #include <QProgressBar>
-#include <QScrollBar>
+#include <QPushButton>
+#include <QScrollArea>
 #include <QSettings>
-#include <QSizePolicy>
+#include <QSlider>
 #include <QStatusBar>
-#include <QTextEdit>
-#include <QThread>
+#include <QToolButton>
 #include <QVBoxLayout>
-#include <QWidget>
-#include <QIcon>
-#include <QProcessEnvironment>
-#include <cmath>
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Dark-mode QSS stylesheet
-// ─────────────────────────────────────────────────────────────────────────────
-
-static const char *k_stylesheet = R"(
-QWidget {
-    background-color: #1A1A1A;
-    color: #E3E4E6;
-    font-family: "Segoe UI", "Inter", Arial, sans-serif;
-    font-size: 13px;
-}
-
-QMainWindow {
-    background-color: #1A1A1A;
-}
-
-QGroupBox {
-    background-color: #222326;
-    border: 1px solid #2F3136;
-    border-radius: 10px;
-    margin-top: 16px;
-    padding: 10px 12px;
-    font-weight: 600;
-    color: #BFD2F5;
-}
-QGroupBox::title {
-    subcontrol-origin: margin;
-    subcontrol-position: top left;
-    left: 12px;
-    top: -2px;
-    padding: 0 4px;
-    color: #BFD2F5;
-}
-
-QLineEdit, QDoubleSpinBox {
-    background-color: #2A2D32;
-    border: 1px solid #3A3E45;
-    border-radius: 6px;
-    padding: 5px 8px;
-    color: #E3E4E6;
-    selection-background-color: #0052CC;
-}
-QLineEdit:focus, QDoubleSpinBox:focus {
-    border: 1px solid #0052CC;
-}
-
-QPushButton {
-    background-color: #2F3136;
-    border: 1px solid #3F434A;
-    border-radius: 8px;
-    padding: 6px 14px;
-    color: #E3E4E6;
-    font-weight: 500;
-}
-QPushButton:hover  { background-color: #3A3E45; border-color: #505660; }
-QPushButton:pressed { background-color: #252830; }
-
-QPushButton#startBtn {
-    background-color: #0052CC;
-    border: none;
-    color: #FFFFFF;
-    font-size: 14px;
-    font-weight: 700;
-    border-radius: 10px;
-    padding: 8px 24px;
-}
-QPushButton#startBtn:hover  { background-color: #0066FF; }
-QPushButton#startBtn:pressed { background-color: #003D99; }
-QPushButton#startBtn:disabled { background-color: #334466; color: #668ABF; }
-
-QPushButton#stopBtn {
-    background-color: #8B0000;
-    border: none;
-    color: #FFFFFF;
-    font-size: 14px;
-    font-weight: 700;
-    border-radius: 10px;
-    padding: 8px 24px;
-}
-QPushButton#stopBtn:hover  { background-color: #CC0000; }
-QPushButton#stopBtn:pressed { background-color: #660000; }
-QPushButton#stopBtn:disabled { background-color: #3D1111; color: #7A4444; }
-
-QProgressBar {
-    background-color: #262626;
-    border: 1px solid #3C4D58;
-    border-radius: 6px;
-    text-align: center;
-    color: #E3E4E6;
-    font-size: 11px;
-    height: 22px;
-    padding: 1px;
-}
-QProgressBar::chunk {
-    background: qlineargradient(
-        x1:0, y1:0, x2:1, y2:0,
-        stop:0 #00B4DB, stop:1 #0083B0);
-    border-radius: 6px;
-    border: 1px solid #5BDCFF;
-}
-QProgressBar#fileProgressBar, QProgressBar#queueProgressBar {
-    background-color: #262626;
-    border: 1px solid #3B5260;
-    border-radius: 6px;
-}
-
-QLabel#progressLabel {
-    color: #A8B8D8;
-    font-size: 11px;
-    padding: 2px 0;
-}
-
-QTextEdit {
-    background-color: #141618;
-    border: 1px solid #2A2D32;
-    border-radius: 8px;
-    color: #C8CDD6;
-    font-family: "Consolas", "Courier New", monospace;
-    font-size: 12px;
-    padding: 4px;
-}
-
-QStatusBar {
-    background-color: #111214;
-    color: #888E99;
-    border-top: 1px solid #2A2D32;
-}
-
-QScrollBar:vertical {
-    background: #1E2126;
-    width: 8px;
-    border-radius: 4px;
-}
-QScrollBar::handle:vertical {
-    background: #404550;
-    border-radius: 4px;
-    min-height: 20px;
-}
-QScrollBar::handle:vertical:hover { background: #5A6070; }
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-)";
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
+#include <QPixmap>
+#include <QSignalBlocker>
 
 namespace {
 
-QString formatHMS(double seconds)
+constexpr const char *kStyle = R"(
+QWidget { background:#181a1f; color:#e7e9ee; font:13px "Segoe UI"; }
+QFrame#previewFrame, QFrame#settingsFrame, QFrame#timelineFrame, QFrame#logFrame {
+    background:#22252d; border:1px solid #2f3441; border-radius:10px;
+}
+QPushButton { background:#2f3441; border:1px solid #3c4353; border-radius:8px; padding:6px 12px; }
+QPushButton:hover { background:#3a4253; }
+QPushButton#startBtn { background:#1d6fff; border:none; font-weight:700; color:white; }
+QPushButton#stopBtn { background:#7a1c1c; border:none; font-weight:700; color:white; }
+QLineEdit, QComboBox, QToolButton { background:#1a1e26; border:1px solid #343b49; border-radius:6px; padding:5px 8px; }
+QSlider::groove:horizontal { height:6px; background:#2f3441; border-radius:3px; }
+QSlider::handle:horizontal { width:14px; background:#6ea8ff; margin:-4px 0; border-radius:7px; }
+QProgressBar { background:#1a1e26; border:1px solid #343b49; border-radius:6px; text-align:center; height:20px; }
+QProgressBar::chunk { background:#1d6fff; border-radius:6px; }
+QPlainTextEdit { background:#11141a; border:1px solid #2a303d; border-radius:8px; font:12px "Consolas"; }
+QLabel#thumbnailLabel { background:#0f1116; border:1px solid #343b49; border-radius:6px; padding:2px; }
+)";
+
+QStringList imageExtensions()
 {
-    if (seconds < 0.0) seconds = 0.0;
-    const int total = static_cast<int>(seconds);
-    return QStringLiteral("%1:%2:%3")
-        .arg(total / 3600,          2, 10, QLatin1Char('0'))
-        .arg((total % 3600) / 60,   2, 10, QLatin1Char('0'))
-        .arg(total % 60,            2, 10, QLatin1Char('0'));
+    return {QStringLiteral("*.png"), QStringLiteral("*.jpg"), QStringLiteral("*.jpeg"), QStringLiteral("*.bmp"), QStringLiteral("*.webp")};
 }
 
-QWidget *makeBrowseRow(QLineEdit *edit, const QString &dialogTitle, bool directory, QWidget *parent)
+QStringList collectImageFiles(const QString &inputPath)
 {
-    auto *row    = new QWidget(parent);
-    auto *layout = new QHBoxLayout(row);
-    layout->setContentsMargins(0, 0, 0, 0);
-    layout->setSpacing(6);
-    layout->addWidget(edit);
+    QFileInfo info(inputPath);
+    if (!info.exists()) return {};
 
-    auto *btn = new QPushButton(QStringLiteral("Browse…"), parent);
-    btn->setFixedWidth(80);
-    layout->addWidget(btn);
+    if (info.isFile()) {
+        return {info.absoluteFilePath()};
+    }
 
-    QObject::connect(btn, &QPushButton::clicked, parent, [edit, dialogTitle, directory, parent]() {
-        QString path;
-        if (directory)
-            path = QFileDialog::getExistingDirectory(parent, dialogTitle, edit->text());
-        else
-            path = QFileDialog::getOpenFileName(parent, dialogTitle, edit->text(),
-                                                QStringLiteral("SafeTensors (*.safetensors *.gguf);;All files (*)"));
-        if (!path.isEmpty())
-            edit->setText(path);
-    });
+    QDir dir(info.absoluteFilePath());
+    QStringList files;
+    for (const QString &pattern : imageExtensions()) {
+        const QFileInfoList list = dir.entryInfoList({pattern}, QDir::Files, QDir::Name);
+        for (const QFileInfo &entry : list) files.push_back(entry.absoluteFilePath());
+    }
+    files.removeDuplicates();
+    files.sort();
+    return files;
+}
 
-    return row;
+QString humanName(const QString &path)
+{
+    const QString name = QFileInfo(path).fileName();
+    return name.isEmpty() ? QStringLiteral("—") : name;
 }
 
 } // namespace
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MainWindow
-// ─────────────────────────────────────────────────────────────────────────────
-
-class MainWindow : public QMainWindow
+class MainWindow final : public QMainWindow
 {
     Q_OBJECT
 
 public:
-    explicit MainWindow(QWidget *parent = nullptr);
-    ~MainWindow() override;
+    explicit MainWindow(QWidget *parent = nullptr)
+        : QMainWindow(parent)
+        , m_engine(new ProcessEngine(this))
+    {
+        setWindowTitle(QStringLiteral("SeedVR2 Runner"));
+        setMinimumSize(1280, 820);
+        qApp->setStyleSheet(QString::fromLatin1(kStyle));
+        buildUi();
+        loadSettings();
+
+        connect(m_engine, &ProcessEngine::logLine, this, &MainWindow::appendLog);
+        connect(m_engine, &ProcessEngine::fileProgressUpdated, this, &MainWindow::onFileProgress);
+        connect(m_engine, &ProcessEngine::processingFinished, this, &MainWindow::onFinished);
+        connect(m_engine, &ProcessEngine::batchProgressUpdated, this, [this](int c, int t) {
+            if (t > 0 && m_fileBar->value() == 0) m_fileBar->setValue((c * 100) / t);
+        });
+
+        setRunning(false);
+    }
+
+    ~MainWindow() override = default;
 
 protected:
-    void closeEvent(QCloseEvent *event) override;
+    void closeEvent(QCloseEvent *event) override
+    {
+        saveSettings();
+        if (m_engine->isRunning()) m_engine->stopProcess();
+        QMainWindow::closeEvent(event);
+    }
 
 private slots:
-    void onStartClicked();
-    void onStopClicked();
-    void onLogLine(const QString &line);
-    void onFileProgress(const QString &filename, int current, int total,
-                        int doneFiles, int remainingFiles, int remainingFramesQueue);
-    void onBatchProgress(int current, int total);
-    void onFinished(bool success, const QString &message);
+    void browseInput()
+    {
+        QString path = QFileDialog::getExistingDirectory(this, QStringLiteral("Select Input Directory"), m_inputPath->text());
+        if (path.isEmpty()) {
+            path = QFileDialog::getOpenFileName(this, QStringLiteral("Select Input File"), m_inputPath->text(),
+                                                QStringLiteral("Media (*.png *.jpg *.jpeg *.bmp *.webp *.mp4 *.mov *.mkv *.avi);;All files (*)"));
+        }
+        if (!path.isEmpty()) {
+            m_inputPath->setText(path);
+            refreshTimeline();
+        }
+    }
+
+    void browseOutput()
+    {
+        const QString path = QFileDialog::getExistingDirectory(this, QStringLiteral("Select Output Directory"), m_outputPath->text());
+        if (!path.isEmpty()) m_outputPath->setText(path);
+    }
+
+    void browsePython()
+    {
+        const QString path = QFileDialog::getOpenFileName(this, QStringLiteral("Select Python Executable"), m_pythonExe->text(), QStringLiteral("Executable (*)"));
+        if (!path.isEmpty()) m_pythonExe->setText(path);
+    }
+
+    void browseScript()
+    {
+        const QString path = QFileDialog::getOpenFileName(this, QStringLiteral("Select inference_cli.py"), m_scriptPath->text(), QStringLiteral("Python (*.py)"));
+        if (!path.isEmpty()) m_scriptPath->setText(path);
+    }
+
+    void toggleSettings(bool expanded)
+    {
+        m_settingsContent->setVisible(expanded);
+        m_toggleSettingsBtn->setText(expanded ? QStringLiteral("▼ Settings") : QStringLiteral("▶ Settings"));
+    }
+
+    void startRun()
+    {
+        const QString input = m_inputPath->text().trimmed();
+        const QString output = m_outputPath->text().trimmed();
+        const QString python = m_pythonExe->text().trimmed();
+        const QString script = m_scriptPath->text().trimmed();
+        if (input.isEmpty() || output.isEmpty() || python.isEmpty() || script.isEmpty()) {
+            QMessageBox::warning(this, QStringLiteral("Missing Required Fields"), QStringLiteral("Input, output, Python executable, and CLI script are required."));
+            return;
+        }
+
+        saveSettings();
+        setRunning(true);
+        m_log->clear();
+        m_fileBar->setValue(0);
+        m_queueBar->setValue(0);
+        m_fileInfo->setText(QStringLiteral("Current: — (0/0)"));
+        m_queueInfo->setText(QStringLiteral("Queue: 0/0"));
+
+        QStringList args;
+        args << QStringLiteral("--input") << input
+             << QStringLiteral("--output") << output
+             << QStringLiteral("--output-resolution") << m_outputResolution->currentText().trimmed()
+             << QStringLiteral("--resize-method") << m_resizeMethod->currentText()
+             << QStringLiteral("--ai-model") << m_aiModel->currentText()
+             << QStringLiteral("--recover-detail") << QString::number(m_recoverDetail->value())
+             << QStringLiteral("--grain") << QString::number(m_grain->value())
+             << QStringLiteral("--batch-flush-interval") << QString::number(1);
+
+        m_engine->startProcess(python, script, args);
+        statusBar()->showMessage(QStringLiteral("Running..."));
+    }
+
+    void stopRun()
+    {
+        m_engine->stopProcess();
+        statusBar()->showMessage(QStringLiteral("Stopping..."));
+    }
+
+    void appendLog(const QString &line)
+    {
+        m_log->appendPlainText(line);
+        auto *sb = m_log->verticalScrollBar();
+        sb->setValue(sb->maximum());
+    }
+
+    void onFileProgress(const QString &filePath, int current, int total, int doneFiles, int remainingFiles, int)
+    {
+        if (total > 0) m_fileBar->setValue((current * 100) / total);
+        const int totalFiles = doneFiles + remainingFiles + 1;
+        if (totalFiles > 0) m_queueBar->setValue((doneFiles * 100) / totalFiles);
+
+        m_fileInfo->setText(QStringLiteral("Current: %1 (%2/%3)").arg(humanName(filePath)).arg(current).arg(total));
+        m_queueInfo->setText(QStringLiteral("Queue: %1/%2").arg(doneFiles).arg(totalFiles));
+    }
+
+    void onFinished(bool success, const QString &message)
+    {
+        setRunning(false);
+        if (success) {
+            m_fileBar->setValue(100);
+            m_queueBar->setValue(100);
+        }
+        statusBar()->showMessage(message, 6000);
+    }
+
+    void refreshTimeline()
+    {
+        qDeleteAll(m_timelineThumbs);
+        m_timelineThumbs.clear();
+
+        const QStringList files = collectImageFiles(m_inputPath->text().trimmed());
+        const int limit = qMin(files.size(), 64);
+        for (int i = 0; i < limit; ++i) {
+            QPixmap pix(files.at(i));
+            if (pix.isNull()) continue;
+
+            auto *thumb = new QLabel(m_timelineContent);
+            thumb->setObjectName(QStringLiteral("thumbnailLabel"));
+            thumb->setFixedSize(120, 72);
+            thumb->setAlignment(Qt::AlignCenter);
+            thumb->setPixmap(pix.scaled(114, 66, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+            thumb->setToolTip(QFileInfo(files.at(i)).fileName());
+            m_timelineLayout->insertWidget(m_timelineLayout->count() - 1, thumb);
+            m_timelineThumbs.push_back(thumb);
+
+            if (i == 0) {
+                m_previewLabel->setPixmap(pix.scaled(m_previewLabel->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+            }
+        }
+        if (m_timelineThumbs.isEmpty()) {
+            m_previewLabel->setText(QStringLiteral("No preview frames available"));
+        }
+    }
 
 private:
-    void buildUi();
-    void saveSettings();
-    void loadSettings();
-    void setRunning(bool running);
-
-    // Settings / path inputs
-    QLineEdit       *m_inputDir  = nullptr;
-    QLineEdit       *m_outputDir = nullptr;
-    QLineEdit       *m_modelPath = nullptr;
-    QLineEdit       *m_pythonExe = nullptr;
-    QLineEdit       *m_cliScript = nullptr;
-    QDoubleSpinBox  *m_fpsSpin   = nullptr;
-
-    // Controls
-    QPushButton *m_startBtn = nullptr;
-    QPushButton *m_stopBtn  = nullptr;
-
-    // Progress – current file
-    QProgressBar *m_fileBar   = nullptr;
-    QLabel       *m_fileLabel = nullptr;
-
-    // Progress – queue
-    QProgressBar *m_queueBar   = nullptr;
-    QLabel       *m_queueLabel = nullptr;
-
-    // Log
-    QTextEdit *m_logView = nullptr;
-
-    // State
-    ProcessEngine *m_engine          = nullptr;
-    double         m_fps             = 1.8;
-    int            m_totalQueueFiles = 0;
-    int            m_lastFileTotalFrames = 0;
-    double         m_fileRemainEmaSeconds = -1.0;
-    double         m_queueRemainEmaSeconds = -1.0;
-    static constexpr double kEmaAlpha = 0.18;
-};
-
-// ── Constructor ───────────────────────────────────────────────────────────────
-
-MainWindow::MainWindow(QWidget *parent)
-    : QMainWindow(parent)
-    , m_engine(new ProcessEngine(this))
-{
-    setWindowTitle(QStringLiteral("SeedVR2 Runner"));
-    setMinimumSize(820, 680);
-    if (qApp) {
-        qApp->setStyleSheet(QString::fromLatin1(k_stylesheet));
-    }
-    buildUi();
-    loadSettings();
-
-    connect(m_engine, &ProcessEngine::logLine,
-            this, &MainWindow::onLogLine);
-    connect(m_engine, &ProcessEngine::fileProgressUpdated,
-            this, &MainWindow::onFileProgress);
-    connect(m_engine, &ProcessEngine::batchProgressUpdated,
-            this, &MainWindow::onBatchProgress);
-    connect(m_engine, &ProcessEngine::processingFinished,
-            this, &MainWindow::onFinished);
-
-    setRunning(false);
-}
-
-MainWindow::~MainWindow() = default;
-
-// ── UI construction ───────────────────────────────────────────────────────────
-
-void MainWindow::buildUi()
-{
-    auto *central = new QWidget(this);
-    setCentralWidget(central);
-
-    auto *root = new QVBoxLayout(central);
-    root->setContentsMargins(16, 16, 16, 16);
-    root->setSpacing(12);
-
-    // ── Paths group ──────────────────────────────────────────────────────
-    auto *pathGroup  = new QGroupBox(QStringLiteral("Paths"), central);
-    auto *pathForm   = new QFormLayout(pathGroup);
-    pathForm->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
-    pathForm->setSpacing(8);
-
-    m_inputDir  = new QLineEdit(pathGroup);
-    m_inputDir->setPlaceholderText(QStringLiteral("Directory containing input videos / images…"));
-    pathForm->addRow(QStringLiteral("Input Directory:"),
-                     makeBrowseRow(m_inputDir, QStringLiteral("Select Input Directory"), true, pathGroup));
-
-    m_outputDir = new QLineEdit(pathGroup);
-    m_outputDir->setPlaceholderText(QStringLiteral("Directory for upscaled output files…"));
-    pathForm->addRow(QStringLiteral("Output Directory:"),
-                     makeBrowseRow(m_outputDir, QStringLiteral("Select Output Directory"), true, pathGroup));
-
-    m_modelPath = new QLineEdit(pathGroup);
-    m_modelPath->setPlaceholderText(QStringLiteral("Path to .safetensors or .gguf model file…"));
-    pathForm->addRow(QStringLiteral("Model Path:"),
-                     makeBrowseRow(m_modelPath, QStringLiteral("Select Model File"), false, pathGroup));
-
-    m_pythonExe = new QLineEdit(pathGroup);
-    m_pythonExe->setPlaceholderText(QStringLiteral(R"(C:\ComfyUI\python_embeded\python.exe)"));
-    pathForm->addRow(QStringLiteral("Python Executable:"),
-                     makeBrowseRow(m_pythonExe, QStringLiteral("Select Python Executable"), false, pathGroup));
-
-    m_cliScript = new QLineEdit(pathGroup);
-    m_cliScript->setPlaceholderText(QStringLiteral(R"(C:\ComfyUI\custom_nodes\ComfyUI-SeedVR2.5\inference_cli.py)"));
-    pathForm->addRow(QStringLiteral("inference_cli.py:"),
-                     makeBrowseRow(m_cliScript, QStringLiteral("Select inference_cli.py"), false, pathGroup));
-
-    // ── Processing options ───────────────────────────────────────────────
-    auto *optGroup = new QGroupBox(QStringLiteral("Processing Options"), central);
-    auto *optForm  = new QFormLayout(optGroup);
-    optForm->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
-    optForm->setSpacing(8);
-
-    m_fpsSpin = new QDoubleSpinBox(optGroup);
-    m_fpsSpin->setRange(0.01, 100.0);
-    m_fpsSpin->setDecimals(2);
-    m_fpsSpin->setSingleStep(0.1);
-    m_fpsSpin->setValue(1.8);
-    m_fpsSpin->setSuffix(QStringLiteral("  fps (estimated processing speed)"));
-    m_fpsSpin->setFixedWidth(280);
-    optForm->addRow(QStringLiteral("Processing Speed:"), m_fpsSpin);
-
-    root->addWidget(pathGroup);
-    root->addWidget(optGroup);
-
-    // ── Action buttons ───────────────────────────────────────────────────
-    auto *btnRow = new QHBoxLayout();
-    m_startBtn = new QPushButton(QStringLiteral("▶  Start Render"), central);
-    m_startBtn->setObjectName(QStringLiteral("startBtn"));
-    m_startBtn->setFixedHeight(38);
-
-    m_stopBtn = new QPushButton(QStringLiteral("⏹  Stop"), central);
-    m_stopBtn->setObjectName(QStringLiteral("stopBtn"));
-    m_stopBtn->setFixedHeight(38);
-
-    btnRow->addStretch();
-    btnRow->addWidget(m_startBtn);
-    btnRow->addWidget(m_stopBtn);
-    btnRow->addStretch();
-    root->addLayout(btnRow);
-
-    connect(m_startBtn, &QPushButton::clicked, this, &MainWindow::onStartClicked);
-    connect(m_stopBtn,  &QPushButton::clicked, this, &MainWindow::onStopClicked);
-
-    // ── Progress bars ────────────────────────────────────────────────────
-    auto *progressGroup = new QGroupBox(QStringLiteral("Progress"), central);
-    auto *pgLayout      = new QVBoxLayout(progressGroup);
-    pgLayout->setSpacing(6);
-
-    // ProgressBar 1 – current file
-    m_fileLabel = new QLabel(QStringLiteral("Current File: — | Remaining: --:--:-- | Frames: 0/0"), progressGroup);
-    m_fileLabel->setObjectName(QStringLiteral("progressLabel"));
-    m_fileBar   = new QProgressBar(progressGroup);
-    m_fileBar->setObjectName(QStringLiteral("fileProgressBar"));
-    m_fileBar->setRange(0, 100);
-    m_fileBar->setValue(0);
-    m_fileBar->setTextVisible(false);
-    m_fileBar->setFixedHeight(22);
-
-    // ProgressBar 2 – overall queue
-    m_queueLabel = new QLabel(
-        QStringLiteral("Overall Batch Progress | Completed: 0/0 | Estimated Total Time Left: --:--:--"),
-        progressGroup);
-    m_queueLabel->setObjectName(QStringLiteral("progressLabel"));
-    m_queueBar   = new QProgressBar(progressGroup);
-    m_queueBar->setObjectName(QStringLiteral("queueProgressBar"));
-    m_queueBar->setRange(0, 100);
-    m_queueBar->setValue(0);
-    m_queueBar->setTextVisible(false);
-    m_queueBar->setFixedHeight(22);
-
-    pgLayout->addWidget(m_fileLabel);
-    pgLayout->addWidget(m_fileBar);
-    pgLayout->addSpacing(4);
-    pgLayout->addWidget(m_queueLabel);
-    pgLayout->addWidget(m_queueBar);
-
-    root->addWidget(progressGroup);
-
-    // ── Log output ───────────────────────────────────────────────────────
-    auto *logGroup  = new QGroupBox(QStringLiteral("Log"), central);
-    auto *logLayout = new QVBoxLayout(logGroup);
-    m_logView = new QTextEdit(logGroup);
-    m_logView->setReadOnly(true);
-    m_logView->setLineWrapMode(QTextEdit::NoWrap);
-    logLayout->addWidget(m_logView);
-    root->addWidget(logGroup, 1);   // stretch the log to fill remaining space
-
-    // ── Status bar ───────────────────────────────────────────────────────
-    statusBar()->showMessage(QStringLiteral("Ready."));
-}
-
-// ── Slot implementations ──────────────────────────────────────────────────────
-
-void MainWindow::onStartClicked()
-{
-    const QString inputDir  = m_inputDir->text().trimmed();
-    const QString outputDir = m_outputDir->text().trimmed();
-    const QString modelPath = m_modelPath->text().trimmed();
-    const QString pythonExe = m_pythonExe->text().trimmed();
-    const QString cliScript = m_cliScript->text().trimmed();
-
-    if (inputDir.isEmpty() || outputDir.isEmpty() || modelPath.isEmpty() ||
-        pythonExe.isEmpty() || cliScript.isEmpty())
+    void buildUi()
     {
-        QMessageBox::warning(this, QStringLiteral("Missing Paths"),
-                             QStringLiteral("Please fill in all path fields before starting."));
-        return;
+        auto *central = new QWidget(this);
+        setCentralWidget(central);
+
+        auto *root = new QVBoxLayout(central);
+        root->setContentsMargins(12, 12, 12, 12);
+        root->setSpacing(10);
+
+        auto *pathRow = new QHBoxLayout();
+        m_inputPath = new QLineEdit(this);
+        m_inputPath->setPlaceholderText(QStringLiteral("Input video, image, or frame directory"));
+        auto *inputBtn = new QPushButton(QStringLiteral("Input..."), this);
+        m_outputPath = new QLineEdit(this);
+        m_outputPath->setPlaceholderText(QStringLiteral("Output directory"));
+        auto *outputBtn = new QPushButton(QStringLiteral("Output..."), this);
+        m_pythonExe = new QLineEdit(this);
+        m_pythonExe->setPlaceholderText(QStringLiteral("Python executable"));
+        auto *pythonBtn = new QPushButton(QStringLiteral("Python..."), this);
+        m_scriptPath = new QLineEdit(this);
+        m_scriptPath->setPlaceholderText(QStringLiteral("inference_cli.py path"));
+        auto *scriptBtn = new QPushButton(QStringLiteral("Script..."), this);
+
+        pathRow->addWidget(m_inputPath, 2);
+        pathRow->addWidget(inputBtn);
+        pathRow->addWidget(m_outputPath, 2);
+        pathRow->addWidget(outputBtn);
+        pathRow->addWidget(m_pythonExe, 2);
+        pathRow->addWidget(pythonBtn);
+        pathRow->addWidget(m_scriptPath, 2);
+        pathRow->addWidget(scriptBtn);
+        root->addLayout(pathRow);
+
+        connect(inputBtn, &QPushButton::clicked, this, &MainWindow::browseInput);
+        connect(outputBtn, &QPushButton::clicked, this, &MainWindow::browseOutput);
+        connect(pythonBtn, &QPushButton::clicked, this, &MainWindow::browsePython);
+        connect(scriptBtn, &QPushButton::clicked, this, &MainWindow::browseScript);
+        connect(m_inputPath, &QLineEdit::editingFinished, this, &MainWindow::refreshTimeline);
+
+        auto *mainPanel = new QHBoxLayout();
+
+        auto *previewFrame = new QFrame(this);
+        previewFrame->setObjectName(QStringLiteral("previewFrame"));
+        auto *previewLayout = new QVBoxLayout(previewFrame);
+        auto *previewTitle = new QLabel(QStringLiteral("Preview"), previewFrame);
+        previewTitle->setStyleSheet(QStringLiteral("font-size:15px;font-weight:600;"));
+        m_previewLabel = new QLabel(QStringLiteral("No preview frames available"), previewFrame);
+        m_previewLabel->setAlignment(Qt::AlignCenter);
+        m_previewLabel->setMinimumSize(720, 420);
+        m_previewLabel->setStyleSheet(QStringLiteral("background:#0f1116;border:1px solid #2f3441;border-radius:8px;"));
+        previewLayout->addWidget(previewTitle);
+        previewLayout->addWidget(m_previewLabel, 1);
+
+        auto *settingsFrame = new QFrame(this);
+        settingsFrame->setObjectName(QStringLiteral("settingsFrame"));
+        settingsFrame->setMinimumWidth(340);
+        auto *settingsLayout = new QVBoxLayout(settingsFrame);
+        m_toggleSettingsBtn = new QToolButton(settingsFrame);
+        m_toggleSettingsBtn->setCheckable(true);
+        m_toggleSettingsBtn->setChecked(true);
+        m_toggleSettingsBtn->setToolButtonStyle(Qt::ToolButtonTextOnly);
+        settingsLayout->addWidget(m_toggleSettingsBtn);
+
+        m_settingsContent = new QWidget(settingsFrame);
+        auto *form = new QFormLayout(m_settingsContent);
+
+        m_outputResolution = new QComboBox(m_settingsContent);
+        m_outputResolution->setEditable(true);
+        m_outputResolution->addItems({QStringLiteral("1280x720"), QStringLiteral("1920x1080"), QStringLiteral("2560x1440"), QStringLiteral("3840x2160")});
+        m_outputResolution->setCurrentText(QStringLiteral("1920x1080"));
+
+        m_resizeMethod = new QComboBox(m_settingsContent);
+        m_resizeMethod->addItems({QStringLiteral("lanczos"), QStringLiteral("bicubic"), QStringLiteral("bilinear"), QStringLiteral("nearest")});
+
+        m_aiModel = new QComboBox(m_settingsContent);
+        m_aiModel->setEditable(true);
+        m_aiModel->addItems({QStringLiteral("seedvr2-pro"), QStringLiteral("seedvr2-balanced"), QStringLiteral("seedvr2-fast")});
+
+        m_recoverDetail = new QSlider(Qt::Horizontal, m_settingsContent);
+        m_recoverDetail->setRange(0, 100);
+        m_recoverDetail->setValue(35);
+        m_recoverLabel = new QLabel(QString::number(m_recoverDetail->value()), m_settingsContent);
+
+        m_grain = new QSlider(Qt::Horizontal, m_settingsContent);
+        m_grain->setRange(0, 100);
+        m_grain->setValue(8);
+        m_grainLabel = new QLabel(QString::number(m_grain->value()), m_settingsContent);
+
+        auto *detailRow = new QWidget(m_settingsContent);
+        auto *detailLayout = new QHBoxLayout(detailRow);
+        detailLayout->setContentsMargins(0, 0, 0, 0);
+        detailLayout->addWidget(m_recoverDetail);
+        detailLayout->addWidget(m_recoverLabel);
+
+        auto *grainRow = new QWidget(m_settingsContent);
+        auto *grainLayout = new QHBoxLayout(grainRow);
+        grainLayout->setContentsMargins(0, 0, 0, 0);
+        grainLayout->addWidget(m_grain);
+        grainLayout->addWidget(m_grainLabel);
+
+        form->addRow(QStringLiteral("Output Resolution"), m_outputResolution);
+        form->addRow(QStringLiteral("Resize Method"), m_resizeMethod);
+        form->addRow(QStringLiteral("AI Model"), m_aiModel);
+        form->addRow(QStringLiteral("Recover Detail"), detailRow);
+        form->addRow(QStringLiteral("Grain"), grainRow);
+
+        settingsLayout->addWidget(m_settingsContent);
+        settingsLayout->addStretch();
+
+        connect(m_toggleSettingsBtn, &QToolButton::toggled, this, &MainWindow::toggleSettings);
+        connect(m_recoverDetail, &QSlider::valueChanged, this, [this](int v) { m_recoverLabel->setText(QString::number(v)); });
+        connect(m_grain, &QSlider::valueChanged, this, [this](int v) { m_grainLabel->setText(QString::number(v)); });
+        toggleSettings(true);
+
+        mainPanel->addWidget(previewFrame, 3);
+        mainPanel->addWidget(settingsFrame, 1);
+        root->addLayout(mainPanel, 1);
+
+        auto *timelineFrame = new QFrame(this);
+        timelineFrame->setObjectName(QStringLiteral("timelineFrame"));
+        auto *timelineLayout = new QVBoxLayout(timelineFrame);
+        auto *timelineTitle = new QLabel(QStringLiteral("Timeline"), timelineFrame);
+        timelineTitle->setStyleSheet(QStringLiteral("font-size:14px;font-weight:600;"));
+
+        m_timelineScroll = new QScrollArea(timelineFrame);
+        m_timelineScroll->setWidgetResizable(true);
+        m_timelineScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOn);
+        m_timelineScroll->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        m_timelineScroll->setMinimumHeight(122);
+
+        m_timelineContent = new QWidget(m_timelineScroll);
+        m_timelineLayout = new QHBoxLayout(m_timelineContent);
+        m_timelineLayout->setContentsMargins(8, 8, 8, 8);
+        m_timelineLayout->setSpacing(8);
+        m_timelineLayout->addStretch();
+        m_timelineScroll->setWidget(m_timelineContent);
+
+        m_fileInfo = new QLabel(QStringLiteral("Current: — (0/0)"), timelineFrame);
+        m_fileBar = new QProgressBar(timelineFrame);
+        m_fileBar->setRange(0, 100);
+        m_fileBar->setValue(0);
+
+        m_queueInfo = new QLabel(QStringLiteral("Queue: 0/0"), timelineFrame);
+        m_queueBar = new QProgressBar(timelineFrame);
+        m_queueBar->setRange(0, 100);
+        m_queueBar->setValue(0);
+
+        timelineLayout->addWidget(timelineTitle);
+        timelineLayout->addWidget(m_timelineScroll);
+        timelineLayout->addWidget(m_fileInfo);
+        timelineLayout->addWidget(m_fileBar);
+        timelineLayout->addWidget(m_queueInfo);
+        timelineLayout->addWidget(m_queueBar);
+        root->addWidget(timelineFrame);
+
+        auto *logFrame = new QFrame(this);
+        logFrame->setObjectName(QStringLiteral("logFrame"));
+        auto *logLayout = new QVBoxLayout(logFrame);
+        auto *logTitle = new QLabel(QStringLiteral("Log"), logFrame);
+        logTitle->setStyleSheet(QStringLiteral("font-size:14px;font-weight:600;"));
+        m_log = new QPlainTextEdit(logFrame);
+        m_log->setReadOnly(true);
+        m_log->setMaximumBlockCount(5000);
+        m_log->setMinimumHeight(170);
+        logLayout->addWidget(logTitle);
+        logLayout->addWidget(m_log);
+        root->addWidget(logFrame);
+
+        auto *actions = new QHBoxLayout();
+        actions->addStretch();
+        m_startBtn = new QPushButton(QStringLiteral("Start"), this);
+        m_startBtn->setObjectName(QStringLiteral("startBtn"));
+        m_stopBtn = new QPushButton(QStringLiteral("Stop"), this);
+        m_stopBtn->setObjectName(QStringLiteral("stopBtn"));
+        actions->addWidget(m_startBtn);
+        actions->addWidget(m_stopBtn);
+        root->addLayout(actions);
+
+        connect(m_startBtn, &QPushButton::clicked, this, &MainWindow::startRun);
+        connect(m_stopBtn, &QPushButton::clicked, this, &MainWindow::stopRun);
+
+        statusBar()->showMessage(QStringLiteral("Ready"));
     }
 
-    m_fps = m_fpsSpin->value();
-    m_totalQueueFiles  = 0;
-    m_lastFileTotalFrames = 0;
-    m_fileRemainEmaSeconds = -1.0;
-    m_queueRemainEmaSeconds = -1.0;
-
-    // Reset progress bars
-    m_fileBar->setValue(0);
-    m_queueBar->setValue(0);
-    m_fileLabel->setText(QStringLiteral("Current File: — | Remaining: --:--:-- | Frames: 0/0"));
-    m_queueLabel->setText(QStringLiteral("Overall Batch Progress | Completed: 0/0 | Estimated Total Time Left: --:--:--"));
-
-    m_logView->clear();
-    saveSettings();
-    setRunning(true);
-
-    // Build CLI arguments for inference_cli.py
-    QStringList args;
-    args << inputDir
-         << QStringLiteral("--output_dir")   << outputDir
-         << QStringLiteral("--dit_model_path") << modelPath;
-
-    statusBar()->showMessage(QStringLiteral("Running…"));
-    m_engine->startProcess(pythonExe, cliScript, args);
-}
-
-void MainWindow::onStopClicked()
-{
-    m_engine->stopProcess();
-    statusBar()->showMessage(QStringLiteral("Stopping…"));
-}
-
-void MainWindow::onLogLine(const QString &line)
-{
-    m_logView->append(line);
-    // Auto-scroll to bottom
-    QScrollBar *sb = m_logView->verticalScrollBar();
-    sb->setValue(sb->maximum());
-}
-
-void MainWindow::onFileProgress(const QString &filename,
-                                int current, int total,
-                                int doneFiles, int remainingFiles, int remainingFramesQueue)
-{
-    m_lastFileTotalFrames = (total > 0) ? total : m_lastFileTotalFrames;
-
-    // ── File progress bar ────────────────────────────────────────────────
-    const int filePercent = (total > 0) ? qBound(0, current * 100 / total, 100) : 0;
-    m_fileBar->setValue(filePercent);
-
-    const double rawFileRemainSec = (m_fps > 0.0 && total > current)
-                                    ? static_cast<double>(total - current) / m_fps
-                                    : 0.0;
-    if (m_fileRemainEmaSeconds < 0.0) {
-        m_fileRemainEmaSeconds = rawFileRemainSec;
-    } else {
-        m_fileRemainEmaSeconds = (kEmaAlpha * rawFileRemainSec) + ((1.0 - kEmaAlpha) * m_fileRemainEmaSeconds);
+    void setRunning(bool running)
+    {
+        m_startBtn->setEnabled(!running);
+        m_stopBtn->setEnabled(running);
+        m_inputPath->setEnabled(!running);
+        m_outputPath->setEnabled(!running);
+        m_pythonExe->setEnabled(!running);
+        m_scriptPath->setEnabled(!running);
+        m_toggleSettingsBtn->setEnabled(!running);
+        m_settingsContent->setEnabled(!running);
     }
 
-    const QString baseName = QFileInfo(filename).fileName();
-    m_fileLabel->setText(
-        QStringLiteral("Current File: %1 | Remaining: %2 | Frames: %3/%4")
-            .arg(baseName.isEmpty() ? QStringLiteral("—") : baseName)
-            .arg(formatHMS(m_fileRemainEmaSeconds))
-            .arg(current)
-            .arg(total));
-
-    // ── Queue progress bar ───────────────────────────────────────────────
-    const int totalFiles = doneFiles + 1 + remainingFiles;  // done + current + remaining
-    if (m_totalQueueFiles == 0 && totalFiles > 0)
-        m_totalQueueFiles = totalFiles;
-
-    const int queueTotal = qMax(m_totalQueueFiles, totalFiles);
-    const int queuePercent = (queueTotal > 0)
-                             ? qBound(0, doneFiles * 100 / queueTotal, 100)
-                             : 0;
-    m_queueBar->setValue(queuePercent);
-
-    const int currentFileRemainingFrames = qMax(0, total - current);
-    const int upcomingRemainingFrames = qMax(0, remainingFramesQueue);
-    const int totalRemainingFrames = upcomingRemainingFrames + currentFileRemainingFrames;
-    const double rawQueueRemainSec = (m_fps > 0.0)
-        ? static_cast<double>(totalRemainingFrames) / m_fps
-        : 0.0;
-    if (m_queueRemainEmaSeconds < 0.0) {
-        m_queueRemainEmaSeconds = rawQueueRemainSec;
-    } else {
-        m_queueRemainEmaSeconds = (kEmaAlpha * rawQueueRemainSec) + ((1.0 - kEmaAlpha) * m_queueRemainEmaSeconds);
+    void saveSettings()
+    {
+        QSettings s(QStringLiteral("SeedVR2"), QStringLiteral("Runner"));
+        s.setValue(QStringLiteral("inputPath"), m_inputPath->text());
+        s.setValue(QStringLiteral("outputPath"), m_outputPath->text());
+        s.setValue(QStringLiteral("pythonExe"), m_pythonExe->text());
+        s.setValue(QStringLiteral("scriptPath"), m_scriptPath->text());
+        s.setValue(QStringLiteral("outputResolution"), m_outputResolution->currentText());
+        s.setValue(QStringLiteral("resizeMethod"), m_resizeMethod->currentText());
+        s.setValue(QStringLiteral("aiModel"), m_aiModel->currentText());
+        s.setValue(QStringLiteral("recoverDetail"), m_recoverDetail->value());
+        s.setValue(QStringLiteral("grain"), m_grain->value());
     }
 
-    m_queueLabel->setText(
-        QStringLiteral("Overall Batch Progress | Completed: %1/%2 | Estimated Total Time Left: %3")
-            .arg(doneFiles)
-            .arg(queueTotal)
-            .arg(formatHMS(m_queueRemainEmaSeconds)));
-}
+    void loadSettings()
+    {
+        QSettings s(QStringLiteral("SeedVR2"), QStringLiteral("Runner"));
+        m_inputPath->setText(s.value(QStringLiteral("inputPath")).toString());
+        m_outputPath->setText(s.value(QStringLiteral("outputPath")).toString());
+        m_pythonExe->setText(s.value(QStringLiteral("pythonExe")).toString());
+        m_scriptPath->setText(s.value(QStringLiteral("scriptPath")).toString());
 
-void MainWindow::onBatchProgress(int current, int total)
-{
-    // Inner diffusion-step bar reused on the file bar when no status token available.
-    // This is the fallback for "step N/M" token parsing.
-    if (total > 0) {
-        const int pct = qBound(0, current * 100 / total, 100);
-        // Only update if the file bar has no meaningful data yet
-        if (m_fileBar->value() == 0)
-            m_fileBar->setValue(pct);
+        const QString outputResolution = s.value(QStringLiteral("outputResolution"), QStringLiteral("1920x1080")).toString();
+        m_outputResolution->setCurrentText(outputResolution);
+
+        const QString resizeMethod = s.value(QStringLiteral("resizeMethod"), QStringLiteral("lanczos")).toString();
+        {
+            QSignalBlocker blocker(m_resizeMethod);
+            int idx = m_resizeMethod->findText(resizeMethod);
+            if (idx < 0) {
+                m_resizeMethod->addItem(resizeMethod);
+                idx = m_resizeMethod->findText(resizeMethod);
+            }
+            m_resizeMethod->setCurrentIndex(idx);
+        }
+
+        const QString aiModel = s.value(QStringLiteral("aiModel"), QStringLiteral("seedvr2-pro")).toString();
+        m_aiModel->setCurrentText(aiModel);
+        m_recoverDetail->setValue(s.value(QStringLiteral("recoverDetail"), 35).toInt());
+        m_grain->setValue(s.value(QStringLiteral("grain"), 8).toInt());
+        refreshTimeline();
     }
-}
 
-void MainWindow::onFinished(bool success, const QString &message)
-{
-    setRunning(false);
-    if (success) {
-        m_fileBar->setValue(100);
-        m_queueBar->setValue(100);
-        statusBar()->showMessage(QStringLiteral("✅  Completed: ") + message);
-    } else {
-        statusBar()->showMessage(QStringLiteral("⏹  ") + message);
-    }
-}
+    QLineEdit *m_inputPath = nullptr;
+    QLineEdit *m_outputPath = nullptr;
+    QLineEdit *m_pythonExe = nullptr;
+    QLineEdit *m_scriptPath = nullptr;
 
-// ── State helpers ─────────────────────────────────────────────────────────────
+    QLabel *m_previewLabel = nullptr;
 
-void MainWindow::setRunning(bool running)
-{
-    m_startBtn->setEnabled(!running);
-    m_stopBtn->setEnabled(running);
-    m_inputDir->setEnabled(!running);
-    m_outputDir->setEnabled(!running);
-    m_modelPath->setEnabled(!running);
-    m_pythonExe->setEnabled(!running);
-    m_cliScript->setEnabled(!running);
-    m_fpsSpin->setEnabled(!running);
-}
+    QToolButton *m_toggleSettingsBtn = nullptr;
+    QWidget *m_settingsContent = nullptr;
+    QComboBox *m_outputResolution = nullptr;
+    QComboBox *m_resizeMethod = nullptr;
+    QComboBox *m_aiModel = nullptr;
+    QSlider *m_recoverDetail = nullptr;
+    QSlider *m_grain = nullptr;
+    QLabel *m_recoverLabel = nullptr;
+    QLabel *m_grainLabel = nullptr;
 
-void MainWindow::closeEvent(QCloseEvent *event)
-{
-    saveSettings();
-    if (m_engine->isRunning()) {
-        m_engine->stopProcess();
-    }
-    QMainWindow::closeEvent(event);
-}
+    QScrollArea *m_timelineScroll = nullptr;
+    QWidget *m_timelineContent = nullptr;
+    QHBoxLayout *m_timelineLayout = nullptr;
+    QList<QLabel *> m_timelineThumbs;
 
-// ── Persistence (QSettings) ──────────────────────────────────────────────────
+    QLabel *m_fileInfo = nullptr;
+    QLabel *m_queueInfo = nullptr;
+    QProgressBar *m_fileBar = nullptr;
+    QProgressBar *m_queueBar = nullptr;
 
-void MainWindow::saveSettings()
-{
-    QSettings s(QStringLiteral("SeedVR2"), QStringLiteral("Runner"));
-    s.setValue(QStringLiteral("inputDir"),  m_inputDir->text());
-    s.setValue(QStringLiteral("outputDir"), m_outputDir->text());
-    s.setValue(QStringLiteral("modelPath"), m_modelPath->text());
-    s.setValue(QStringLiteral("pythonExe"), m_pythonExe->text());
-    s.setValue(QStringLiteral("cliScript"), m_cliScript->text());
-    s.setValue(QStringLiteral("fps"),       m_fpsSpin->value());
-}
+    QPlainTextEdit *m_log = nullptr;
 
-void MainWindow::loadSettings()
-{
-    QSettings s(QStringLiteral("SeedVR2"), QStringLiteral("Runner"));
-    m_inputDir->setText(s.value(QStringLiteral("inputDir")).toString());
-    m_outputDir->setText(s.value(QStringLiteral("outputDir")).toString());
-    m_modelPath->setText(s.value(QStringLiteral("modelPath")).toString());
-    m_pythonExe->setText(s.value(QStringLiteral("pythonExe"),
-        QStringLiteral(R"(C:\ComfyUI\python_embeded\python.exe)")).toString());
-    m_cliScript->setText(s.value(QStringLiteral("cliScript")).toString());
-    m_fpsSpin->setValue(s.value(QStringLiteral("fps"), 1.8).toDouble());
-}
+    QPushButton *m_startBtn = nullptr;
+    QPushButton *m_stopBtn = nullptr;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// main()
-// ─────────────────────────────────────────────────────────────────────────────
+    ProcessEngine *m_engine = nullptr;
+};
 
 #include "main.moc"
 
 int main(int argc, char *argv[])
 {
-    // High-DPI support (relevant on Windows with display scaling)
-    QApplication::setHighDpiScaleFactorRoundingPolicy(
-        Qt::HighDpiScaleFactorRoundingPolicy::PassThrough);
-
+    QApplication::setHighDpiScaleFactorRoundingPolicy(Qt::HighDpiScaleFactorRoundingPolicy::PassThrough);
     QApplication app(argc, argv);
     app.setApplicationName(QStringLiteral("SeedVR2 Runner"));
     app.setOrganizationName(QStringLiteral("SeedVR2"));
-    app.setApplicationVersion(QStringLiteral("2.5"));
 
-    MainWindow window;
-    window.show();
-
+    MainWindow w;
+    w.show();
     return app.exec();
 }
