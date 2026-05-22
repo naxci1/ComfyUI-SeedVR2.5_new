@@ -83,22 +83,58 @@ QWidget *buildPathRow(QWidget *parent, QLineEdit *lineEdit, QPushButton *browseB
     return row;
 }
 
-QString findDefaultCliScriptPath()
+/**
+ * Locate inference_cli.py using a priority chain:
+ *  1. seedvrFolder argument (from Settings dialog / config.json)
+ *  2. config.json in the application directory ("SeedVR2 Folder" key)
+ *  3. Adjacent heuristic paths relative to the executable
+ *
+ * Returns an absolute path when found, or an empty QString on failure.
+ */
+QString findCliScriptPath(const QString &seedvrFolder = QString())
 {
     const QString appDir = QCoreApplication::applicationDirPath();
+
+    // Priority 1: explicit folder from settings
+    if (!seedvrFolder.trimmed().isEmpty()) {
+        const QString candidate = QDir(seedvrFolder.trimmed())
+                                      .absoluteFilePath(QStringLiteral("inference_cli.py"));
+        if (QFileInfo::exists(candidate))
+            return QFileInfo(candidate).absoluteFilePath();
+    }
+
+    // Priority 2: config.json next to the executable
+    const QString configPath = QDir(appDir).absoluteFilePath(QStringLiteral("config.json"));
+    QFile configFile(configPath);
+    if (configFile.open(QIODevice::ReadOnly)) {
+        const QJsonDocument doc = QJsonDocument::fromJson(configFile.readAll());
+        if (doc.isObject()) {
+            const QString folder = doc.object()
+                                       .value(QStringLiteral("SeedVR2 Folder"))
+                                       .toString()
+                                       .trimmed();
+            if (!folder.isEmpty()) {
+                const QString candidate = QDir(folder)
+                                              .absoluteFilePath(QStringLiteral("inference_cli.py"));
+                if (QFileInfo::exists(candidate))
+                    return QFileInfo(candidate).absoluteFilePath();
+            }
+        }
+    }
+
+    // Priority 3: heuristic relative paths
     const QStringList candidates = {
         QDir(appDir).absoluteFilePath(QStringLiteral("inference_cli.py")),
         QDir(appDir).absoluteFilePath(QStringLiteral("../inference_cli.py")),
         QDir(appDir).absoluteFilePath(QStringLiteral("../../inference_cli.py")),
         QDir::current().absoluteFilePath(QStringLiteral("inference_cli.py"))
     };
-
-    for (const QString &candidate : candidates) {
-        if (QFileInfo::exists(candidate)) {
-            return QFileInfo(candidate).absoluteFilePath();
-        }
+    for (const QString &c : candidates) {
+        if (QFileInfo::exists(c))
+            return QFileInfo(c).absoluteFilePath();
     }
-    return candidates.first();
+
+    return {};  // not found
 }
 
 void setPreviewPixmap(QLabel *target, const QString &path)
@@ -235,6 +271,9 @@ public:
     QString primaryGpu() const { return m_primaryGpu->currentText(); }
     QString secondaryGpu() const { return m_secondaryGpu->currentText(); }
 
+    /** Re-read all fields from QSettings (called after config.json import). */
+    void reloadFromSettings() { load(); }
+
 signals:
     void settingsChanged();
 
@@ -333,6 +372,7 @@ public:
         , m_settingsDialog(new SettingsDialog(this))
     {
         setWindowTitle(QStringLiteral("SeedVR2 Pro Upscaler"));
+        setWindowIcon(QIcon(QStringLiteral("app.ico")));
         setMinimumSize(1650, 980);
         setAcceptDrops(true);
 
@@ -340,6 +380,7 @@ public:
 
         buildUi();
         loadUiSettings();
+        loadConfigJson();   // read config.json → seed QSettings → reload settings dialog
 
         connect(m_engine, &ProcessEngine::logLine, this, &MainWindow::appendLogLine);
         connect(m_engine, &ProcessEngine::fileProgressUpdated, this, &MainWindow::onFileProgress);
@@ -378,7 +419,7 @@ protected:
             QSettings s(QStringLiteral("SeedVR2"), QStringLiteral("QtRunner"));
             s.setValue(QStringLiteral("settings/inputPath"), path);
         }
-        refreshPreviewPanels();
+        loadFirstFrame(path);   // extract & display first frame automatically
         appendLogLine(QStringLiteral("Dropped input: %1").arg(path));
     }
 
@@ -443,11 +484,17 @@ private slots:
 
     void startRender()
     {
-        const QString scriptPath = findDefaultCliScriptPath();
-        if (!QFileInfo::exists(scriptPath)) {
-            QMessageBox::critical(this, QStringLiteral("CLI Not Found"), QStringLiteral("Could not locate inference_cli.py"));
+        const QString scriptPath = findCliScriptPath(m_settingsDialog->seedvrFolder());
+        if (scriptPath.isEmpty()) {
+            const QString msg = QStringLiteral(
+                "Could not locate inference_cli.py.\n\n"
+                "Please set the 'SeedVR2 Folder' path in Edit > Settings, "
+                "or place a config.json with a 'SeedVR2 Folder' key next to the executable.");
+            appendLogLine(QStringLiteral("[ERROR] CLI not found. Set SeedVR2 Folder in Edit > Settings."));
+            QMessageBox::critical(this, QStringLiteral("CLI Not Found"), msg);
             return;
         }
+        appendLogLine(QStringLiteral("[INFO] Using CLI: %1").arg(scriptPath));
 
         const QString input = m_settingsDialog->inputPath();
         if (input.isEmpty()) {
@@ -689,6 +736,111 @@ private:
     {
         m_startBtn->setEnabled(!running);
         m_stopBtn->setEnabled(running);
+    }
+
+    /**
+     * Load and display the first frame of a media file into the input preview panels.
+     * For image files: loaded directly via QPixmap.
+     * For video files: the first frame is extracted asynchronously via ffmpeg.
+     */
+    void loadFirstFrame(const QString &path)
+    {
+        if (path.isEmpty() || !QFileInfo::exists(path)) {
+            refreshPreviewPanels();
+            return;
+        }
+
+        static const QStringList kImageExts = {
+            "png", "jpg", "jpeg", "bmp", "webp", "tif", "tiff"
+        };
+        const QString ext = QFileInfo(path).suffix().toLower();
+
+        if (kImageExts.contains(ext)) {
+            // Direct image: just refresh the panels
+            refreshPreviewPanels();
+            return;
+        }
+
+        // Video/unknown: extract frame 0 via ffmpeg asynchronously
+        m_firstFrameTempPath = QDir::temp().absoluteFilePath(
+            QStringLiteral("seedvr2_preview_%1.png").arg(QFileInfo(path).baseName()));
+
+        auto *proc = new QProcess(this);
+        connect(proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+                this, [this, proc](int exitCode, QProcess::ExitStatus) {
+            proc->deleteLater();
+            if (exitCode == 0 && QFileInfo::exists(m_firstFrameTempPath)) {
+                setPreviewPixmap(m_splitInputPreview, m_firstFrameTempPath);
+                setPreviewPixmap(m_inputPreviewSolo,  m_firstFrameTempPath);
+                appendLogLine(QStringLiteral("[INFO] First frame extracted for preview."));
+            } else {
+                m_splitInputPreview->setText(QStringLiteral("Video preview: first frame extraction failed"));
+                m_inputPreviewSolo->setText(QStringLiteral("Video preview: first frame extraction failed"));
+                appendLogLine(QStringLiteral("[WARN] ffmpeg could not extract first frame from: %1")
+                                  .arg(m_inputPreviewPath->text()));
+            }
+        });
+
+        proc->start(QStringLiteral("ffmpeg"), {
+            QStringLiteral("-y"),
+            QStringLiteral("-i"),     path,
+            QStringLiteral("-vframes"), QStringLiteral("1"),
+            QStringLiteral("-q:v"),     QStringLiteral("2"),
+            m_firstFrameTempPath
+        });
+    }
+
+    /**
+     * Read config.json from the application directory on startup.
+     * For each recognised key, if QSettings does not yet have a value, seed it.
+     * Then ask the SettingsDialog to reload so the new values appear immediately.
+     * Errors are logged to the console but never crash the application.
+     */
+    void loadConfigJson()
+    {
+        const QString configPath = QDir(QCoreApplication::applicationDirPath())
+                                       .absoluteFilePath(QStringLiteral("config.json"));
+        QFile f(configPath);
+        if (!f.open(QIODevice::ReadOnly)) {
+            appendLogLine(QStringLiteral("[INFO] config.json not present at: %1 — using saved settings.")
+                              .arg(configPath));
+            return;
+        }
+
+        const QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
+        if (!doc.isObject()) {
+            appendLogLine(QStringLiteral("[WARN] config.json is malformed — skipped."));
+            return;
+        }
+
+        const QJsonObject obj = doc.object();
+        QSettings s(QStringLiteral("SeedVR2"), QStringLiteral("QtRunner"));
+
+        // Map config.json keys → QSettings keys (only seed if not already set)
+        const QVector<QPair<QString, QString>> keyMap = {
+            { QStringLiteral("SeedVR2 Folder"),     QStringLiteral("settings/seedvrFolder") },
+            { QStringLiteral("Python Executable"),  QStringLiteral("settings/pythonExe")    },
+            { QStringLiteral("Input Path"),          QStringLiteral("settings/inputPath")    },
+            { QStringLiteral("Output Path"),         QStringLiteral("settings/outputPath")   },
+            { QStringLiteral("Model Directory"),     QStringLiteral("settings/modelDir")     },
+        };
+        bool anyApplied = false;
+        for (const auto &kv : keyMap) {
+            const QString val = obj.value(kv.first).toString().trimmed();
+            if (!val.isEmpty() && s.value(kv.second).toString().isEmpty()) {
+                s.setValue(kv.second, val);
+                anyApplied = true;
+                appendLogLine(QStringLiteral("[INFO] config.json → %1 = %2").arg(kv.second, val));
+            }
+        }
+
+        if (anyApplied) {
+            // Sync the settings dialog fields with the newly written QSettings values
+            m_settingsDialog->reloadFromSettings();
+            appendLogLine(QStringLiteral("[INFO] Settings updated from config.json: %1").arg(configPath));
+        } else {
+            appendLogLine(QStringLiteral("[INFO] config.json loaded (no new values to apply): %1").arg(configPath));
+        }
     }
 
     void buildMenus()
@@ -1125,6 +1277,7 @@ private:
     // core runtime objects
     ProcessEngine *m_engine = nullptr;
     SettingsDialog *m_settingsDialog = nullptr;
+    QString m_firstFrameTempPath;
 
     // preview
     QTabWidget *m_previewTabs = nullptr;
