@@ -17,9 +17,6 @@ try:
 except Exception:  # pragma: no cover
     cv2 = None
 
-import numpy as np
-from PIL import Image, ImageFilter
-
 _STATUS_PREFIX = "__SEEDVR2_GUI_STATUS__|"
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
 _VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
@@ -96,6 +93,8 @@ def _parse_resolution(raw: str) -> Tuple[int, int]:
 
 
 def _resample_mode(method: str) -> int:
+    from PIL import Image
+
     mapping = {
         "nearest": Image.Resampling.NEAREST,
         "bilinear": Image.Resampling.BILINEAR,
@@ -106,12 +105,15 @@ def _resample_mode(method: str) -> int:
 
 
 def _apply_image_pipeline(
-    image: Image.Image,
+    image: "Image.Image",
     target_size: Tuple[int, int],
     resize_method: str,
     recover_detail: int,
     grain: int,
-) -> Image.Image:
+) -> "Image.Image":
+    from PIL import ImageFilter
+    import numpy as np
+
     processed = image.resize(target_size, _resample_mode(resize_method))
 
     if recover_detail > 0:
@@ -128,6 +130,8 @@ def _apply_image_pipeline(
         sigma = max(0.2, grain / 14.0)
         noise = np.random.normal(0.0, sigma, arr.shape).astype(np.float32)
         arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
+        from PIL import Image
+
         processed = Image.fromarray(arr, mode=processed.mode)
 
     return processed
@@ -204,6 +208,8 @@ def _process_image(
     remaining_frames_queue: int,
     flush_interval: int,
 ) -> None:
+    from PIL import Image
+
     with Image.open(item.path) as src:
         image = src.convert("RGB")
         rendered = _apply_image_pipeline(image, target_size, resize_method, recover_detail, grain)
@@ -230,6 +236,8 @@ def _process_video(
 ) -> None:
     if cv2 is None:
         raise RuntimeError("OpenCV is required for video processing.")
+    import numpy as np
+    from PIL import Image
 
     cap = cv2.VideoCapture(str(item.path))
     if not cap.isOpened():
