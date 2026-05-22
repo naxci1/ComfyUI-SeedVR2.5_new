@@ -178,7 +178,8 @@ class FFMPEGVideoWriter:
     """
     
     def __init__(self, path: str, width: int, height: int, fps: float, use_10bit: bool = False,
-                 custom_video_args: Optional[List[str]] = None):
+                 custom_video_args: Optional[List[str]] = None,
+                 lut_path: Optional[str] = None):
         if custom_video_args:
             video_enc_args = custom_video_args
         else:
@@ -186,10 +187,14 @@ class FFMPEGVideoWriter:
             codec = 'libx265' if use_10bit else 'libx264'
             video_enc_args = ['-c:v', codec, '-pix_fmt', pix_fmt, '-preset', 'medium', '-crf', '12']
         
+        filter_args: List[str] = []
+        if lut_path:
+            filter_args = ['-vf', f'lut3d={lut_path}']
+
         self.proc = subprocess.Popen(
             ['ffmpeg', '-y', '-f', 'rawvideo', '-pix_fmt', 'rgb24',
              '-s', f'{width}x{height}', '-r', str(fps), '-i', '-',
-             *video_enc_args, path],
+             *filter_args, *video_enc_args, path],
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
     
@@ -683,7 +688,8 @@ def process_single_file(input_path: str, args: "argparse.Namespace", device_list
                 else:
                     video_writer = save_frames_to_video(result, output_path, fps,
                         video_backend=args.video_backend, use_10bit=args.use_10bit,
-                        custom_video_args=custom_video_args)
+                        custom_video_args=custom_video_args,
+                        lut_path=getattr(args, "lut", None))
 
                 frames_written = result.shape[0]
 
@@ -715,7 +721,8 @@ def process_single_file(input_path: str, args: "argparse.Namespace", device_list
                     else:
                         video_writer = save_frames_to_video(result, output_path, fps, writer=video_writer,
                             video_backend=args.video_backend, use_10bit=args.use_10bit,
-                            custom_video_args=custom_video_args)
+                            custom_video_args=custom_video_args,
+                            lut_path=getattr(args, "lut", None))
 
                     frames_written += result.shape[0]
                     del result
@@ -947,8 +954,13 @@ def _emit_gui_queue_status(file_path: str, current: int, total: int) -> None:
     print(f"__SEEDVR2_GUI_STATUS__|{json.dumps(payload, ensure_ascii=False)}", flush=True)
 
 
-def _release_post_file_resources() -> None:
-    """Force Python and CUDA cleanup between sequential files."""
+def _strict_batch_flush(*objs: Any) -> None:
+    """Strict flush hook used by GUI/CLI runs to aggressively release memory."""
+    for obj in objs:
+        try:
+            del obj
+        except Exception:
+            pass
     gc.collect()
     try:
         if torch.cuda.is_available():
@@ -959,6 +971,11 @@ def _release_post_file_resources() -> None:
         pass
 
 
+def _release_post_file_resources() -> None:
+    """Force Python and CUDA cleanup between sequential files."""
+    _strict_batch_flush()
+
+
 def save_frames_to_video(
     frames_tensor: torch.Tensor, 
     output_path: str, 
@@ -967,6 +984,7 @@ def save_frames_to_video(
     video_backend: str = "ffmpeg",
     use_10bit: bool = False,
     custom_video_args: Optional[List[str]] = None,
+    lut_path: Optional[str] = None,
 ) -> Optional[cv2.VideoWriter]:
     """
     Save frames tensor to a video file.
@@ -1014,7 +1032,8 @@ def save_frames_to_video(
                 raise ValueError(f"cv2.VideoWriter cannot open: {output_path}")
         else:
             writer = FFMPEGVideoWriter(output_path, W, H, fps, use_10bit,
-                                       custom_video_args=custom_video_args)
+                                       custom_video_args=custom_video_args,
+                                       lut_path=lut_path)
             if not writer.isOpened():
                 raise ValueError(f"Cannot create video writer for: {output_path}")
 
@@ -1650,6 +1669,8 @@ Examples:
                         help="JSON array of custom FFmpeg video encoding args, e.g. "
                              '\'["-c:v","prores_ks","-profile:v","3","-pix_fmt","yuv422p10le"]\'. '
                              "When supplied, implies --video_backend ffmpeg and overrides --10bit codec defaults.")
+    io_group.add_argument("--lut", type=str, default=None,
+                        help="Optional LUT file path passed to ffmpeg (uses lut3d filter when writing video).")
     io_group.add_argument("--model_dir", type=str, default=None,
                         help=f"Model directory (default: ./models/{SEEDVR2_FOLDER_NAME})")
     io_group.add_argument("--pre_downscale", type=int, default=1, choices=[1, 2, 3],
