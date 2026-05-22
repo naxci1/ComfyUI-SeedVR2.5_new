@@ -2179,6 +2179,14 @@ class MainWindow(QMainWindow):
 
         # positional input
         inp = self._settings_win.input_edit.text().strip()
+        input_mode = self._settings_win.input_mode_combo.currentText()
+        input_is_directory = (
+            not self._is_preview_run
+            and (
+                input_mode == "Folder"
+                or (inp and Path(inp).is_dir())
+            )
+        )
         args.append(inp)
 
         # output
@@ -2194,6 +2202,13 @@ class MainWindow(QMainWindow):
                 preview_out = self._generate_export_output_path(".png", export_dir)
             self._settings_win.output_edit.setText(str(preview_out))
             args += ["--output", str(preview_out)]
+        elif input_is_directory:
+            # Directory-mode should mirror native CLI usage:
+            #   python inference_cli.py <folder> --output <directory>
+            if out:
+                args += ["--output", out]
+            else:
+                args += ["--output", str(self._resolve_export_output_dir())]
         elif out:
             args += ["--output", out]
         else:
@@ -2412,6 +2427,13 @@ class MainWindow(QMainWindow):
         inp = self._settings_win.input_edit.text().strip()
         if not inp:
             self._on_log("❌  Please specify an input file or directory (⚙ Settings).")
+            return
+        if (
+            not self._is_preview_run
+            and self._settings_win.input_mode_combo.currentText() == "Folder"
+            and not Path(inp).is_dir()
+        ):
+            self._on_log(f"❌  Folder mode requires a directory path, got: {inp}")
             return
         if not self._is_preview_run:
             self._preview_compare_active = False
