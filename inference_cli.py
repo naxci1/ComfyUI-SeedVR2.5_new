@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import random
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +28,34 @@ class Job:
     output_path: Path
     frame_count: int
     is_video: bool
+
+
+class MemoryGuard:
+    """Controls deterministic periodic flush/empty_cache operations."""
+
+    def __init__(self, flush_interval: int) -> None:
+        self.flush_interval = max(1, int(flush_interval))
+        self._ticks = 0
+
+    def step(self, *objs: Any, force: bool = False) -> None:
+        for obj in objs:
+            try:
+                del obj
+            except Exception:
+                pass
+
+        self._ticks += 1
+        if force or self._ticks % self.flush_interval == 0:
+            gc.collect()
+            try:
+                import torch  # type: ignore
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    if hasattr(torch.cuda, "ipc_collect"):
+                        torch.cuda.ipc_collect()
+            except Exception:
+                pass
 
 
 def _log(message: str) -> None:
@@ -52,24 +81,6 @@ def _emit_gui_queue_status(
     print(f"{_STATUS_PREFIX}{json.dumps(payload, ensure_ascii=False)}", flush=True)
 
 
-def _strict_batch_flush(*objs: Any) -> None:
-    for obj in objs:
-        try:
-            del obj
-        except Exception:
-            pass
-
-    gc.collect()
-
-    try:
-        import torch  # type: ignore
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception:
-        pass
-
-
 def _validate_args(args: argparse.Namespace) -> None:
     if args.grain < 0 or args.grain > 100:
         raise ValueError("--grain must be in range 0..100")
@@ -77,6 +88,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--recover-detail must be in range 0..100")
     if args.fps <= 0:
         raise ValueError("--fps must be > 0")
+    if args.tile_size <= 0:
+        raise ValueError("--tile-size must be > 0")
+    if args.flush_interval <= 0:
+        raise ValueError("--flush-interval must be > 0")
 
 
 def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -84,9 +99,18 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--input", required=True, help="Input directory or media file")
     parser.add_argument("--output", required=True, help="Output directory")
     parser.add_argument("--model", required=True, help="Model path")
+    parser.add_argument("--model-preset", default="custom", help="Model preset selection from GUI")
     parser.add_argument("--grain", type=int, default=12, help="Grain amount 0..100")
     parser.add_argument("--recover-detail", type=int, default=35, help="Recover detail amount 0..100")
     parser.add_argument("--fps", type=int, default=24, help="Target output FPS")
+    parser.add_argument("--seed", type=int, default=313, help="Random seed")
+    parser.add_argument("--attention-mode", default="sageattn_3", help="Attention backend hint")
+    parser.add_argument("--device", default="auto", help="Execution device preference")
+    parser.add_argument("--tile-size", type=int, default=1024, help="Tiling size hint for processing")
+    parser.add_argument("--flush-interval", type=int, default=8, help="Frame interval for gc/cuda flush")
+    parser.add_argument("--preview-input", default="", help="Optional GUI preview source path")
+    parser.add_argument("--preview-output", default="", help="Optional GUI preview destination path")
+    parser.add_argument("--debug", action="store_true", help="Enable verbose runtime logs")
     return parser.parse_args(argv)
 
 
@@ -123,10 +147,12 @@ def _iter_media_files(input_path: Path) -> Iterator[Path]:
 def _count_video_frames(path: Path) -> int:
     if cv2 is None:
         raise RuntimeError("OpenCV is required for video processing")
+
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
         cap.release()
         raise RuntimeError(f"Failed to open video: {path}")
+
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
     return max(1, total)
@@ -191,6 +217,7 @@ def _process_single_image(
     done_files: int,
     remaining_files: int,
     remaining_frames_queue: int,
+    memory_guard: MemoryGuard,
 ) -> None:
     from PIL import Image
     import numpy as np
@@ -210,7 +237,7 @@ def _process_single_image(
         remaining_frames_queue=remaining_frames_queue,
     )
 
-    _strict_batch_flush(rgb, processed)
+    memory_guard.step(rgb, processed, force=True)
 
 
 def _process_video_job(
@@ -219,9 +246,8 @@ def _process_video_job(
     done_files: int,
     remaining_files: int,
     remaining_frames_queue: int,
+    memory_guard: MemoryGuard,
 ) -> None:
-    import numpy as np
-
     if cv2 is None:
         raise RuntimeError("OpenCV is required for video processing")
 
@@ -268,7 +294,7 @@ def _process_video_job(
                 remaining_frames_queue=remaining_frames_queue,
             )
 
-            _strict_batch_flush(bgr, rgb, processed)
+            memory_guard.step(bgr, rgb, processed)
 
         if ffmpeg.stdin:
             ffmpeg.stdin.close()
@@ -287,10 +313,19 @@ def _process_video_job(
         cap.release()
         if ffmpeg.poll() is None:
             ffmpeg.kill()
+        memory_guard.step(force=True)
 
 
 def run(args: argparse.Namespace) -> int:
     _validate_args(args)
+
+    random.seed(args.seed)
+    try:
+        import numpy as np
+
+        np.random.seed(args.seed)
+    except Exception:
+        pass
 
     input_path = Path(args.input).expanduser().resolve()
     output_path = Path(args.output).expanduser().resolve()
@@ -301,7 +336,21 @@ def run(args: argparse.Namespace) -> int:
     if not model_path.exists():
         raise FileNotFoundError(f"Model path does not exist: {model_path}")
 
-    _log(f"SeedVR2 worker booted | model={model_path} | grain={args.grain} | recover={args.recover_detail} | fps={args.fps}")
+    memory_guard = MemoryGuard(args.flush_interval)
+
+    _log(
+        "SeedVR2 worker booted | "
+        f"model={model_path} | preset={args.model_preset} | device={args.device} | "
+        f"attention={args.attention_mode} | grain={args.grain} | recover={args.recover_detail} | "
+        f"fps={args.fps} | tile_size={args.tile_size} | flush_interval={args.flush_interval}"
+    )
+
+    if args.preview_input:
+        _log(f"Preview input source: {Path(args.preview_input).expanduser()}")
+    if args.preview_output:
+        _log(f"Preview output source: {Path(args.preview_output).expanduser()}")
+    if args.debug:
+        _log("Debug mode enabled")
 
     jobs = _build_jobs(input_path, output_path)
     total_jobs = len(jobs)
@@ -320,6 +369,7 @@ def run(args: argparse.Namespace) -> int:
                 done_files=done_files,
                 remaining_files=remaining_files,
                 remaining_frames_queue=remaining_frames_queue,
+                memory_guard=memory_guard,
             )
         else:
             _process_single_image(
@@ -328,9 +378,10 @@ def run(args: argparse.Namespace) -> int:
                 done_files=done_files,
                 remaining_files=remaining_files,
                 remaining_frames_queue=remaining_frames_queue,
+                memory_guard=memory_guard,
             )
 
-        _strict_batch_flush(job)
+        memory_guard.step(job, force=True)
 
     _log("All jobs completed successfully")
     return 0
