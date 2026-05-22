@@ -1018,31 +1018,35 @@ def save_frames_to_video(
             if not writer.isOpened():
                 raise ValueError(f"Cannot create video writer for: {output_path}")
 
-    micro_batch = max(1, min(8, T))
+    gc_interval = 32
 
-    for start_idx in range(0, T, micro_batch):
-        end_idx = min(start_idx + micro_batch, T)
-        cpu_chunk = (
-            frames_tensor[start_idx:end_idx]
+    for frame_idx in range(T):
+        frame_np = (
+            frames_tensor[frame_idx:frame_idx + 1]
             .detach()
             .clamp(0.0, 1.0)
             .mul(255.0)
             .to(device="cpu", dtype=torch.uint8)
+            .squeeze(0)
             .contiguous()
+            .numpy()
         )
 
-        for offset in range(cpu_chunk.shape[0]):
-            frame_np = cpu_chunk[offset].numpy()
-            frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
-            writer.write(frame_bgr)
-            del frame_np, frame_bgr
+        if effective_backend == "ffmpeg":
+            frame_to_write = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
+        else:
+            frame_to_write = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
+        writer.write(frame_to_write)
+        del frame_np, frame_to_write
 
-        if debug.enabled:
-            debug.log(f"Written {end_idx}/{T} frames", category="file")
+        completed = frame_idx + 1
+        if debug.enabled and ((completed % 32 == 0) or completed == T):
+            debug.log(f"Written {completed}/{T} frames", category="file")
 
-        del cpu_chunk
-        if frames_tensor.is_cuda and ((end_idx % 64 == 0) or end_idx == T):
-            torch.cuda.empty_cache()
+        if (completed % gc_interval == 0) or completed == T:
+            gc.collect()
+            if frames_tensor.is_cuda:
+                torch.cuda.empty_cache()
 
     return writer  # Caller always closes
 
