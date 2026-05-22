@@ -2,7 +2,7 @@
 
 #include <QApplication>
 #include <QCloseEvent>
-#include <QComboBox>
+#include <QCoreApplication>
 #include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -17,65 +17,142 @@
 #include <QPlainTextEdit>
 #include <QProgressBar>
 #include <QPushButton>
-#include <QScrollArea>
 #include <QScrollBar>
 #include <QSettings>
 #include <QSlider>
+#include <QSplitter>
 #include <QStatusBar>
-#include <QToolButton>
 #include <QVBoxLayout>
+#include <QWidget>
 #include <QPixmap>
-#include <QSignalBlocker>
 
 namespace {
 
-constexpr const char *kStyle = R"(
-QWidget { background:#181a1f; color:#e7e9ee; font:13px "Segoe UI"; }
-QFrame#previewFrame, QFrame#settingsFrame, QFrame#timelineFrame, QFrame#logFrame {
-    background:#22252d; border:1px solid #2f3441; border-radius:10px;
+constexpr const char *kStyleSheet = R"(
+QWidget {
+    background-color: #171a22;
+    color: #e6ebff;
+    font-family: "Segoe UI", "Inter", sans-serif;
+    font-size: 13px;
 }
-QPushButton { background:#2f3441; border:1px solid #3c4353; border-radius:8px; padding:6px 12px; }
-QPushButton:hover { background:#3a4253; }
-QPushButton#startBtn { background:#1d6fff; border:none; font-weight:700; color:white; }
-QPushButton#stopBtn { background:#7a1c1c; border:none; font-weight:700; color:white; }
-QLineEdit, QComboBox, QToolButton { background:#1a1e26; border:1px solid #343b49; border-radius:6px; padding:5px 8px; }
-QSlider::groove:horizontal { height:6px; background:#2f3441; border-radius:3px; }
-QSlider::handle:horizontal { width:14px; background:#6ea8ff; margin:-4px 0; border-radius:7px; }
-QProgressBar { background:#1a1e26; border:1px solid #343b49; border-radius:6px; text-align:center; height:20px; }
-QProgressBar::chunk { background:#1d6fff; border-radius:6px; }
-QPlainTextEdit { background:#11141a; border:1px solid #2a303d; border-radius:8px; font:12px "Consolas"; }
-QLabel#thumbnailLabel { background:#0f1116; border:1px solid #343b49; border-radius:6px; padding:2px; }
+QMainWindow {
+    background-color: #11141c;
+}
+QFrame#previewPanel, QFrame#controlsPanel, QFrame#logPanel {
+    background-color: #202433;
+    border: 1px solid #2f3550;
+    border-radius: 12px;
+}
+QLabel#panelTitle {
+    font-size: 16px;
+    font-weight: 700;
+    color: #eaf1ff;
+}
+QLineEdit {
+    background-color: #151a27;
+    border: 1px solid #3a4463;
+    border-radius: 8px;
+    padding: 6px 8px;
+}
+QPushButton {
+    background-color: #2b3552;
+    border: 1px solid #435181;
+    border-radius: 8px;
+    padding: 6px 12px;
+    color: #e6ebff;
+    font-weight: 600;
+}
+QPushButton:hover {
+    background-color: #344166;
+}
+QPushButton#startButton {
+    background-color: #0f5fff;
+    border: none;
+    color: #ffffff;
+    font-size: 14px;
+}
+QPushButton#stopButton {
+    background-color: #7a1f2f;
+    border: none;
+    color: #ffffff;
+    font-size: 14px;
+}
+QSlider::groove:horizontal {
+    border: 1px solid #364468;
+    height: 6px;
+    background: #151a27;
+    border-radius: 3px;
+}
+QSlider::handle:horizontal {
+    background: #9fe2ff;
+    border: 1px solid #b4f1ff;
+    width: 16px;
+    margin: -6px 0;
+    border-radius: 8px;
+}
+QProgressBar {
+    background-color: #121724;
+    border: 1px solid #32446c;
+    border-radius: 8px;
+    color: #d9ecff;
+    text-align: center;
+    min-height: 22px;
+}
+QProgressBar::chunk {
+    border-radius: 8px;
+    background: qlineargradient(
+        x1:0, y1:0, x2:1, y2:0,
+        stop:0 #03ffd5,
+        stop:0.5 #2f8cff,
+        stop:1 #7a5cff
+    );
+}
+QPlainTextEdit {
+    background-color: #0d1119;
+    border: 1px solid #2d3958;
+    border-radius: 10px;
+    color: #dbe8ff;
+    font-family: "Consolas", "JetBrains Mono", monospace;
+    font-size: 12px;
+    padding: 6px;
+}
+QSplitter::handle {
+    background: #2b3348;
+}
 )";
 
-QStringList imageExtensions()
+QString formatSliderLabel(const QString &name, int value, const QString &suffix = QString())
 {
-    return {QStringLiteral("*.png"), QStringLiteral("*.jpg"), QStringLiteral("*.jpeg"), QStringLiteral("*.bmp"), QStringLiteral("*.webp")};
+    return QStringLiteral("%1: %2%3").arg(name).arg(value).arg(suffix);
 }
 
-QStringList collectImageFiles(const QString &inputPath)
+QWidget *buildPathRow(QWidget *parent, QLineEdit *lineEdit, QPushButton *browseButton)
 {
-    QFileInfo info(inputPath);
-    if (!info.exists()) return {};
-
-    if (info.isFile()) {
-        return {info.absoluteFilePath()};
-    }
-
-    QDir dir(info.absoluteFilePath());
-    QStringList files;
-    for (const QString &pattern : imageExtensions()) {
-        const QFileInfoList list = dir.entryInfoList({pattern}, QDir::Files, QDir::Name);
-        for (const QFileInfo &entry : list) files.push_back(entry.absoluteFilePath());
-    }
-    files.removeDuplicates();
-    files.sort();
-    return files;
+    auto *row = new QWidget(parent);
+    auto *layout = new QHBoxLayout(row);
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(6);
+    layout->addWidget(lineEdit, 1);
+    layout->addWidget(browseButton);
+    return row;
 }
 
-QString humanName(const QString &path)
+QString findDefaultCliScriptPath()
 {
-    const QString name = QFileInfo(path).fileName();
-    return name.isEmpty() ? QStringLiteral("—") : name;
+    const QString appDir = QCoreApplication::applicationDirPath();
+    const QStringList candidates = {
+        QDir(appDir).absoluteFilePath(QStringLiteral("inference_cli.py")),
+        QDir(appDir).absoluteFilePath(QStringLiteral("../inference_cli.py")),
+        QDir(appDir).absoluteFilePath(QStringLiteral("../../inference_cli.py")),
+        QDir::current().absoluteFilePath(QStringLiteral("inference_cli.py"))
+    };
+
+    for (const QString &candidate : candidates) {
+        if (QFileInfo::exists(candidate)) {
+            return QFileInfo(candidate).absoluteFilePath();
+        }
+    }
+    return candidates.first();
 }
 
 } // namespace
@@ -89,18 +166,20 @@ public:
         : QMainWindow(parent)
         , m_engine(new ProcessEngine(this))
     {
-        setWindowTitle(QStringLiteral("SeedVR2 Runner"));
-        setMinimumSize(1280, 820);
-        qApp->setStyleSheet(QString::fromLatin1(kStyle));
+        setWindowTitle(QStringLiteral("SeedVR2 Professional Video Upscaler"));
+        setMinimumSize(1366, 860);
+
+        if (qApp) {
+            qApp->setStyleSheet(QString::fromLatin1(kStyleSheet));
+        }
+
         buildUi();
         loadSettings();
 
-        connect(m_engine, &ProcessEngine::logLine, this, &MainWindow::appendLog);
+        connect(m_engine, &ProcessEngine::logLine, this, &MainWindow::appendLogLine);
         connect(m_engine, &ProcessEngine::fileProgressUpdated, this, &MainWindow::onFileProgress);
-        connect(m_engine, &ProcessEngine::processingFinished, this, &MainWindow::onFinished);
-        connect(m_engine, &ProcessEngine::batchProgressUpdated, this, [this](int c, int t) {
-            if (t > 0 && m_fileBar->value() == 0) m_fileBar->setValue((c * 100) / t);
-        });
+        connect(m_engine, &ProcessEngine::batchProgressUpdated, this, &MainWindow::onBatchProgress);
+        connect(m_engine, &ProcessEngine::processingFinished, this, &MainWindow::onProcessingFinished);
 
         setRunning(false);
     }
@@ -111,416 +190,379 @@ protected:
     void closeEvent(QCloseEvent *event) override
     {
         saveSettings();
-        if (m_engine->isRunning()) m_engine->stopProcess();
+        if (m_engine->isRunning()) {
+            m_engine->stopProcess();
+        }
         QMainWindow::closeEvent(event);
     }
 
 private slots:
-    void browseInput()
+    void browseInputDirectory()
     {
-        QString path = QFileDialog::getExistingDirectory(this, QStringLiteral("Select Input Directory"), m_inputPath->text());
-        if (path.isEmpty()) {
-            path = QFileDialog::getOpenFileName(this, QStringLiteral("Select Input File"), m_inputPath->text(),
-                                                QStringLiteral("Media (*.png *.jpg *.jpeg *.bmp *.webp *.mp4 *.mov *.mkv *.avi);;All files (*)"));
+        const QString dir = QFileDialog::getExistingDirectory(this, QStringLiteral("Select Input Directory"), m_inputDir->text());
+        if (!dir.isEmpty()) {
+            m_inputDir->setText(dir);
         }
+    }
+
+    void browseOutputDirectory()
+    {
+        const QString dir = QFileDialog::getExistingDirectory(this, QStringLiteral("Select Output Directory"), m_outputDir->text());
+        if (!dir.isEmpty()) {
+            m_outputDir->setText(dir);
+        }
+    }
+
+    void browseModelPath()
+    {
+        const QString path = QFileDialog::getOpenFileName(
+            this,
+            QStringLiteral("Select Model Path"),
+            m_modelPath->text(),
+            QStringLiteral("Models (*.safetensors *.pt *.pth *.onnx *.gguf);;All files (*)"));
         if (!path.isEmpty()) {
-            m_inputPath->setText(path);
-            refreshTimeline();
+            m_modelPath->setText(path);
         }
     }
 
-    void browseOutput()
+    void updateSliderLabels()
     {
-        const QString path = QFileDialog::getExistingDirectory(this, QStringLiteral("Select Output Directory"), m_outputPath->text());
-        if (!path.isEmpty()) m_outputPath->setText(path);
+        m_grainValue->setText(formatSliderLabel(QStringLiteral("Grain Amount"), m_grainSlider->value()));
+        m_recoverValue->setText(formatSliderLabel(QStringLiteral("Recover Detail"), m_recoverSlider->value()));
+        m_fpsValue->setText(formatSliderLabel(QStringLiteral("FPS"), m_fpsSlider->value()));
     }
 
-    void browsePython()
+    void startRender()
     {
-        const QString path = QFileDialog::getOpenFileName(this, QStringLiteral("Select Python Executable"), m_pythonExe->text(), QStringLiteral("Executable (*)"));
-        if (!path.isEmpty()) m_pythonExe->setText(path);
-    }
+        const QString input = m_inputDir->text().trimmed();
+        const QString output = m_outputDir->text().trimmed();
+        const QString model = m_modelPath->text().trimmed();
 
-    void browseScript()
-    {
-        const QString path = QFileDialog::getOpenFileName(this, QStringLiteral("Select inference_cli.py"), m_scriptPath->text(), QStringLiteral("Python (*.py)"));
-        if (!path.isEmpty()) m_scriptPath->setText(path);
-    }
+        if (input.isEmpty() || output.isEmpty() || model.isEmpty()) {
+            QMessageBox::warning(
+                this,
+                QStringLiteral("Missing Fields"),
+                QStringLiteral("Please provide Input Directory, Output Directory, and Model Path before starting."));
+            return;
+        }
 
-    void toggleSettings(bool expanded)
-    {
-        m_settingsContent->setVisible(expanded);
-        m_toggleSettingsBtn->setText(expanded ? QStringLiteral("▼ Settings") : QStringLiteral("▶ Settings"));
-    }
-
-    void startRun()
-    {
-        const QString input = m_inputPath->text().trimmed();
-        const QString output = m_outputPath->text().trimmed();
-        const QString python = m_pythonExe->text().trimmed();
-        const QString script = m_scriptPath->text().trimmed();
-        if (input.isEmpty() || output.isEmpty() || python.isEmpty() || script.isEmpty()) {
-            QMessageBox::warning(this, QStringLiteral("Missing Required Fields"), QStringLiteral("Input, output, Python executable, and CLI script are required."));
+        const QString pythonExe = m_pythonExecutable;
+        const QString scriptPath = findDefaultCliScriptPath();
+        if (!QFileInfo::exists(scriptPath)) {
+            QMessageBox::critical(
+                this,
+                QStringLiteral("CLI Not Found"),
+                QStringLiteral("Could not locate inference_cli.py. Expected near executable or repository root."));
             return;
         }
 
         saveSettings();
-        setRunning(true);
-        m_log->clear();
-        m_fileBar->setValue(0);
-        m_queueBar->setValue(0);
-        m_fileInfo->setText(QStringLiteral("Current: — (0/0)"));
-        m_queueInfo->setText(QStringLiteral("Queue: 0/0"));
+        m_logConsole->clear();
+        m_currentFileLabel->setText(QStringLiteral("Current File: — (0/0)"));
+        m_batchLabel->setText(QStringLiteral("Batch Progress: 0/0"));
+        m_fileProgressBar->setValue(0);
+        m_batchProgressBar->setValue(0);
 
         QStringList args;
         args << QStringLiteral("--input") << input
              << QStringLiteral("--output") << output
-             << QStringLiteral("--output-resolution") << m_outputResolution->currentText().trimmed()
-             << QStringLiteral("--resize-method") << m_resizeMethod->currentText()
-             << QStringLiteral("--ai-model") << m_aiModel->currentText()
-             << QStringLiteral("--recover-detail") << QString::number(m_recoverDetail->value())
-             << QStringLiteral("--grain") << QString::number(m_grain->value())
-             << QStringLiteral("--batch-flush-interval") << QString::number(1);
+             << QStringLiteral("--model") << model
+             << QStringLiteral("--grain") << QString::number(m_grainSlider->value())
+             << QStringLiteral("--recover-detail") << QString::number(m_recoverSlider->value())
+             << QStringLiteral("--fps") << QString::number(m_fpsSlider->value());
 
-        m_engine->startProcess(python, script, args);
-        statusBar()->showMessage(QStringLiteral("Running..."));
+        setRunning(true);
+        statusBar()->showMessage(QStringLiteral("Rendering started..."));
+        m_engine->startProcess(pythonExe, scriptPath, args);
     }
 
-    void stopRun()
+    void stopRender()
     {
         m_engine->stopProcess();
-        statusBar()->showMessage(QStringLiteral("Stopping..."));
+        statusBar()->showMessage(QStringLiteral("Stopping render..."));
     }
 
-    void appendLog(const QString &line)
+    void appendLogLine(const QString &line)
     {
-        m_log->appendPlainText(line);
-        auto *sb = m_log->verticalScrollBar();
-        sb->setValue(sb->maximum());
+        m_logConsole->appendPlainText(line);
+        QScrollBar *scroll = m_logConsole->verticalScrollBar();
+        scroll->setValue(scroll->maximum());
     }
 
-    void onFileProgress(const QString &filePath, int current, int total, int doneFiles, int remainingFiles, int)
+    void onFileProgress(const QString &filename, int current, int total, int doneFiles, int remainingFiles, int)
     {
-        if (total > 0) m_fileBar->setValue((current * 100) / total);
+        const int filePct = (total > 0) ? qBound(0, (current * 100) / total, 100) : 0;
+        m_fileProgressBar->setValue(filePct);
+        m_currentFileLabel->setText(
+            QStringLiteral("Current File: %1 (%2/%3)")
+                .arg(QFileInfo(filename).fileName().isEmpty() ? QStringLiteral("—") : QFileInfo(filename).fileName())
+                .arg(current)
+                .arg(total));
+
         const int totalFiles = doneFiles + remainingFiles + 1;
-        if (totalFiles > 0) m_queueBar->setValue((doneFiles * 100) / totalFiles);
-
-        m_fileInfo->setText(QStringLiteral("Current: %1 (%2/%3)").arg(humanName(filePath)).arg(current).arg(total));
-        m_queueInfo->setText(QStringLiteral("Queue: %1/%2").arg(doneFiles).arg(totalFiles));
+        const int batchPct = (totalFiles > 0) ? qBound(0, (doneFiles * 100) / totalFiles, 100) : 0;
+        m_batchProgressBar->setValue(batchPct);
+        m_batchLabel->setText(
+            QStringLiteral("Batch Progress: %1/%2")
+                .arg(doneFiles)
+                .arg(totalFiles));
     }
 
-    void onFinished(bool success, const QString &message)
+    void onBatchProgress(int current, int total)
+    {
+        if (total > 0) {
+            m_batchProgressBar->setValue(qBound(0, (current * 100) / total, 100));
+            m_batchLabel->setText(QStringLiteral("Batch Progress: %1/%2").arg(current).arg(total));
+        }
+    }
+
+    void onProcessingFinished(bool success, const QString &message)
     {
         setRunning(false);
+        statusBar()->showMessage(success ? QStringLiteral("Render complete.") : QStringLiteral("Render stopped."), 5000);
+        appendLogLine(QStringLiteral("Process result: %1").arg(message));
+
         if (success) {
-            m_fileBar->setValue(100);
-            m_queueBar->setValue(100);
-        }
-        statusBar()->showMessage(message, 6000);
-    }
-
-    void refreshTimeline()
-    {
-        qDeleteAll(m_timelineThumbs);
-        m_timelineThumbs.clear();
-
-        const QStringList files = collectImageFiles(m_inputPath->text().trimmed());
-        const int limit = qMin(files.size(), 64);
-        for (int i = 0; i < limit; ++i) {
-            QPixmap pix(files.at(i));
-            if (pix.isNull()) continue;
-
-            auto *thumb = new QLabel(m_timelineContent);
-            thumb->setObjectName(QStringLiteral("thumbnailLabel"));
-            thumb->setFixedSize(120, 72);
-            thumb->setAlignment(Qt::AlignCenter);
-            thumb->setPixmap(pix.scaled(114, 66, Qt::KeepAspectRatio, Qt::SmoothTransformation));
-            thumb->setToolTip(QFileInfo(files.at(i)).fileName());
-            m_timelineLayout->insertWidget(m_timelineLayout->count() - 1, thumb);
-            m_timelineThumbs.push_back(thumb);
-
-            if (i == 0) {
-                m_previewLabel->setPixmap(pix.scaled(m_previewLabel->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
-            }
-        }
-        if (m_timelineThumbs.isEmpty()) {
-            m_previewLabel->setText(QStringLiteral("No preview frames available"));
+            m_fileProgressBar->setValue(100);
+            m_batchProgressBar->setValue(100);
         }
     }
 
 private:
+    void setRunning(bool running)
+    {
+        m_startButton->setEnabled(!running);
+        m_stopButton->setEnabled(running);
+        m_inputDir->setEnabled(!running);
+        m_outputDir->setEnabled(!running);
+        m_modelPath->setEnabled(!running);
+        m_inputBrowseButton->setEnabled(!running);
+        m_outputBrowseButton->setEnabled(!running);
+        m_modelBrowseButton->setEnabled(!running);
+        m_grainSlider->setEnabled(!running);
+        m_recoverSlider->setEnabled(!running);
+        m_fpsSlider->setEnabled(!running);
+    }
+
     void buildUi()
     {
         auto *central = new QWidget(this);
         setCentralWidget(central);
 
-        auto *root = new QVBoxLayout(central);
-        root->setContentsMargins(12, 12, 12, 12);
-        root->setSpacing(10);
+        auto *rootLayout = new QVBoxLayout(central);
+        rootLayout->setContentsMargins(12, 12, 12, 12);
+        rootLayout->setSpacing(10);
 
-        auto *pathRow = new QHBoxLayout();
-        m_inputPath = new QLineEdit(this);
-        m_inputPath->setPlaceholderText(QStringLiteral("Input video, image, or frame directory"));
-        auto *inputBtn = new QPushButton(QStringLiteral("Input..."), this);
-        m_outputPath = new QLineEdit(this);
-        m_outputPath->setPlaceholderText(QStringLiteral("Output directory"));
-        auto *outputBtn = new QPushButton(QStringLiteral("Output..."), this);
-        m_pythonExe = new QLineEdit(this);
-        m_pythonExe->setPlaceholderText(QStringLiteral("Python executable"));
-        auto *pythonBtn = new QPushButton(QStringLiteral("Python..."), this);
-        m_scriptPath = new QLineEdit(this);
-        m_scriptPath->setPlaceholderText(QStringLiteral("inference_cli.py path"));
-        auto *scriptBtn = new QPushButton(QStringLiteral("Script..."), this);
+        auto *mainVerticalSplitter = new QSplitter(Qt::Vertical, central);
 
-        pathRow->addWidget(m_inputPath, 2);
-        pathRow->addWidget(inputBtn);
-        pathRow->addWidget(m_outputPath, 2);
-        pathRow->addWidget(outputBtn);
-        pathRow->addWidget(m_pythonExe, 2);
-        pathRow->addWidget(pythonBtn);
-        pathRow->addWidget(m_scriptPath, 2);
-        pathRow->addWidget(scriptBtn);
-        root->addLayout(pathRow);
+        auto *topHorizontalSplitter = new QSplitter(Qt::Horizontal, mainVerticalSplitter);
 
-        connect(inputBtn, &QPushButton::clicked, this, &MainWindow::browseInput);
-        connect(outputBtn, &QPushButton::clicked, this, &MainWindow::browseOutput);
-        connect(pythonBtn, &QPushButton::clicked, this, &MainWindow::browsePython);
-        connect(scriptBtn, &QPushButton::clicked, this, &MainWindow::browseScript);
-        connect(m_inputPath, &QLineEdit::editingFinished, this, &MainWindow::refreshTimeline);
+        auto *previewPanel = new QFrame(topHorizontalSplitter);
+        previewPanel->setObjectName(QStringLiteral("previewPanel"));
+        auto *previewLayout = new QVBoxLayout(previewPanel);
+        previewLayout->setContentsMargins(12, 12, 12, 12);
+        previewLayout->setSpacing(10);
 
-        auto *mainPanel = new QHBoxLayout();
-
-        auto *previewFrame = new QFrame(this);
-        previewFrame->setObjectName(QStringLiteral("previewFrame"));
-        auto *previewLayout = new QVBoxLayout(previewFrame);
-        auto *previewTitle = new QLabel(QStringLiteral("Preview"), previewFrame);
-        previewTitle->setStyleSheet(QStringLiteral("font-size:15px;font-weight:600;"));
-        m_previewLabel = new QLabel(QStringLiteral("No preview frames available"), previewFrame);
-        m_previewLabel->setAlignment(Qt::AlignCenter);
-        m_previewLabel->setMinimumSize(720, 420);
-        m_previewLabel->setStyleSheet(QStringLiteral("background:#0f1116;border:1px solid #2f3441;border-radius:8px;"));
+        auto *previewTitle = new QLabel(QStringLiteral("Frame Preview"), previewPanel);
+        previewTitle->setObjectName(QStringLiteral("panelTitle"));
         previewLayout->addWidget(previewTitle);
+
+        m_previewLabel = new QLabel(QStringLiteral("No frame available"), previewPanel);
+        m_previewLabel->setAlignment(Qt::AlignCenter);
+        m_previewLabel->setMinimumSize(760, 480);
+        m_previewLabel->setStyleSheet(QStringLiteral("background:#0f131d;border:1px solid #2b3550;border-radius:10px;"));
         previewLayout->addWidget(m_previewLabel, 1);
 
-        auto *settingsFrame = new QFrame(this);
-        settingsFrame->setObjectName(QStringLiteral("settingsFrame"));
-        settingsFrame->setMinimumWidth(340);
-        auto *settingsLayout = new QVBoxLayout(settingsFrame);
-        m_toggleSettingsBtn = new QToolButton(settingsFrame);
-        m_toggleSettingsBtn->setCheckable(true);
-        m_toggleSettingsBtn->setChecked(true);
-        m_toggleSettingsBtn->setToolButtonStyle(Qt::ToolButtonTextOnly);
-        settingsLayout->addWidget(m_toggleSettingsBtn);
+        auto *controlsPanel = new QFrame(topHorizontalSplitter);
+        controlsPanel->setObjectName(QStringLiteral("controlsPanel"));
+        auto *controlsLayout = new QVBoxLayout(controlsPanel);
+        controlsLayout->setContentsMargins(12, 12, 12, 12);
+        controlsLayout->setSpacing(10);
 
-        m_settingsContent = new QWidget(settingsFrame);
-        auto *form = new QFormLayout(m_settingsContent);
+        auto *controlsTitle = new QLabel(QStringLiteral("Control Panel"), controlsPanel);
+        controlsTitle->setObjectName(QStringLiteral("panelTitle"));
+        controlsLayout->addWidget(controlsTitle);
 
-        m_outputResolution = new QComboBox(m_settingsContent);
-        m_outputResolution->setEditable(true);
-        m_outputResolution->addItems({QStringLiteral("1280x720"), QStringLiteral("1920x1080"), QStringLiteral("2560x1440"), QStringLiteral("3840x2160")});
-        m_outputResolution->setCurrentText(QStringLiteral("1920x1080"));
+        auto *formGroup = new QGroupBox(QStringLiteral("Paths"), controlsPanel);
+        auto *formLayout = new QFormLayout(formGroup);
+        formLayout->setSpacing(8);
 
-        m_resizeMethod = new QComboBox(m_settingsContent);
-        m_resizeMethod->addItems({QStringLiteral("lanczos"), QStringLiteral("bicubic"), QStringLiteral("bilinear"), QStringLiteral("nearest")});
+        m_inputDir = new QLineEdit(formGroup);
+        m_inputDir->setPlaceholderText(QStringLiteral("Input directory with videos/images"));
+        m_inputBrowseButton = new QPushButton(QStringLiteral("Browse"), formGroup);
+        formLayout->addRow(QStringLiteral("Input:"), buildPathRow(formGroup, m_inputDir, m_inputBrowseButton));
 
-        m_aiModel = new QComboBox(m_settingsContent);
-        m_aiModel->setEditable(true);
-        m_aiModel->addItems({QStringLiteral("seedvr2-pro"), QStringLiteral("seedvr2-balanced"), QStringLiteral("seedvr2-fast")});
+        m_outputDir = new QLineEdit(formGroup);
+        m_outputDir->setPlaceholderText(QStringLiteral("Output directory"));
+        m_outputBrowseButton = new QPushButton(QStringLiteral("Browse"), formGroup);
+        formLayout->addRow(QStringLiteral("Output:"), buildPathRow(formGroup, m_outputDir, m_outputBrowseButton));
 
-        m_recoverDetail = new QSlider(Qt::Horizontal, m_settingsContent);
-        m_recoverDetail->setRange(0, 100);
-        m_recoverDetail->setValue(35);
-        m_recoverLabel = new QLabel(QString::number(m_recoverDetail->value()), m_settingsContent);
+        m_modelPath = new QLineEdit(formGroup);
+        m_modelPath->setPlaceholderText(QStringLiteral("Model path"));
+        m_modelBrowseButton = new QPushButton(QStringLiteral("Browse"), formGroup);
+        formLayout->addRow(QStringLiteral("Model:"), buildPathRow(formGroup, m_modelPath, m_modelBrowseButton));
 
-        m_grain = new QSlider(Qt::Horizontal, m_settingsContent);
-        m_grain->setRange(0, 100);
-        m_grain->setValue(8);
-        m_grainLabel = new QLabel(QString::number(m_grain->value()), m_settingsContent);
+        controlsLayout->addWidget(formGroup);
 
-        auto *detailRow = new QWidget(m_settingsContent);
-        auto *detailLayout = new QHBoxLayout(detailRow);
-        detailLayout->setContentsMargins(0, 0, 0, 0);
-        detailLayout->addWidget(m_recoverDetail);
-        detailLayout->addWidget(m_recoverLabel);
+        auto *sliderGroup = new QGroupBox(QStringLiteral("Adjustments"), controlsPanel);
+        auto *sliderLayout = new QVBoxLayout(sliderGroup);
 
-        auto *grainRow = new QWidget(m_settingsContent);
-        auto *grainLayout = new QHBoxLayout(grainRow);
-        grainLayout->setContentsMargins(0, 0, 0, 0);
-        grainLayout->addWidget(m_grain);
-        grainLayout->addWidget(m_grainLabel);
+        m_grainValue = new QLabel(sliderGroup);
+        m_grainSlider = new QSlider(Qt::Horizontal, sliderGroup);
+        m_grainSlider->setRange(0, 100);
+        m_grainSlider->setValue(12);
+        sliderLayout->addWidget(m_grainValue);
+        sliderLayout->addWidget(m_grainSlider);
 
-        form->addRow(QStringLiteral("Output Resolution"), m_outputResolution);
-        form->addRow(QStringLiteral("Resize Method"), m_resizeMethod);
-        form->addRow(QStringLiteral("AI Model"), m_aiModel);
-        form->addRow(QStringLiteral("Recover Detail"), detailRow);
-        form->addRow(QStringLiteral("Grain"), grainRow);
+        m_recoverValue = new QLabel(sliderGroup);
+        m_recoverSlider = new QSlider(Qt::Horizontal, sliderGroup);
+        m_recoverSlider->setRange(0, 100);
+        m_recoverSlider->setValue(35);
+        sliderLayout->addWidget(m_recoverValue);
+        sliderLayout->addWidget(m_recoverSlider);
 
-        settingsLayout->addWidget(m_settingsContent);
-        settingsLayout->addStretch();
+        m_fpsValue = new QLabel(sliderGroup);
+        m_fpsSlider = new QSlider(Qt::Horizontal, sliderGroup);
+        m_fpsSlider->setRange(1, 120);
+        m_fpsSlider->setValue(24);
+        sliderLayout->addWidget(m_fpsValue);
+        sliderLayout->addWidget(m_fpsSlider);
 
-        connect(m_toggleSettingsBtn, &QToolButton::toggled, this, &MainWindow::toggleSettings);
-        connect(m_recoverDetail, &QSlider::valueChanged, this, [this](int v) { m_recoverLabel->setText(QString::number(v)); });
-        connect(m_grain, &QSlider::valueChanged, this, [this](int v) { m_grainLabel->setText(QString::number(v)); });
-        toggleSettings(true);
+        controlsLayout->addWidget(sliderGroup);
 
-        mainPanel->addWidget(previewFrame, 3);
-        mainPanel->addWidget(settingsFrame, 1);
-        root->addLayout(mainPanel, 1);
+        auto *buttonRow = new QHBoxLayout();
+        m_startButton = new QPushButton(QStringLiteral("Start Render"), controlsPanel);
+        m_startButton->setObjectName(QStringLiteral("startButton"));
+        m_stopButton = new QPushButton(QStringLiteral("Stop"), controlsPanel);
+        m_stopButton->setObjectName(QStringLiteral("stopButton"));
+        buttonRow->addWidget(m_startButton);
+        buttonRow->addWidget(m_stopButton);
+        controlsLayout->addLayout(buttonRow);
 
-        auto *timelineFrame = new QFrame(this);
-        timelineFrame->setObjectName(QStringLiteral("timelineFrame"));
-        auto *timelineLayout = new QVBoxLayout(timelineFrame);
-        auto *timelineTitle = new QLabel(QStringLiteral("Timeline"), timelineFrame);
-        timelineTitle->setStyleSheet(QStringLiteral("font-size:14px;font-weight:600;"));
+        controlsLayout->addStretch();
 
-        m_timelineScroll = new QScrollArea(timelineFrame);
-        m_timelineScroll->setWidgetResizable(true);
-        m_timelineScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOn);
-        m_timelineScroll->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-        m_timelineScroll->setMinimumHeight(122);
+        topHorizontalSplitter->addWidget(previewPanel);
+        topHorizontalSplitter->addWidget(controlsPanel);
+        topHorizontalSplitter->setStretchFactor(0, 4);
+        topHorizontalSplitter->setStretchFactor(1, 2);
 
-        m_timelineContent = new QWidget(m_timelineScroll);
-        m_timelineLayout = new QHBoxLayout(m_timelineContent);
-        m_timelineLayout->setContentsMargins(8, 8, 8, 8);
-        m_timelineLayout->setSpacing(8);
-        m_timelineLayout->addStretch();
-        m_timelineScroll->setWidget(m_timelineContent);
+        auto *bottomContainer = new QWidget(mainVerticalSplitter);
+        auto *bottomLayout = new QVBoxLayout(bottomContainer);
+        bottomLayout->setContentsMargins(0, 0, 0, 0);
+        bottomLayout->setSpacing(10);
 
-        m_fileInfo = new QLabel(QStringLiteral("Current: — (0/0)"), timelineFrame);
-        m_fileBar = new QProgressBar(timelineFrame);
-        m_fileBar->setRange(0, 100);
-        m_fileBar->setValue(0);
+        auto *progressGroup = new QGroupBox(QStringLiteral("Progress"), bottomContainer);
+        auto *progressLayout = new QVBoxLayout(progressGroup);
+        progressLayout->setSpacing(6);
 
-        m_queueInfo = new QLabel(QStringLiteral("Queue: 0/0"), timelineFrame);
-        m_queueBar = new QProgressBar(timelineFrame);
-        m_queueBar->setRange(0, 100);
-        m_queueBar->setValue(0);
+        m_currentFileLabel = new QLabel(QStringLiteral("Current File: — (0/0)"), progressGroup);
+        m_fileProgressBar = new QProgressBar(progressGroup);
+        m_fileProgressBar->setRange(0, 100);
+        m_fileProgressBar->setValue(0);
 
-        timelineLayout->addWidget(timelineTitle);
-        timelineLayout->addWidget(m_timelineScroll);
-        timelineLayout->addWidget(m_fileInfo);
-        timelineLayout->addWidget(m_fileBar);
-        timelineLayout->addWidget(m_queueInfo);
-        timelineLayout->addWidget(m_queueBar);
-        root->addWidget(timelineFrame);
+        m_batchLabel = new QLabel(QStringLiteral("Batch Progress: 0/0"), progressGroup);
+        m_batchProgressBar = new QProgressBar(progressGroup);
+        m_batchProgressBar->setRange(0, 100);
+        m_batchProgressBar->setValue(0);
 
-        auto *logFrame = new QFrame(this);
-        logFrame->setObjectName(QStringLiteral("logFrame"));
-        auto *logLayout = new QVBoxLayout(logFrame);
-        auto *logTitle = new QLabel(QStringLiteral("Log"), logFrame);
-        logTitle->setStyleSheet(QStringLiteral("font-size:14px;font-weight:600;"));
-        m_log = new QPlainTextEdit(logFrame);
-        m_log->setReadOnly(true);
-        m_log->setMaximumBlockCount(5000);
-        m_log->setMinimumHeight(170);
+        progressLayout->addWidget(m_currentFileLabel);
+        progressLayout->addWidget(m_fileProgressBar);
+        progressLayout->addWidget(m_batchLabel);
+        progressLayout->addWidget(m_batchProgressBar);
+
+        bottomLayout->addWidget(progressGroup);
+
+        auto *logPanel = new QFrame(bottomContainer);
+        logPanel->setObjectName(QStringLiteral("logPanel"));
+        auto *logLayout = new QVBoxLayout(logPanel);
+        logLayout->setContentsMargins(12, 12, 12, 12);
+        logLayout->setSpacing(8);
+
+        auto *logTitle = new QLabel(QStringLiteral("Log"), logPanel);
+        logTitle->setObjectName(QStringLiteral("panelTitle"));
+        m_logConsole = new QPlainTextEdit(logPanel);
+        m_logConsole->setReadOnly(true);
+        m_logConsole->setMaximumBlockCount(8000);
+        m_logConsole->setMinimumHeight(240);
+
         logLayout->addWidget(logTitle);
-        logLayout->addWidget(m_log);
-        root->addWidget(logFrame);
+        logLayout->addWidget(m_logConsole, 1);
 
-        auto *actions = new QHBoxLayout();
-        actions->addStretch();
-        m_startBtn = new QPushButton(QStringLiteral("Start"), this);
-        m_startBtn->setObjectName(QStringLiteral("startBtn"));
-        m_stopBtn = new QPushButton(QStringLiteral("Stop"), this);
-        m_stopBtn->setObjectName(QStringLiteral("stopBtn"));
-        actions->addWidget(m_startBtn);
-        actions->addWidget(m_stopBtn);
-        root->addLayout(actions);
+        bottomLayout->addWidget(logPanel, 1);
 
-        connect(m_startBtn, &QPushButton::clicked, this, &MainWindow::startRun);
-        connect(m_stopBtn, &QPushButton::clicked, this, &MainWindow::stopRun);
+        mainVerticalSplitter->addWidget(topHorizontalSplitter);
+        mainVerticalSplitter->addWidget(bottomContainer);
+        mainVerticalSplitter->setStretchFactor(0, 3);
+        mainVerticalSplitter->setStretchFactor(1, 2);
 
+        rootLayout->addWidget(mainVerticalSplitter);
+
+        connect(m_inputBrowseButton, &QPushButton::clicked, this, &MainWindow::browseInputDirectory);
+        connect(m_outputBrowseButton, &QPushButton::clicked, this, &MainWindow::browseOutputDirectory);
+        connect(m_modelBrowseButton, &QPushButton::clicked, this, &MainWindow::browseModelPath);
+        connect(m_grainSlider, &QSlider::valueChanged, this, &MainWindow::updateSliderLabels);
+        connect(m_recoverSlider, &QSlider::valueChanged, this, &MainWindow::updateSliderLabels);
+        connect(m_fpsSlider, &QSlider::valueChanged, this, &MainWindow::updateSliderLabels);
+        connect(m_startButton, &QPushButton::clicked, this, &MainWindow::startRender);
+        connect(m_stopButton, &QPushButton::clicked, this, &MainWindow::stopRender);
+
+        updateSliderLabels();
         statusBar()->showMessage(QStringLiteral("Ready"));
-    }
-
-    void setRunning(bool running)
-    {
-        m_startBtn->setEnabled(!running);
-        m_stopBtn->setEnabled(running);
-        m_inputPath->setEnabled(!running);
-        m_outputPath->setEnabled(!running);
-        m_pythonExe->setEnabled(!running);
-        m_scriptPath->setEnabled(!running);
-        m_toggleSettingsBtn->setEnabled(!running);
-        m_settingsContent->setEnabled(!running);
     }
 
     void saveSettings()
     {
-        QSettings s(QStringLiteral("SeedVR2"), QStringLiteral("Runner"));
-        s.setValue(QStringLiteral("inputPath"), m_inputPath->text());
-        s.setValue(QStringLiteral("outputPath"), m_outputPath->text());
-        s.setValue(QStringLiteral("pythonExe"), m_pythonExe->text());
-        s.setValue(QStringLiteral("scriptPath"), m_scriptPath->text());
-        s.setValue(QStringLiteral("outputResolution"), m_outputResolution->currentText());
-        s.setValue(QStringLiteral("resizeMethod"), m_resizeMethod->currentText());
-        s.setValue(QStringLiteral("aiModel"), m_aiModel->currentText());
-        s.setValue(QStringLiteral("recoverDetail"), m_recoverDetail->value());
-        s.setValue(QStringLiteral("grain"), m_grain->value());
+        QSettings settings(QStringLiteral("SeedVR2"), QStringLiteral("QtRunner"));
+        settings.setValue(QStringLiteral("inputDir"), m_inputDir->text());
+        settings.setValue(QStringLiteral("outputDir"), m_outputDir->text());
+        settings.setValue(QStringLiteral("modelPath"), m_modelPath->text());
+        settings.setValue(QStringLiteral("grain"), m_grainSlider->value());
+        settings.setValue(QStringLiteral("recover"), m_recoverSlider->value());
+        settings.setValue(QStringLiteral("fps"), m_fpsSlider->value());
     }
 
     void loadSettings()
     {
-        QSettings s(QStringLiteral("SeedVR2"), QStringLiteral("Runner"));
-        m_inputPath->setText(s.value(QStringLiteral("inputPath")).toString());
-        m_outputPath->setText(s.value(QStringLiteral("outputPath")).toString());
-        m_pythonExe->setText(s.value(QStringLiteral("pythonExe")).toString());
-        m_scriptPath->setText(s.value(QStringLiteral("scriptPath")).toString());
-
-        const QString outputResolution = s.value(QStringLiteral("outputResolution"), QStringLiteral("1920x1080")).toString();
-        m_outputResolution->setCurrentText(outputResolution);
-
-        const QString resizeMethod = s.value(QStringLiteral("resizeMethod"), QStringLiteral("lanczos")).toString();
-        {
-            QSignalBlocker blocker(m_resizeMethod);
-            int idx = m_resizeMethod->findText(resizeMethod);
-            if (idx < 0) {
-                m_resizeMethod->addItem(resizeMethod);
-                idx = m_resizeMethod->findText(resizeMethod);
-            }
-            m_resizeMethod->setCurrentIndex(idx);
-        }
-
-        const QString aiModel = s.value(QStringLiteral("aiModel"), QStringLiteral("seedvr2-pro")).toString();
-        m_aiModel->setCurrentText(aiModel);
-        m_recoverDetail->setValue(s.value(QStringLiteral("recoverDetail"), 35).toInt());
-        m_grain->setValue(s.value(QStringLiteral("grain"), 8).toInt());
-        refreshTimeline();
+        QSettings settings(QStringLiteral("SeedVR2"), QStringLiteral("QtRunner"));
+        m_inputDir->setText(settings.value(QStringLiteral("inputDir")).toString());
+        m_outputDir->setText(settings.value(QStringLiteral("outputDir")).toString());
+        m_modelPath->setText(settings.value(QStringLiteral("modelPath")).toString());
+        m_grainSlider->setValue(settings.value(QStringLiteral("grain"), 12).toInt());
+        m_recoverSlider->setValue(settings.value(QStringLiteral("recover"), 35).toInt());
+        m_fpsSlider->setValue(settings.value(QStringLiteral("fps"), 24).toInt());
+        updateSliderLabels();
     }
 
-    QLineEdit *m_inputPath = nullptr;
-    QLineEdit *m_outputPath = nullptr;
-    QLineEdit *m_pythonExe = nullptr;
-    QLineEdit *m_scriptPath = nullptr;
+    QLineEdit *m_inputDir = nullptr;
+    QLineEdit *m_outputDir = nullptr;
+    QLineEdit *m_modelPath = nullptr;
+
+    QPushButton *m_inputBrowseButton = nullptr;
+    QPushButton *m_outputBrowseButton = nullptr;
+    QPushButton *m_modelBrowseButton = nullptr;
+
+    QSlider *m_grainSlider = nullptr;
+    QSlider *m_recoverSlider = nullptr;
+    QSlider *m_fpsSlider = nullptr;
+
+    QLabel *m_grainValue = nullptr;
+    QLabel *m_recoverValue = nullptr;
+    QLabel *m_fpsValue = nullptr;
 
     QLabel *m_previewLabel = nullptr;
 
-    QToolButton *m_toggleSettingsBtn = nullptr;
-    QWidget *m_settingsContent = nullptr;
-    QComboBox *m_outputResolution = nullptr;
-    QComboBox *m_resizeMethod = nullptr;
-    QComboBox *m_aiModel = nullptr;
-    QSlider *m_recoverDetail = nullptr;
-    QSlider *m_grain = nullptr;
-    QLabel *m_recoverLabel = nullptr;
-    QLabel *m_grainLabel = nullptr;
+    QPushButton *m_startButton = nullptr;
+    QPushButton *m_stopButton = nullptr;
 
-    QScrollArea *m_timelineScroll = nullptr;
-    QWidget *m_timelineContent = nullptr;
-    QHBoxLayout *m_timelineLayout = nullptr;
-    QList<QLabel *> m_timelineThumbs;
+    QLabel *m_currentFileLabel = nullptr;
+    QLabel *m_batchLabel = nullptr;
+    QProgressBar *m_fileProgressBar = nullptr;
+    QProgressBar *m_batchProgressBar = nullptr;
 
-    QLabel *m_fileInfo = nullptr;
-    QLabel *m_queueInfo = nullptr;
-    QProgressBar *m_fileBar = nullptr;
-    QProgressBar *m_queueBar = nullptr;
-
-    QPlainTextEdit *m_log = nullptr;
-
-    QPushButton *m_startBtn = nullptr;
-    QPushButton *m_stopBtn = nullptr;
+    QPlainTextEdit *m_logConsole = nullptr;
 
     ProcessEngine *m_engine = nullptr;
+    QString m_pythonExecutable = QStringLiteral("python");
 };
 
 #include "main.moc"
@@ -528,11 +570,14 @@ private:
 int main(int argc, char *argv[])
 {
     QApplication::setHighDpiScaleFactorRoundingPolicy(Qt::HighDpiScaleFactorRoundingPolicy::PassThrough);
+
     QApplication app(argc, argv);
     app.setApplicationName(QStringLiteral("SeedVR2 Runner"));
     app.setOrganizationName(QStringLiteral("SeedVR2"));
+    app.setApplicationVersion(QStringLiteral("2.5"));
 
-    MainWindow w;
-    w.show();
+    MainWindow window;
+    window.show();
+
     return app.exec();
 }
