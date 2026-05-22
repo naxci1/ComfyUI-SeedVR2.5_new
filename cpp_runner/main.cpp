@@ -25,6 +25,7 @@
 #include <QVBoxLayout>
 #include <QWidget>
 #include <QPixmap>
+#include <QtGlobal>
 
 namespace {
 

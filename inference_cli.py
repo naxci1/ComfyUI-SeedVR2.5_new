@@ -6,9 +6,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
-import os
 import subprocess
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, List, Sequence
@@ -275,8 +273,10 @@ def _process_video_job(
         if ffmpeg.stdin:
             ffmpeg.stdin.close()
 
-        stdout_data, stderr_data = ffmpeg.communicate()
-        if ffmpeg.returncode != 0:
+        return_code = ffmpeg.wait()
+        stderr_data = ffmpeg.stderr.read() if ffmpeg.stderr else b""
+        stdout_data = ffmpeg.stdout.read() if ffmpeg.stdout else b""
+        if return_code != 0:
             raise RuntimeError(
                 f"FFmpeg encoding failed for {job.output_path}: {stderr_data.decode('utf-8', errors='ignore')}"
             )
