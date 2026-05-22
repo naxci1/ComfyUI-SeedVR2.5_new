@@ -10,6 +10,7 @@
 #include <QFileInfo>
 #include <QFormLayout>
 #include <QFrame>
+#include <QGridLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -20,9 +21,9 @@
 #include <QPlainTextEdit>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QScrollArea>
 #include <QScrollBar>
 #include <QSettings>
-#include <QSlider>
 #include <QSpinBox>
 #include <QSplitter>
 #include <QStatusBar>
@@ -34,133 +35,25 @@
 namespace {
 
 constexpr const char *kStyleSheet = R"(
-QWidget {
-    background-color: #161922;
-    color: #e5ebff;
-    font-family: "Segoe UI", "Inter", sans-serif;
-    font-size: 13px;
-}
-QMainWindow {
-    background-color: #0f1219;
-}
-QFrame#previewPanel, QFrame#settingsPanel, QFrame#logPanel, QFrame#progressPanel {
-    background-color: #1e2331;
-    border: 1px solid #2f3852;
-    border-radius: 12px;
-}
-QLabel#panelTitle {
-    font-size: 16px;
-    font-weight: 700;
-    color: #f2f6ff;
-}
-QLabel#subtleTitle {
-    color: #9fb0d3;
-    font-size: 12px;
-    font-weight: 600;
-}
-QLineEdit, QComboBox, QSpinBox {
-    background-color: #111726;
-    border: 1px solid #384666;
-    border-radius: 8px;
-    padding: 6px 8px;
-}
-QComboBox::drop-down {
-    border: none;
-}
-QPushButton {
-    background-color: #2e3b5e;
-    border: 1px solid #445784;
-    border-radius: 8px;
-    padding: 6px 12px;
-    color: #edf3ff;
-    font-weight: 600;
-}
-QPushButton:hover {
-    background-color: #374a76;
-}
-QPushButton#startButton {
-    background-color: #146dff;
-    border: none;
-    color: white;
-    font-size: 14px;
-}
-QPushButton#stopButton {
-    background-color: #8b2c40;
-    border: none;
-    color: white;
-    font-size: 14px;
-}
-QTabWidget::pane {
-    border: 1px solid #2f3852;
-    border-radius: 10px;
-    top: -1px;
-}
-QTabBar::tab {
-    background: #111726;
-    border: 1px solid #2f3852;
-    padding: 8px 14px;
-    margin-right: 4px;
-    border-top-left-radius: 8px;
-    border-top-right-radius: 8px;
-}
-QTabBar::tab:selected {
-    background: #243151;
-    color: #ffffff;
-}
-QSlider::groove:horizontal {
-    border: 1px solid #3d4f78;
-    height: 6px;
-    background: #101522;
-    border-radius: 3px;
-}
-QSlider::handle:horizontal {
-    background: #8ce7ff;
-    border: 1px solid #b5f3ff;
-    width: 16px;
-    margin: -6px 0;
-    border-radius: 8px;
-}
-QProgressBar {
-    background-color: #0f1523;
-    border: 1px solid #32446c;
-    border-radius: 8px;
-    color: #d9ecff;
-    text-align: center;
-    min-height: 22px;
-}
-QProgressBar::chunk {
-    border-radius: 8px;
-    background: qlineargradient(
-        x1:0, y1:0, x2:1, y2:0,
-        stop:0 #03ffd5,
-        stop:0.5 #2f8cff,
-        stop:1 #7a5cff
-    );
-}
-QPlainTextEdit {
-    background-color: #0b1019;
-    border: 1px solid #2d3958;
-    border-radius: 10px;
-    color: #dbe8ff;
-    font-family: "Consolas", "JetBrains Mono", monospace;
-    font-size: 12px;
-    padding: 6px;
-}
-QLabel#previewBox {
-    background: #0d1119;
-    border: 1px solid #2f3852;
-    border-radius: 10px;
-    color: #9db1da;
-}
-QSplitter::handle {
-    background: #2b3348;
-}
+QWidget { background-color:#161922; color:#e5ebff; font-family:"Segoe UI","Inter",sans-serif; font-size:13px; }
+QMainWindow { background-color:#0f1219; }
+QFrame#previewPanel, QFrame#settingsPanel, QFrame#logPanel, QFrame#progressPanel { background-color:#1e2331; border:1px solid #2f3852; border-radius:12px; }
+QLabel#panelTitle { font-size:16px; font-weight:700; color:#f2f6ff; }
+QLineEdit, QComboBox, QSpinBox { background-color:#111726; border:1px solid #384666; border-radius:8px; padding:6px 8px; }
+QComboBox::drop-down { border:none; }
+QPushButton { background-color:#2e3b5e; border:1px solid #445784; border-radius:8px; padding:6px 12px; color:#edf3ff; font-weight:600; }
+QPushButton:hover { background-color:#374a76; }
+QPushButton#startButton { background-color:#146dff; border:none; color:white; font-size:14px; }
+QPushButton#stopButton { background-color:#8b2c40; border:none; color:white; font-size:14px; }
+QTabWidget::pane { border:1px solid #2f3852; border-radius:10px; top:-1px; }
+QTabBar::tab { background:#111726; border:1px solid #2f3852; padding:8px 14px; margin-right:4px; border-top-left-radius:8px; border-top-right-radius:8px; }
+QTabBar::tab:selected { background:#243151; color:#ffffff; }
+QProgressBar { background-color:#0f1523; border:1px solid #32446c; border-radius:8px; color:#d9ecff; text-align:center; min-height:22px; }
+QProgressBar::chunk { border-radius:8px; background:qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #03ffd5, stop:0.5 #2f8cff, stop:1 #7a5cff); }
+QPlainTextEdit { background-color:#0b1019; border:1px solid #2d3958; border-radius:10px; color:#dbe8ff; font-family:"Consolas","JetBrains Mono",monospace; font-size:12px; padding:6px; }
+QLabel#previewBox { background:#0d1119; border:1px solid #2f3852; border-radius:10px; color:#9db1da; }
+QSplitter::handle { background:#2b3348; }
 )";
-
-QString formatSliderLabel(const QString &name, int value, const QString &suffix = QString())
-{
-    return QStringLiteral("%1: %2%3").arg(name).arg(value).arg(suffix);
-}
 
 QWidget *buildPathRow(QWidget *parent, QLineEdit *lineEdit, QPushButton *browseButton)
 {
@@ -196,20 +89,17 @@ void setPreviewPixmap(QLabel *target, const QString &path)
     if (!target) {
         return;
     }
-
     if (path.trimmed().isEmpty() || !QFileInfo::exists(path)) {
         target->setText(QStringLiteral("No preview available"));
         target->setPixmap(QPixmap());
         return;
     }
-
     const QPixmap px(path);
     if (px.isNull()) {
         target->setText(QStringLiteral("Unable to decode image/video frame"));
         target->setPixmap(QPixmap());
         return;
     }
-
     target->setPixmap(px.scaled(target->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
     target->setText(QString());
 }
@@ -225,7 +115,7 @@ public:
         : QMainWindow(parent)
         , m_engine(new ProcessEngine(this))
     {
-        setWindowTitle(QStringLiteral("SeedVR2 Professional Upscaler (Qt6)"));
+        setWindowTitle(QStringLiteral("SeedVR2 Legacy Logic Runner (Qt6)"));
         setMinimumSize(1500, 920);
 
         if (qApp) {
@@ -285,19 +175,6 @@ private slots:
         }
     }
 
-    void browseModelPath()
-    {
-        const QString path = QFileDialog::getOpenFileName(
-            this,
-            QStringLiteral("Select Model Path"),
-            m_modelPath->text(),
-            QStringLiteral("Models (*.safetensors *.pt *.pth *.onnx *.gguf);;All files (*)"));
-        if (!path.isEmpty()) {
-            m_modelPath->setText(path);
-            m_modelPreset->setCurrentText(QStringLiteral("Custom"));
-        }
-    }
-
     void browsePythonExecutable()
     {
         const QString path = QFileDialog::getOpenFileName(
@@ -307,6 +184,14 @@ private slots:
             QStringLiteral("Executables (*.exe python python3);;All files (*)"));
         if (!path.isEmpty()) {
             m_pythonPath->setText(path);
+        }
+    }
+
+    void browseModelDir()
+    {
+        const QString dir = QFileDialog::getExistingDirectory(this, QStringLiteral("Select Model Directory"), m_modelDirPath->text());
+        if (!dir.isEmpty()) {
+            m_modelDirPath->setText(dir);
         }
     }
 
@@ -344,40 +229,22 @@ private slots:
         setPreviewPixmap(m_outputOnlyPreview, m_previewOutputPath->text().trimmed());
     }
 
-    void updateSliderLabels()
+    void updateResolutionMode(const QString &mode)
     {
-        m_grainValue->setText(formatSliderLabel(QStringLiteral("Grain Amount"), m_grainSlider->value()));
-        m_recoverValue->setText(formatSliderLabel(QStringLiteral("Recover Detail"), m_recoverSlider->value()));
-    }
-
-    void applyModelPreset(const QString &preset)
-    {
-        const QString current = m_modelPath->text().trimmed();
-        if (!current.isEmpty() && QFileInfo::exists(current)) {
-            return;
-        }
-
-        if (preset == QStringLiteral("3B")) {
-            m_modelPath->setPlaceholderText(QStringLiteral("models/SEEDVR2/seedvr2_ema_3b.safetensors"));
-        } else if (preset == QStringLiteral("7B")) {
-            m_modelPath->setPlaceholderText(QStringLiteral("models/SEEDVR2/seedvr2_ema_7b.safetensors"));
-        } else if (preset == QStringLiteral("GGUF")) {
-            m_modelPath->setPlaceholderText(QStringLiteral("models/SEEDVR2/seedvr2_ema_7b-Q4_K_M.gguf"));
-        } else {
-            m_modelPath->setPlaceholderText(QStringLiteral("Custom model path"));
-        }
+        const bool pixel = (mode == QStringLiteral("Pixel"));
+        m_resolutionSpin->setVisible(pixel);
+        m_resolutionTimesCombo->setVisible(!pixel);
     }
 
     void startRender()
     {
         const QString input = m_inputPath->text().trimmed();
         const QString output = m_outputPath->text().trimmed();
-        const QString model = m_modelPath->text().trimmed();
 
-        if (input.isEmpty() || output.isEmpty() || model.isEmpty()) {
+        if (input.isEmpty()) {
             QMessageBox::warning(this,
                                  QStringLiteral("Missing Fields"),
-                                 QStringLiteral("Please provide Input, Output, and Model path before starting."));
+                                 QStringLiteral("Please provide Input path before starting."));
             return;
         }
 
@@ -402,26 +269,133 @@ private slots:
         m_batchProgressBar->setValue(0);
 
         QStringList args;
-        args << QStringLiteral("--input") << input
-             << QStringLiteral("--output") << output
-             << QStringLiteral("--model") << model
-             << QStringLiteral("--model-preset") << m_modelPreset->currentText().toLower()
-             << QStringLiteral("--grain") << QString::number(m_grainSlider->value())
-             << QStringLiteral("--recover-detail") << QString::number(m_recoverSlider->value())
-             << QStringLiteral("--fps") << QString::number(m_fpsSpin->value())
-             << QStringLiteral("--seed") << QString::number(m_seedSpin->value())
-             << QStringLiteral("--attention-mode") << m_attentionMode->currentText()
-             << QStringLiteral("--device") << m_deviceCombo->currentText()
-             << QStringLiteral("--tile-size") << QString::number(m_tileSizeSpin->value())
-             << QStringLiteral("--flush-interval") << QString::number(m_flushIntervalSpin->value());
+        args << input;
 
-        if (!m_previewInputPath->text().trimmed().isEmpty()) {
-            args << QStringLiteral("--preview-input") << m_previewInputPath->text().trimmed();
+        if (!output.isEmpty()) {
+            args << QStringLiteral("--output") << output;
         }
-        if (!m_previewOutputPath->text().trimmed().isEmpty()) {
-            args << QStringLiteral("--preview-output") << m_previewOutputPath->text().trimmed();
+
+        const QString modelDir = m_modelDirPath->text().trimmed();
+        if (!modelDir.isEmpty()) {
+            args << QStringLiteral("--model_dir") << modelDir;
         }
-        if (m_verboseDebug->isChecked()) {
+
+        args << QStringLiteral("--output_format") << m_outputFormatCombo->currentText().toLower();
+        args << QStringLiteral("--video_backend") << m_videoBackendCombo->currentText().toLower();
+
+        const QString ffmpegArgs = m_ffmpegArgsEdit->text().trimmed();
+        if (m_videoBackendCombo->currentText().toLower() == QStringLiteral("ffmpeg") && !ffmpegArgs.isEmpty()) {
+            args << QStringLiteral("--ffmpeg_video_args") << ffmpegArgs;
+        }
+
+        if (m_use10bitCheck->isChecked()) {
+            args << QStringLiteral("--10bit");
+        }
+
+        args << QStringLiteral("--dit_model") << m_ditModelCombo->currentText();
+
+        const int preDownscale = m_preDownscaleCombo->currentText().left(1).toInt();
+        if (preDownscale > 1) {
+            args << QStringLiteral("--pre_downscale") << QString::number(preDownscale);
+        }
+
+        if (m_resolutionModeCombo->currentText() == QStringLiteral("X Times")) {
+            args << QStringLiteral("--resolution_mode") << QStringLiteral("xtimes");
+            const int times = m_resolutionTimesCombo->currentText().left(1).toInt();
+            args << QStringLiteral("--resolution_scale") << QString::number(times);
+        } else {
+            args << QStringLiteral("--resolution") << QString::number(m_resolutionSpin->value());
+        }
+
+        if (m_maxResolutionSpin->value() > 0) {
+            args << QStringLiteral("--max_resolution") << QString::number(m_maxResolutionSpin->value());
+        }
+
+        args << QStringLiteral("--batch_size") << QString::number(m_batchSizeSpin->value());
+
+        if (m_uniformBatchCheck->isChecked()) {
+            args << QStringLiteral("--uniform_batch_size");
+        }
+
+        args << QStringLiteral("--seed") << QString::number(m_seedSpin->value());
+
+        if (m_skipFirstFramesSpin->value() > 0) {
+            args << QStringLiteral("--skip_first_frames") << QString::number(m_skipFirstFramesSpin->value());
+        }
+        if (m_loadCapSpin->value() > 0) {
+            args << QStringLiteral("--load_cap") << QString::number(m_loadCapSpin->value());
+        }
+        if (m_chunkSizeSpin->value() > 0) {
+            args << QStringLiteral("--chunk_size") << QString::number(m_chunkSizeSpin->value());
+        }
+        if (m_prependFramesSpin->value() > 0) {
+            args << QStringLiteral("--prepend_frames") << QString::number(m_prependFramesSpin->value());
+        }
+        if (m_temporalOverlapSpin->value() > 0) {
+            args << QStringLiteral("--temporal_overlap") << QString::number(m_temporalOverlapSpin->value());
+        }
+
+        if (m_colorCorrectionCombo->currentText() != QStringLiteral("lab")) {
+            args << QStringLiteral("--color_correction") << m_colorCorrectionCombo->currentText();
+        }
+
+        args << QStringLiteral("--cuda_device") << m_cudaDeviceEdit->text().trimmed();
+
+        if (m_ditOffloadCombo->currentText() != QStringLiteral("none")) {
+            args << QStringLiteral("--dit_offload_device") << m_ditOffloadCombo->currentText();
+        }
+        if (m_vaeOffloadCombo->currentText() != QStringLiteral("none")) {
+            args << QStringLiteral("--vae_offload_device") << m_vaeOffloadCombo->currentText();
+        }
+        if (m_tensorOffloadCombo->currentText() != QStringLiteral("none")) {
+            args << QStringLiteral("--tensor_offload_device") << m_tensorOffloadCombo->currentText();
+        }
+
+        if (m_blocksToSwapSpin->value() > 0) {
+            args << QStringLiteral("--blocks_to_swap") << QString::number(m_blocksToSwapSpin->value());
+        }
+        if (m_swapIoComponentsCheck->isChecked()) {
+            args << QStringLiteral("--swap_io_components");
+        }
+
+        if (m_vaeEncodeTiledCheck->isChecked()) {
+            args << QStringLiteral("--vae_encode_tiled");
+            if (m_vaeEncodeTileSizeSpin->value() != 1024) {
+                args << QStringLiteral("--vae_encode_tile_size") << QString::number(m_vaeEncodeTileSizeSpin->value());
+            }
+            if (m_vaeEncodeTileOverlapSpin->value() != 128) {
+                args << QStringLiteral("--vae_encode_tile_overlap") << QString::number(m_vaeEncodeTileOverlapSpin->value());
+            }
+        }
+
+        if (m_vaeDecodeTiledCheck->isChecked()) {
+            args << QStringLiteral("--vae_decode_tiled");
+            if (m_vaeDecodeTileSizeSpin->value() != 1024) {
+                args << QStringLiteral("--vae_decode_tile_size") << QString::number(m_vaeDecodeTileSizeSpin->value());
+            }
+            if (m_vaeDecodeTileOverlapSpin->value() != 128) {
+                args << QStringLiteral("--vae_decode_tile_overlap") << QString::number(m_vaeDecodeTileOverlapSpin->value());
+            }
+        }
+
+        if (m_tileDebugCombo->currentText() != QStringLiteral("false")) {
+            args << QStringLiteral("--tile_debug") << m_tileDebugCombo->currentText();
+        }
+
+        if (m_attentionModeCombo->currentText() != QStringLiteral("sdpa")) {
+            args << QStringLiteral("--attention_mode") << m_attentionModeCombo->currentText();
+        }
+
+        if (m_cacheDitCheck->isChecked()) {
+            args << QStringLiteral("--cache_dit");
+        }
+        if (m_cacheVaeCheck->isChecked()) {
+            args << QStringLiteral("--cache_vae");
+        }
+        if (m_autoSafeguardCheck->isChecked()) {
+            args << QStringLiteral("--auto_safeguard");
+        }
+        if (m_debugCheck->isChecked()) {
             args << QStringLiteral("--debug");
         }
 
@@ -490,30 +464,6 @@ private:
     {
         m_startButton->setEnabled(!running);
         m_stopButton->setEnabled(running);
-
-        for (QWidget *widget : {
-                 static_cast<QWidget *>(m_inputPath),
-                 static_cast<QWidget *>(m_outputPath),
-                 static_cast<QWidget *>(m_modelPath),
-                 static_cast<QWidget *>(m_pythonPath),
-                 static_cast<QWidget *>(m_inputBrowseButton),
-                 static_cast<QWidget *>(m_outputBrowseButton),
-                 static_cast<QWidget *>(m_modelBrowseButton),
-                 static_cast<QWidget *>(m_pythonBrowseButton),
-                 static_cast<QWidget *>(m_grainSlider),
-                 static_cast<QWidget *>(m_recoverSlider),
-                 static_cast<QWidget *>(m_fpsSpin),
-                 static_cast<QWidget *>(m_seedSpin),
-                 static_cast<QWidget *>(m_attentionMode),
-                 static_cast<QWidget *>(m_deviceCombo),
-                 static_cast<QWidget *>(m_tileSizeSpin),
-                 static_cast<QWidget *>(m_flushIntervalSpin),
-                 static_cast<QWidget *>(m_modelPreset),
-                 static_cast<QWidget *>(m_verboseDebug) }) {
-            if (widget) {
-                widget->setEnabled(!running);
-            }
-        }
     }
 
     void buildUi()
@@ -542,10 +492,6 @@ private:
         auto *previewTitle = new QLabel(QStringLiteral("Preview Workspace"), previewFrame);
         previewTitle->setObjectName(QStringLiteral("panelTitle"));
         previewLayout->addWidget(previewTitle);
-
-        auto *previewSubtitle = new QLabel(QStringLiteral("Multi-tab / split side-by-side comparison"), previewFrame);
-        previewSubtitle->setObjectName(QStringLiteral("subtleTitle"));
-        previewLayout->addWidget(previewSubtitle);
 
         auto *previewSelector = new QGroupBox(QStringLiteral("Preview Sources"), previewFrame);
         auto *previewSelectorLayout = new QFormLayout(previewSelector);
@@ -653,102 +599,229 @@ private:
         rightLayout->setContentsMargins(12, 12, 12, 12);
         rightLayout->setSpacing(10);
 
-        auto *settingsTitle = new QLabel(QStringLiteral("Settings Panel"), rightFrame);
+        auto *settingsTitle = new QLabel(QStringLiteral("Legacy Parameter Mapping"), rightFrame);
         settingsTitle->setObjectName(QStringLiteral("panelTitle"));
         rightLayout->addWidget(settingsTitle);
 
-        auto *settingsTabs = new QTabWidget(rightFrame);
+        auto *scrollArea = new QScrollArea(rightFrame);
+        scrollArea->setWidgetResizable(true);
+        scrollArea->setFrameShape(QFrame::NoFrame);
 
-        auto *pathsTab = new QWidget(settingsTabs);
-        auto *pathsForm = new QFormLayout(pathsTab);
+        auto *scrollHost = new QWidget(scrollArea);
+        auto *scrollLayout = new QVBoxLayout(scrollHost);
+        scrollLayout->setContentsMargins(0, 0, 0, 0);
+        scrollLayout->setSpacing(8);
 
-        m_pythonPath = new QLineEdit(pathsTab);
-        m_pythonBrowseButton = new QPushButton(QStringLiteral("Browse"), pathsTab);
-        pathsForm->addRow(QStringLiteral("Python Executable:"), buildPathRow(pathsTab, m_pythonPath, m_pythonBrowseButton));
+        auto *pathsGroup = new QGroupBox(QStringLiteral("Paths"), scrollHost);
+        auto *pathsForm = new QFormLayout(pathsGroup);
+        m_pythonPath = new QLineEdit(pathsGroup);
+        m_pythonBrowseButton = new QPushButton(QStringLiteral("Browse"), pathsGroup);
+        pathsForm->addRow(QStringLiteral("Python Executable:"), buildPathRow(pathsGroup, m_pythonPath, m_pythonBrowseButton));
 
-        m_inputPath = new QLineEdit(pathsTab);
-        m_inputBrowseButton = new QPushButton(QStringLiteral("Browse"), pathsTab);
-        pathsForm->addRow(QStringLiteral("Input Path:"), buildPathRow(pathsTab, m_inputPath, m_inputBrowseButton));
+        m_inputPath = new QLineEdit(pathsGroup);
+        m_inputBrowseButton = new QPushButton(QStringLiteral("Browse"), pathsGroup);
+        pathsForm->addRow(QStringLiteral("Input (file/folder):"), buildPathRow(pathsGroup, m_inputPath, m_inputBrowseButton));
 
-        m_outputPath = new QLineEdit(pathsTab);
-        m_outputBrowseButton = new QPushButton(QStringLiteral("Browse"), pathsTab);
-        pathsForm->addRow(QStringLiteral("Output Path:"), buildPathRow(pathsTab, m_outputPath, m_outputBrowseButton));
+        m_outputPath = new QLineEdit(pathsGroup);
+        m_outputBrowseButton = new QPushButton(QStringLiteral("Browse"), pathsGroup);
+        pathsForm->addRow(QStringLiteral("Output:"), buildPathRow(pathsGroup, m_outputPath, m_outputBrowseButton));
 
-        m_modelPath = new QLineEdit(pathsTab);
-        m_modelBrowseButton = new QPushButton(QStringLiteral("Browse"), pathsTab);
-        pathsForm->addRow(QStringLiteral("Model File:"), buildPathRow(pathsTab, m_modelPath, m_modelBrowseButton));
+        m_modelDirPath = new QLineEdit(pathsGroup);
+        m_modelDirBrowseButton = new QPushButton(QStringLiteral("Browse"), pathsGroup);
+        pathsForm->addRow(QStringLiteral("Model Directory:"), buildPathRow(pathsGroup, m_modelDirPath, m_modelDirBrowseButton));
+        scrollLayout->addWidget(pathsGroup);
 
-        settingsTabs->addTab(pathsTab, QStringLiteral("Paths"));
+        auto *modelGroup = new QGroupBox(QStringLiteral("AI Model"), scrollHost);
+        auto *modelForm = new QFormLayout(modelGroup);
+        m_ditModelCombo = new QComboBox(modelGroup);
+        m_ditModelCombo->addItems({
+            QStringLiteral("seedvr2_ema_3b_fp8_e4m3fn.safetensors"),
+            QStringLiteral("seedvr2_ema_3b-Q4_K_M.gguf"),
+            QStringLiteral("seedvr2_ema_3b-Q8_0.gguf"),
+            QStringLiteral("seedvr2_ema_3b_fp16.safetensors"),
+            QStringLiteral("seedvr2_ema_7b-Q4_K_M.gguf"),
+            QStringLiteral("seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors"),
+            QStringLiteral("seedvr2_ema_7b_fp16.safetensors"),
+            QStringLiteral("seedvr2_ema_7b_sharp-Q4_K_M.gguf"),
+            QStringLiteral("seedvr2_ema_7b_sharp_fp8_e4m3fn_mixed_block35_fp16.safetensors"),
+            QStringLiteral("seedvr2_ema_7b_sharp_fp16.safetensors")
+        });
+        m_ditModelCombo->setCurrentText(QStringLiteral("seedvr2_ema_3b-Q8_0.gguf"));
+        modelForm->addRow(QStringLiteral("DiT Model:"), m_ditModelCombo);
+        scrollLayout->addWidget(modelGroup);
 
-        auto *aiTab = new QWidget(settingsTabs);
-        auto *aiLayout = new QVBoxLayout(aiTab);
+        auto *procGroup = new QGroupBox(QStringLiteral("Processing Settings"), scrollHost);
+        auto *procForm = new QFormLayout(procGroup);
+        m_preDownscaleCombo = new QComboBox(procGroup);
+        m_preDownscaleCombo->addItems({ QStringLiteral("1:1"), QStringLiteral("2:1"), QStringLiteral("3:1") });
+        procForm->addRow(QStringLiteral("Pre-Downscale:"), m_preDownscaleCombo);
 
-        auto *aiForm = new QFormLayout();
-        m_modelPreset = new QComboBox(aiTab);
-        m_modelPreset->addItems({ QStringLiteral("3B"), QStringLiteral("7B"), QStringLiteral("GGUF"), QStringLiteral("Custom") });
-        aiForm->addRow(QStringLiteral("AI Model Option:"), m_modelPreset);
+        auto *resRow = new QWidget(procGroup);
+        auto *resRowLayout = new QHBoxLayout(resRow);
+        resRowLayout->setContentsMargins(0, 0, 0, 0);
+        m_resolutionModeCombo = new QComboBox(procGroup);
+        m_resolutionModeCombo->addItems({ QStringLiteral("Pixel"), QStringLiteral("X Times") });
+        m_resolutionSpin = new QSpinBox(procGroup);
+        m_resolutionSpin->setRange(128, 7680);
+        m_resolutionSpin->setValue(720);
+        m_resolutionTimesCombo = new QComboBox(procGroup);
+        m_resolutionTimesCombo->addItems({ QStringLiteral("1x"), QStringLiteral("2x"), QStringLiteral("3x"), QStringLiteral("4x"), QStringLiteral("5x") });
+        m_resolutionTimesCombo->setCurrentText(QStringLiteral("2x"));
+        resRowLayout->addWidget(m_resolutionModeCombo);
+        resRowLayout->addWidget(m_resolutionSpin);
+        resRowLayout->addWidget(m_resolutionTimesCombo);
+        procForm->addRow(QStringLiteral("Resolution:"), resRow);
 
-        m_attentionMode = new QComboBox(aiTab);
-        m_attentionMode->addItems({ QStringLiteral("sageattn_3"), QStringLiteral("flash_attn_3"), QStringLiteral("flash_attn_2"), QStringLiteral("sdpa") });
-        aiForm->addRow(QStringLiteral("Attention Mode:"), m_attentionMode);
+        m_maxResolutionSpin = new QSpinBox(procGroup);
+        m_maxResolutionSpin->setRange(0, 7680);
+        m_maxResolutionSpin->setValue(0);
+        procForm->addRow(QStringLiteral("Max Resolution:"), m_maxResolutionSpin);
 
-        m_deviceCombo = new QComboBox(aiTab);
-        m_deviceCombo->addItems({ QStringLiteral("auto"), QStringLiteral("cuda"), QStringLiteral("cpu") });
-        aiForm->addRow(QStringLiteral("Device:"), m_deviceCombo);
+        m_batchSizeSpin = new QSpinBox(procGroup);
+        m_batchSizeSpin->setRange(1, 10001);
+        m_batchSizeSpin->setValue(81);
+        procForm->addRow(QStringLiteral("Batch Size:"), m_batchSizeSpin);
 
-        m_seedSpin = new QSpinBox(aiTab);
+        m_uniformBatchCheck = new QCheckBox(procGroup);
+        procForm->addRow(QStringLiteral("Uniform Batch Size:"), m_uniformBatchCheck);
+
+        m_temporalOverlapSpin = new QSpinBox(procGroup);
+        m_temporalOverlapSpin->setRange(0, 100);
+        procForm->addRow(QStringLiteral("Temporal Overlap:"), m_temporalOverlapSpin);
+
+        m_prependFramesSpin = new QSpinBox(procGroup);
+        m_prependFramesSpin->setRange(0, 100);
+        procForm->addRow(QStringLiteral("Prepend Frames:"), m_prependFramesSpin);
+        scrollLayout->addWidget(procGroup);
+
+        auto *previewGroup = new QGroupBox(QStringLiteral("Preview & Processing"), scrollHost);
+        auto *previewForm = new QFormLayout(previewGroup);
+        m_seedSpin = new QSpinBox(previewGroup);
         m_seedSpin->setRange(0, 2147483647);
         m_seedSpin->setValue(313);
-        aiForm->addRow(QStringLiteral("Seed:"), m_seedSpin);
+        previewForm->addRow(QStringLiteral("Seed:"), m_seedSpin);
 
-        aiLayout->addLayout(aiForm);
+        m_skipFirstFramesSpin = new QSpinBox(previewGroup);
+        m_skipFirstFramesSpin->setRange(0, 99999);
+        previewForm->addRow(QStringLiteral("Skip First Frames:"), m_skipFirstFramesSpin);
 
-        auto *grainGroup = new QGroupBox(QStringLiteral("Image Controls"), aiTab);
-        auto *grainLayout = new QVBoxLayout(grainGroup);
+        m_loadCapSpin = new QSpinBox(previewGroup);
+        m_loadCapSpin->setRange(0, 99999);
+        previewForm->addRow(QStringLiteral("Load Cap:"), m_loadCapSpin);
 
-        m_grainValue = new QLabel(grainGroup);
-        m_grainSlider = new QSlider(Qt::Horizontal, grainGroup);
-        m_grainSlider->setRange(0, 100);
-        m_grainSlider->setValue(12);
+        m_chunkSizeSpin = new QSpinBox(previewGroup);
+        m_chunkSizeSpin->setRange(0, 99999);
+        previewForm->addRow(QStringLiteral("Chunk Size:"), m_chunkSizeSpin);
+        scrollLayout->addWidget(previewGroup);
 
-        m_recoverValue = new QLabel(grainGroup);
-        m_recoverSlider = new QSlider(Qt::Horizontal, grainGroup);
-        m_recoverSlider->setRange(0, 100);
-        m_recoverSlider->setValue(35);
+        auto *deviceGroup = new QGroupBox(QStringLiteral("Device Management"), scrollHost);
+        auto *deviceForm = new QFormLayout(deviceGroup);
 
-        grainLayout->addWidget(m_grainValue);
-        grainLayout->addWidget(m_grainSlider);
-        grainLayout->addWidget(m_recoverValue);
-        grainLayout->addWidget(m_recoverSlider);
-        aiLayout->addWidget(grainGroup);
-        aiLayout->addStretch(1);
+        m_cudaDeviceEdit = new QLineEdit(deviceGroup);
+        m_cudaDeviceEdit->setText(QStringLiteral("0"));
+        deviceForm->addRow(QStringLiteral("CUDA Device(s):"), m_cudaDeviceEdit);
 
-        settingsTabs->addTab(aiTab, QStringLiteral("AI"));
+        m_ditOffloadCombo = new QComboBox(deviceGroup);
+        m_ditOffloadCombo->addItems({ QStringLiteral("none"), QStringLiteral("cpu"), QStringLiteral("0"), QStringLiteral("1") });
+        deviceForm->addRow(QStringLiteral("DiT Offload:"), m_ditOffloadCombo);
 
-        auto *runtimeTab = new QWidget(settingsTabs);
-        auto *runtimeForm = new QFormLayout(runtimeTab);
+        m_vaeOffloadCombo = new QComboBox(deviceGroup);
+        m_vaeOffloadCombo->addItems({ QStringLiteral("none"), QStringLiteral("cpu"), QStringLiteral("0"), QStringLiteral("1") });
+        deviceForm->addRow(QStringLiteral("VAE Offload:"), m_vaeOffloadCombo);
 
-        m_fpsSpin = new QSpinBox(runtimeTab);
-        m_fpsSpin->setRange(1, 240);
-        m_fpsSpin->setValue(24);
-        runtimeForm->addRow(QStringLiteral("FPS:"), m_fpsSpin);
+        m_tensorOffloadCombo = new QComboBox(deviceGroup);
+        m_tensorOffloadCombo->addItems({ QStringLiteral("cpu"), QStringLiteral("none"), QStringLiteral("0"), QStringLiteral("1") });
+        deviceForm->addRow(QStringLiteral("Tensor Offload:"), m_tensorOffloadCombo);
+        scrollLayout->addWidget(deviceGroup);
 
-        m_tileSizeSpin = new QSpinBox(runtimeTab);
-        m_tileSizeSpin->setRange(64, 4096);
-        m_tileSizeSpin->setValue(1024);
-        runtimeForm->addRow(QStringLiteral("Tile Size:"), m_tileSizeSpin);
+        auto *qualityGroup = new QGroupBox(QStringLiteral("Quality + Performance"), scrollHost);
+        auto *qualityForm = new QFormLayout(qualityGroup);
 
-        m_flushIntervalSpin = new QSpinBox(runtimeTab);
-        m_flushIntervalSpin->setRange(1, 512);
-        m_flushIntervalSpin->setValue(8);
-        runtimeForm->addRow(QStringLiteral("Memory Flush Interval (frames):"), m_flushIntervalSpin);
+        m_colorCorrectionCombo = new QComboBox(qualityGroup);
+        m_colorCorrectionCombo->addItems({ QStringLiteral("lab"), QStringLiteral("wavelet"), QStringLiteral("wavelet_adaptive"), QStringLiteral("hsv"), QStringLiteral("adain"), QStringLiteral("none") });
+        qualityForm->addRow(QStringLiteral("Color Correction:"), m_colorCorrectionCombo);
 
-        m_verboseDebug = new QCheckBox(runtimeTab);
-        runtimeForm->addRow(QStringLiteral("Verbose Debug:"), m_verboseDebug);
+        m_attentionModeCombo = new QComboBox(qualityGroup);
+        m_attentionModeCombo->addItems({ QStringLiteral("sdpa"), QStringLiteral("flash_attn_2"), QStringLiteral("flash_attn_3"), QStringLiteral("sageattn_2"), QStringLiteral("sageattn_3") });
+        qualityForm->addRow(QStringLiteral("Attention Mode:"), m_attentionModeCombo);
+        scrollLayout->addWidget(qualityGroup);
 
-        settingsTabs->addTab(runtimeTab, QStringLiteral("Runtime"));
+        auto *memoryGroup = new QGroupBox(QStringLiteral("Memory Optimization + VAE Tiling"), scrollHost);
+        auto *memoryForm = new QFormLayout(memoryGroup);
 
-        rightLayout->addWidget(settingsTabs, 1);
+        m_blocksToSwapSpin = new QSpinBox(memoryGroup);
+        m_blocksToSwapSpin->setRange(0, 64);
+        memoryForm->addRow(QStringLiteral("Blocks To Swap:"), m_blocksToSwapSpin);
+
+        m_swapIoComponentsCheck = new QCheckBox(memoryGroup);
+        memoryForm->addRow(QStringLiteral("Swap IO Components:"), m_swapIoComponentsCheck);
+
+        m_vaeEncodeTiledCheck = new QCheckBox(memoryGroup);
+        memoryForm->addRow(QStringLiteral("VAE Encode Tiled:"), m_vaeEncodeTiledCheck);
+
+        m_vaeEncodeTileSizeSpin = new QSpinBox(memoryGroup);
+        m_vaeEncodeTileSizeSpin->setRange(128, 4096);
+        m_vaeEncodeTileSizeSpin->setValue(1024);
+        memoryForm->addRow(QStringLiteral("Encode Tile Size:"), m_vaeEncodeTileSizeSpin);
+
+        m_vaeEncodeTileOverlapSpin = new QSpinBox(memoryGroup);
+        m_vaeEncodeTileOverlapSpin->setRange(0, 1023);
+        m_vaeEncodeTileOverlapSpin->setValue(128);
+        memoryForm->addRow(QStringLiteral("Encode Tile Overlap:"), m_vaeEncodeTileOverlapSpin);
+
+        m_vaeDecodeTiledCheck = new QCheckBox(memoryGroup);
+        memoryForm->addRow(QStringLiteral("VAE Decode Tiled:"), m_vaeDecodeTiledCheck);
+
+        m_vaeDecodeTileSizeSpin = new QSpinBox(memoryGroup);
+        m_vaeDecodeTileSizeSpin->setRange(128, 4096);
+        m_vaeDecodeTileSizeSpin->setValue(1024);
+        memoryForm->addRow(QStringLiteral("Decode Tile Size:"), m_vaeDecodeTileSizeSpin);
+
+        m_vaeDecodeTileOverlapSpin = new QSpinBox(memoryGroup);
+        m_vaeDecodeTileOverlapSpin->setRange(0, 1023);
+        m_vaeDecodeTileOverlapSpin->setValue(128);
+        memoryForm->addRow(QStringLiteral("Decode Tile Overlap:"), m_vaeDecodeTileOverlapSpin);
+
+        m_tileDebugCombo = new QComboBox(memoryGroup);
+        m_tileDebugCombo->addItems({ QStringLiteral("false"), QStringLiteral("encode"), QStringLiteral("decode") });
+        memoryForm->addRow(QStringLiteral("Tile Debug:"), m_tileDebugCombo);
+
+        scrollLayout->addWidget(memoryGroup);
+
+        auto *codecGroup = new QGroupBox(QStringLiteral("Codec / Output"), scrollHost);
+        auto *codecForm = new QFormLayout(codecGroup);
+
+        m_outputFormatCombo = new QComboBox(codecGroup);
+        m_outputFormatCombo->addItems({ QStringLiteral("mp4"), QStringLiteral("mov"), QStringLiteral("mkv"), QStringLiteral("webm"), QStringLiteral("png"), QStringLiteral("tiff"), QStringLiteral("jpg"), QStringLiteral("dpx"), QStringLiteral("exr") });
+        codecForm->addRow(QStringLiteral("Output Format:"), m_outputFormatCombo);
+
+        m_videoBackendCombo = new QComboBox(codecGroup);
+        m_videoBackendCombo->addItems({ QStringLiteral("ffmpeg"), QStringLiteral("opencv") });
+        codecForm->addRow(QStringLiteral("Video Backend:"), m_videoBackendCombo);
+
+        m_ffmpegArgsEdit = new QLineEdit(codecGroup);
+        codecForm->addRow(QStringLiteral("FFmpeg Video Args (JSON):"), m_ffmpegArgsEdit);
+
+        m_use10bitCheck = new QCheckBox(codecGroup);
+        codecForm->addRow(QStringLiteral("Use 10-bit:"), m_use10bitCheck);
+
+        scrollLayout->addWidget(codecGroup);
+
+        auto *flagsGroup = new QGroupBox(QStringLiteral("Caching / Safety / Debug"), scrollHost);
+        auto *flagsForm = new QFormLayout(flagsGroup);
+        m_cacheDitCheck = new QCheckBox(flagsGroup);
+        flagsForm->addRow(QStringLiteral("Cache DiT:"), m_cacheDitCheck);
+        m_cacheVaeCheck = new QCheckBox(flagsGroup);
+        flagsForm->addRow(QStringLiteral("Cache VAE:"), m_cacheVaeCheck);
+        m_autoSafeguardCheck = new QCheckBox(flagsGroup);
+        flagsForm->addRow(QStringLiteral("Auto Safeguard:"), m_autoSafeguardCheck);
+        m_debugCheck = new QCheckBox(flagsGroup);
+        flagsForm->addRow(QStringLiteral("Debug:"), m_debugCheck);
+        scrollLayout->addWidget(flagsGroup);
+
+        scrollLayout->addStretch(1);
+        scrollArea->setWidget(scrollHost);
+        rightLayout->addWidget(scrollArea, 1);
 
         auto *buttonRow = new QHBoxLayout();
         m_startButton = new QPushButton(QStringLiteral("Start Render"), rightFrame);
@@ -766,20 +839,17 @@ private:
 
         connect(m_inputBrowseButton, &QPushButton::clicked, this, &MainWindow::browseInputPath);
         connect(m_outputBrowseButton, &QPushButton::clicked, this, &MainWindow::browseOutputPath);
-        connect(m_modelBrowseButton, &QPushButton::clicked, this, &MainWindow::browseModelPath);
         connect(m_pythonBrowseButton, &QPushButton::clicked, this, &MainWindow::browsePythonExecutable);
+        connect(m_modelDirBrowseButton, &QPushButton::clicked, this, &MainWindow::browseModelDir);
         connect(m_previewInputBrowseButton, &QPushButton::clicked, this, &MainWindow::browsePreviewInput);
         connect(m_previewOutputBrowseButton, &QPushButton::clicked, this, &MainWindow::browsePreviewOutput);
         connect(previewRefreshButton, &QPushButton::clicked, this, &MainWindow::refreshPreviewPanels);
-
-        connect(m_grainSlider, &QSlider::valueChanged, this, &MainWindow::updateSliderLabels);
-        connect(m_recoverSlider, &QSlider::valueChanged, this, &MainWindow::updateSliderLabels);
-        connect(m_modelPreset, &QComboBox::currentTextChanged, this, &MainWindow::applyModelPreset);
+        connect(m_resolutionModeCombo, &QComboBox::currentTextChanged, this, &MainWindow::updateResolutionMode);
 
         connect(m_startButton, &QPushButton::clicked, this, &MainWindow::startRender);
         connect(m_stopButton, &QPushButton::clicked, this, &MainWindow::stopRender);
 
-        updateSliderLabels();
+        updateResolutionMode(m_resolutionModeCombo->currentText());
         refreshPreviewPanels();
         statusBar()->showMessage(QStringLiteral("Ready"));
     }
@@ -789,20 +859,17 @@ private:
         QSettings settings(QStringLiteral("SeedVR2"), QStringLiteral("QtRunner"));
         settings.setValue(QStringLiteral("inputPath"), m_inputPath->text());
         settings.setValue(QStringLiteral("outputPath"), m_outputPath->text());
-        settings.setValue(QStringLiteral("modelPath"), m_modelPath->text());
+        settings.setValue(QStringLiteral("modelDirPath"), m_modelDirPath->text());
         settings.setValue(QStringLiteral("pythonPath"), m_pythonPath->text());
         settings.setValue(QStringLiteral("previewInputPath"), m_previewInputPath->text());
         settings.setValue(QStringLiteral("previewOutputPath"), m_previewOutputPath->text());
-        settings.setValue(QStringLiteral("modelPreset"), m_modelPreset->currentText());
-        settings.setValue(QStringLiteral("attentionMode"), m_attentionMode->currentText());
-        settings.setValue(QStringLiteral("device"), m_deviceCombo->currentText());
-        settings.setValue(QStringLiteral("grain"), m_grainSlider->value());
-        settings.setValue(QStringLiteral("recover"), m_recoverSlider->value());
-        settings.setValue(QStringLiteral("fps"), m_fpsSpin->value());
+        settings.setValue(QStringLiteral("ditModel"), m_ditModelCombo->currentText());
+        settings.setValue(QStringLiteral("resolutionMode"), m_resolutionModeCombo->currentText());
+        settings.setValue(QStringLiteral("resolution"), m_resolutionSpin->value());
+        settings.setValue(QStringLiteral("resolutionTimes"), m_resolutionTimesCombo->currentText());
+        settings.setValue(QStringLiteral("batchSize"), m_batchSizeSpin->value());
         settings.setValue(QStringLiteral("seed"), m_seedSpin->value());
-        settings.setValue(QStringLiteral("tileSize"), m_tileSizeSpin->value());
-        settings.setValue(QStringLiteral("flushInterval"), m_flushIntervalSpin->value());
-        settings.setValue(QStringLiteral("verboseDebug"), m_verboseDebug->isChecked());
+        settings.setValue(QStringLiteral("cudaDevice"), m_cudaDeviceEdit->text());
     }
 
     void loadSettings()
@@ -810,44 +877,25 @@ private:
         QSettings settings(QStringLiteral("SeedVR2"), QStringLiteral("QtRunner"));
         m_inputPath->setText(settings.value(QStringLiteral("inputPath")).toString());
         m_outputPath->setText(settings.value(QStringLiteral("outputPath")).toString());
-        m_modelPath->setText(settings.value(QStringLiteral("modelPath")).toString());
+        m_modelDirPath->setText(settings.value(QStringLiteral("modelDirPath")).toString());
         m_pythonPath->setText(settings.value(QStringLiteral("pythonPath"), QStringLiteral("python")).toString());
         m_previewInputPath->setText(settings.value(QStringLiteral("previewInputPath")).toString());
         m_previewOutputPath->setText(settings.value(QStringLiteral("previewOutputPath")).toString());
-
-        const QString modelPreset = settings.value(QStringLiteral("modelPreset"), QStringLiteral("3B")).toString();
-        const int modelPresetIndex = m_modelPreset->findText(modelPreset);
-        if (modelPresetIndex >= 0) {
-            m_modelPreset->setCurrentIndex(modelPresetIndex);
-        }
-
-        const QString attentionMode = settings.value(QStringLiteral("attentionMode"), QStringLiteral("sageattn_3")).toString();
-        const int attentionIndex = m_attentionMode->findText(attentionMode);
-        if (attentionIndex >= 0) {
-            m_attentionMode->setCurrentIndex(attentionIndex);
-        }
-
-        const QString device = settings.value(QStringLiteral("device"), QStringLiteral("auto")).toString();
-        const int deviceIndex = m_deviceCombo->findText(device);
-        if (deviceIndex >= 0) {
-            m_deviceCombo->setCurrentIndex(deviceIndex);
-        }
-
-        m_grainSlider->setValue(settings.value(QStringLiteral("grain"), 12).toInt());
-        m_recoverSlider->setValue(settings.value(QStringLiteral("recover"), 35).toInt());
-        m_fpsSpin->setValue(settings.value(QStringLiteral("fps"), 24).toInt());
+        m_ditModelCombo->setCurrentText(settings.value(QStringLiteral("ditModel"), m_ditModelCombo->currentText()).toString());
+        m_resolutionModeCombo->setCurrentText(settings.value(QStringLiteral("resolutionMode"), QStringLiteral("Pixel")).toString());
+        m_resolutionSpin->setValue(settings.value(QStringLiteral("resolution"), 720).toInt());
+        m_resolutionTimesCombo->setCurrentText(settings.value(QStringLiteral("resolutionTimes"), QStringLiteral("2x")).toString());
+        m_batchSizeSpin->setValue(settings.value(QStringLiteral("batchSize"), 81).toInt());
         m_seedSpin->setValue(settings.value(QStringLiteral("seed"), 313).toInt());
-        m_tileSizeSpin->setValue(settings.value(QStringLiteral("tileSize"), 1024).toInt());
-        m_flushIntervalSpin->setValue(settings.value(QStringLiteral("flushInterval"), 8).toInt());
-        m_verboseDebug->setChecked(settings.value(QStringLiteral("verboseDebug"), false).toBool());
+        m_cudaDeviceEdit->setText(settings.value(QStringLiteral("cudaDevice"), QStringLiteral("0")).toString());
 
-        updateSliderLabels();
+        updateResolutionMode(m_resolutionModeCombo->currentText());
         refreshPreviewPanels();
     }
 
     QLineEdit *m_inputPath = nullptr;
     QLineEdit *m_outputPath = nullptr;
-    QLineEdit *m_modelPath = nullptr;
+    QLineEdit *m_modelDirPath = nullptr;
     QLineEdit *m_pythonPath = nullptr;
 
     QLineEdit *m_previewInputPath = nullptr;
@@ -855,7 +903,7 @@ private:
 
     QPushButton *m_inputBrowseButton = nullptr;
     QPushButton *m_outputBrowseButton = nullptr;
-    QPushButton *m_modelBrowseButton = nullptr;
+    QPushButton *m_modelDirBrowseButton = nullptr;
     QPushButton *m_pythonBrowseButton = nullptr;
     QPushButton *m_previewInputBrowseButton = nullptr;
     QPushButton *m_previewOutputBrowseButton = nullptr;
@@ -866,20 +914,49 @@ private:
     QLabel *m_outputOnlyPreview = nullptr;
     QTabWidget *m_previewTabs = nullptr;
 
-    QComboBox *m_modelPreset = nullptr;
-    QComboBox *m_attentionMode = nullptr;
-    QComboBox *m_deviceCombo = nullptr;
+    QComboBox *m_ditModelCombo = nullptr;
+    QComboBox *m_preDownscaleCombo = nullptr;
+    QComboBox *m_resolutionModeCombo = nullptr;
+    QSpinBox *m_resolutionSpin = nullptr;
+    QComboBox *m_resolutionTimesCombo = nullptr;
+    QSpinBox *m_maxResolutionSpin = nullptr;
+    QSpinBox *m_batchSizeSpin = nullptr;
+    QCheckBox *m_uniformBatchCheck = nullptr;
+    QSpinBox *m_temporalOverlapSpin = nullptr;
+    QSpinBox *m_prependFramesSpin = nullptr;
 
-    QSlider *m_grainSlider = nullptr;
-    QSlider *m_recoverSlider = nullptr;
-    QLabel *m_grainValue = nullptr;
-    QLabel *m_recoverValue = nullptr;
-
-    QSpinBox *m_fpsSpin = nullptr;
     QSpinBox *m_seedSpin = nullptr;
-    QSpinBox *m_tileSizeSpin = nullptr;
-    QSpinBox *m_flushIntervalSpin = nullptr;
-    QCheckBox *m_verboseDebug = nullptr;
+    QSpinBox *m_skipFirstFramesSpin = nullptr;
+    QSpinBox *m_loadCapSpin = nullptr;
+    QSpinBox *m_chunkSizeSpin = nullptr;
+
+    QLineEdit *m_cudaDeviceEdit = nullptr;
+    QComboBox *m_ditOffloadCombo = nullptr;
+    QComboBox *m_vaeOffloadCombo = nullptr;
+    QComboBox *m_tensorOffloadCombo = nullptr;
+
+    QComboBox *m_colorCorrectionCombo = nullptr;
+    QComboBox *m_attentionModeCombo = nullptr;
+
+    QSpinBox *m_blocksToSwapSpin = nullptr;
+    QCheckBox *m_swapIoComponentsCheck = nullptr;
+    QCheckBox *m_vaeEncodeTiledCheck = nullptr;
+    QSpinBox *m_vaeEncodeTileSizeSpin = nullptr;
+    QSpinBox *m_vaeEncodeTileOverlapSpin = nullptr;
+    QCheckBox *m_vaeDecodeTiledCheck = nullptr;
+    QSpinBox *m_vaeDecodeTileSizeSpin = nullptr;
+    QSpinBox *m_vaeDecodeTileOverlapSpin = nullptr;
+    QComboBox *m_tileDebugCombo = nullptr;
+
+    QComboBox *m_outputFormatCombo = nullptr;
+    QComboBox *m_videoBackendCombo = nullptr;
+    QLineEdit *m_ffmpegArgsEdit = nullptr;
+    QCheckBox *m_use10bitCheck = nullptr;
+
+    QCheckBox *m_cacheDitCheck = nullptr;
+    QCheckBox *m_cacheVaeCheck = nullptr;
+    QCheckBox *m_autoSafeguardCheck = nullptr;
+    QCheckBox *m_debugCheck = nullptr;
 
     QPushButton *m_startButton = nullptr;
     QPushButton *m_stopButton = nullptr;
