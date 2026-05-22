@@ -44,6 +44,9 @@ Model Support:
 """
 
 # Standard library imports
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, message=".*expandable_segments.*")
+
 import sys
 import os
 import gc
