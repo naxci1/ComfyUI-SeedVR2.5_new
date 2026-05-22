@@ -52,10 +52,12 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFormLayout,
+    QDoubleSpinBox,
     QMainWindow,
     QMenu,
     QMessageBox,
     QPushButton,
+    QProgressBar,
     QScrollArea,
     QSizePolicy,
     QSlider,
@@ -67,6 +69,11 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None  # type: ignore[assignment]
 
 try:
     from PyQt6.QtMultimedia import QAudioOutput, QMediaMetaData, QMediaPlayer, QVideoFrame, QVideoSink
@@ -660,6 +667,14 @@ class MainWindow(QMainWindow):
         self._force_exit: bool = False
         self._tray_tip_shown: bool = False
         self._drop_highlight_count: int = 0
+        self._current_file_path: str = ""
+        self._current_file_total_frames: int = 0
+        self._current_file_processed_frames: int = 0
+        self._queue_files_total: int = 0
+        self._queue_files_completed: int = 0
+        self._queue_file_frame_counts: dict[str, int] = {}
+        self._queue_ordered_files: list[str] = []
+        self._active_queue_index: int = -1
         self._preview_original_input_path: Optional[str] = None
         self._preview_original_input_mode: str = "File"
         self._preview_original_position: int = 0
@@ -1281,6 +1296,15 @@ class MainWindow(QMainWindow):
             self.attention_mode_combo.setCurrentIndex(_attn_idx)
         self.attention_mode_combo.setMinimumWidth(240)
         f.addRow("Attention Mode:", self.attention_mode_combo)
+        self.estimated_processing_fps_spin = QDoubleSpinBox()
+        self.estimated_processing_fps_spin.setRange(0.1, 120.0)
+        self.estimated_processing_fps_spin.setDecimals(2)
+        self.estimated_processing_fps_spin.setSingleStep(0.1)
+        self.estimated_processing_fps_spin.setValue(1.8)
+        self.estimated_processing_fps_spin.setToolTip(
+            "Used by GUI time estimation: Remaining Seconds = Remaining Frames / Estimated FPS"
+        )
+        f.addRow("Estimated Processing Speed (FPS):", self.estimated_processing_fps_spin)
 
         adj_layout.addWidget(g)
 
@@ -1559,15 +1583,11 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 4, 0, 0)
         layout.setSpacing(4)
 
-        # Status + primary actions
-        # Note: run_btn and preview_btn are placed under the viewer in _build_left_panel.
-        # Only Abort lives here.
-        btn_row = QHBoxLayout()
+        # Status row
+        status_row = QHBoxLayout()
         self.status_label = QLabel("Ready")
         self.status_label.setMinimumWidth(200)
         self.status_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        self.fps_label = QLabel("0.0 fps")
-        self.fps_label.setMinimumWidth(80)
 
         self.abort_btn = QPushButton("⏹  Abort")
         self.abort_btn.setObjectName("danger_button")
@@ -1584,12 +1604,48 @@ class MainWindow(QMainWindow):
         self.open_output_folder_btn.setEnabled(True)
         self.open_output_folder_btn.clicked.connect(self._open_output_folder)
 
-        btn_row.addWidget(self.status_label)
-        btn_row.addWidget(self.fps_label)
-        btn_row.addStretch(1)
-        btn_row.addWidget(self.run_btn)
-        btn_row.addWidget(self.abort_btn)
-        layout.addLayout(btn_row)
+        status_row.addWidget(self.status_label)
+        status_row.addStretch(1)
+        status_row.addWidget(self.run_btn)
+        status_row.addWidget(self.abort_btn)
+        layout.addLayout(status_row)
+
+        # Two-tier graphical progress panel
+        self.progress_panel = QFrame()
+        self.progress_panel.setObjectName("progress_panel")
+        self.progress_panel.setStyleSheet(
+            "QFrame#progress_panel {"
+            "background:#1A1D21;"
+            "border:1px solid #2E3338;"
+            "border-radius:10px;"
+            "padding:8px;"
+            "}"
+        )
+        panel_layout = QVBoxLayout(self.progress_panel)
+        panel_layout.setContentsMargins(10, 8, 10, 10)
+        panel_layout.setSpacing(8)
+
+        self.current_file_progress_label = QLabel(
+            "Current File: - | Remaining: 00:00:00 | Frames: 0/0"
+        )
+        self.current_file_progress_bar = QProgressBar()
+        self.current_file_progress_bar.setRange(0, 1000)
+        self.current_file_progress_bar.setValue(0)
+        self.current_file_progress_bar.setTextVisible(False)
+
+        self.batch_progress_label = QLabel(
+            "Overall Batch Progress | Completed: 0/0 | Estimated Total Time Left: 00:00:00"
+        )
+        self.batch_progress_bar = QProgressBar()
+        self.batch_progress_bar.setRange(0, 1000)
+        self.batch_progress_bar.setValue(0)
+        self.batch_progress_bar.setTextVisible(False)
+
+        panel_layout.addWidget(self.current_file_progress_label)
+        panel_layout.addWidget(self.current_file_progress_bar)
+        panel_layout.addWidget(self.batch_progress_label)
+        panel_layout.addWidget(self.batch_progress_bar)
+        layout.addWidget(self.progress_panel)
 
         util_row = QHBoxLayout()
         util_row.addStretch(1)
@@ -1688,6 +1744,7 @@ class MainWindow(QMainWindow):
             "vae_decode_tile_overlap_spin": self.vae_decode_tile_overlap_spin,
             "tile_debug_combo": self.tile_debug_combo,
             "attention_mode_combo": self.attention_mode_combo,
+            "estimated_processing_fps_spin": self.estimated_processing_fps_spin,
             "cache_dit_check": self.cache_dit_check,
             "cache_vae_check": self.cache_vae_check,
             "auto_safeguard_check": self.auto_safeguard_check,
@@ -1880,6 +1937,8 @@ class MainWindow(QMainWindow):
                 data[key] = widget.currentText()
             elif isinstance(widget, QSpinBox):
                 data[key] = widget.value()
+            elif isinstance(widget, QDoubleSpinBox):
+                data[key] = widget.value()
             elif isinstance(widget, QCheckBox):
                 data[key] = widget.isChecked()
         return data
@@ -1898,6 +1957,11 @@ class MainWindow(QMainWindow):
             elif isinstance(widget, QSpinBox):
                 try:
                     widget.setValue(int(value))
+                except (TypeError, ValueError):
+                    continue
+            elif isinstance(widget, QDoubleSpinBox):
+                try:
+                    widget.setValue(float(value))
                 except (TypeError, ValueError):
                     continue
             elif isinstance(widget, QCheckBox):
@@ -2483,6 +2547,9 @@ class MainWindow(QMainWindow):
 
         self._run_started_at = time.time()
         self._reset_progress_bars()
+        self._prepare_queue_progress_context()
+        self._update_current_file_progress_ui()
+        self._update_batch_progress_ui()
         self._set_running(True)
         self.status_label.setText("Starting…")
         self._thread.start()
@@ -3192,62 +3259,171 @@ class MainWindow(QMainWindow):
         self.console.append(f"[{ts}] {line}")
 
     def _reset_progress_bars(self) -> None:
-        self.fps_label.setText("0.0 fps")
         self._active_file_status = ""
         self._progress_status = ""
         self._batch_status = ""
+        self._current_file_path = ""
+        self._current_file_total_frames = 0
+        self._current_file_processed_frames = 0
+        self._queue_files_total = 0
+        self._queue_files_completed = 0
+        self._queue_file_frame_counts = {}
+        self._queue_ordered_files = []
+        self._active_queue_index = -1
         self.status_label.setToolTip("")
         self.status_label.setText("Ready")
+        self.current_file_progress_label.setText(
+            "Current File: - | Remaining: 00:00:00 | Frames: 0/0"
+        )
+        self.current_file_progress_bar.setValue(0)
+        self.batch_progress_label.setText(
+            "Overall Batch Progress | Completed: 0/0 | Estimated Total Time Left: 00:00:00"
+        )
+        self.batch_progress_bar.setValue(0)
 
     def _format_seconds(self, seconds: float) -> str:
         total = max(0, int(seconds))
-        return f"{total // 60}:{total % 60:02d}"
+        hours = total // 3600
+        minutes = (total % 3600) // 60
+        secs = total % 60
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+    def _estimated_processing_fps(self) -> float:
+        return max(0.1, float(self.estimated_processing_fps_spin.value()))
+
+    def _count_frames_for_file(self, path: Path) -> int:
+        suffix = path.suffix.lower()
+        if suffix in SUPPORTED_IMAGE_EXTS:
+            return 1
+        if suffix not in SUPPORTED_VIDEO_EXTS or cv2 is None:
+            return 0
+        cap = cv2.VideoCapture(str(path))
+        try:
+            if not cap.isOpened():
+                return 0
+            frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            return max(0, frames)
+        except Exception:
+            return 0
+        finally:
+            cap.release()
+
+    def _collect_input_files_for_estimation(self) -> list[Path]:
+        inp = self._settings_win.input_edit.text().strip()
+        if not inp:
+            return []
+        input_path = Path(inp)
+        if self._settings_win.input_mode_combo.currentText() == "Folder" and input_path.is_dir():
+            try:
+                files = [
+                    p for p in sorted(input_path.iterdir(), key=lambda x: x.name.lower())
+                    if p.is_file() and p.suffix.lower() in (SUPPORTED_VIDEO_EXTS | SUPPORTED_IMAGE_EXTS)
+                ]
+                return files
+            except OSError:
+                return []
+        if input_path.is_file():
+            return [input_path]
+        return []
+
+    def _prepare_queue_progress_context(self) -> None:
+        input_files = self._collect_input_files_for_estimation()
+        self._queue_ordered_files = [str(p.resolve()) for p in input_files]
+        self._queue_file_frame_counts = {
+            str(p.resolve()): self._count_frames_for_file(p) for p in input_files
+        }
+        self._queue_files_total = len(self._queue_ordered_files)
+        self._queue_files_completed = 0
+        self._active_queue_index = 0 if self._queue_files_total > 0 else -1
+        if self._queue_ordered_files:
+            self._current_file_path = self._queue_ordered_files[0]
+            self._current_file_total_frames = max(
+                0, self._queue_file_frame_counts.get(self._current_file_path, 0)
+            )
+        else:
+            self._current_file_path = ""
+            self._current_file_total_frames = 0
+        self._current_file_processed_frames = 0
+
+    def _update_current_file_progress_ui(self) -> None:
+        fps = self._estimated_processing_fps()
+        total_frames = max(0, self._current_file_total_frames)
+        current_frames = max(0, min(self._current_file_processed_frames, total_frames)) if total_frames > 0 else max(0, self._current_file_processed_frames)
+        remaining_seconds = max(0.0, (total_frames - current_frames) / fps) if total_frames > 0 else 0.0
+        file_name = Path(self._current_file_path).name if self._current_file_path else "-"
+        self.current_file_progress_label.setText(
+            f"Current File: {file_name} | Remaining: {self._format_seconds(remaining_seconds)} | Frames: {current_frames}/{total_frames}"
+        )
+        ratio = (current_frames / total_frames) if total_frames > 0 else 0.0
+        self.current_file_progress_bar.setValue(int(max(0.0, min(1.0, ratio)) * 1000))
+
+    def _update_batch_progress_ui(self) -> None:
+        fps = self._estimated_processing_fps()
+        if self._queue_files_total <= 0:
+            self.batch_progress_label.setText(
+                "Overall Batch Progress | Completed: 0/0 | Estimated Total Time Left: 00:00:00"
+            )
+            self.batch_progress_bar.setValue(0)
+            return
+
+        current_index = max(0, self._active_queue_index)
+        upcoming_start = min(current_index + 1, self._queue_files_total)
+        current_remaining = max(0, self._current_file_total_frames - self._current_file_processed_frames)
+        upcoming_remaining = 0
+        for file_path in self._queue_ordered_files[upcoming_start:]:
+            upcoming_remaining += max(0, self._queue_file_frame_counts.get(file_path, 0))
+        total_remaining_frames = current_remaining + upcoming_remaining
+        remaining_seconds = total_remaining_frames / fps
+
+        completed_files = min(self._queue_files_total, max(self._queue_files_completed, current_index))
+        self.batch_progress_label.setText(
+            f"Overall Batch Progress | Completed: {completed_files}/{self._queue_files_total} | Estimated Total Time Left: {self._format_seconds(remaining_seconds)}"
+        )
+
+        processed_current = max(0, min(self._current_file_processed_frames, self._current_file_total_frames))
+        processed_frames = processed_current
+        for idx in range(min(current_index, self._queue_files_total)):
+            processed_frames += max(0, self._queue_file_frame_counts.get(self._queue_ordered_files[idx], 0))
+        total_frames = sum(max(0, v) for v in self._queue_file_frame_counts.values())
+        ratio = (processed_frames / total_frames) if total_frames > 0 else (completed_files / self._queue_files_total)
+        self.batch_progress_bar.setValue(int(max(0.0, min(1.0, ratio)) * 1000))
 
     def _on_global_progress(self, cur: int, tot: int) -> None:
         if tot <= 0:
             return
-
-        elapsed = 0.0 if self._run_started_at is None else (time.time() - self._run_started_at)
-        eta_text = "estimating…"
-        fps_text = "0.0 fps"
-        if cur > 0:
-            remaining = (elapsed / cur) * max(0, tot - cur)
-            eta_text = f"≈ {self._format_seconds(remaining)} remaining"
-            if elapsed > 0:
-                fps_text = f"{(cur / elapsed):.1f} fps"
-        self.fps_label.setText(fps_text)
-        self._progress_status = (
-            f"Frames {cur}/{tot}  |  {self._format_seconds(elapsed)} elapsed  |  {eta_text}"
-        )
-        self._refresh_status_label()
+        self._current_file_processed_frames = max(0, cur)
+        self._current_file_total_frames = max(0, tot)
+        self._update_current_file_progress_ui()
+        self._update_batch_progress_ui()
+        self.status_label.setText("Processing…")
 
     def _on_batch_progress(self, cur: int, tot: int) -> None:
         if tot <= 0:
             return
         self._batch_status = f"Batch {cur}/{tot}"
-        self._refresh_status_label()
+        self.status_label.setToolTip(self._batch_status)
 
     def _on_queue_status_update(
         self, file_path: str, current: int, total: int, done: int, remaining: int
     ) -> None:
         if total > 0 and file_path:
-            self._active_file_status = (
-                f"Processing: {file_path} | File {current} of {total} "
-                f"[Done: {done}, Remaining: {remaining}]"
-            )
+            resolved = str(Path(file_path).resolve())
+            self._active_file_status = f"Processing: {resolved}"
+            self._queue_files_total = total
+            self._queue_files_completed = done
+            self._current_file_path = resolved
+            self._active_queue_index = max(0, current - 1)
+            if resolved in self._queue_file_frame_counts:
+                self._current_file_total_frames = max(0, self._queue_file_frame_counts[resolved])
+            elif self._current_file_total_frames <= 0:
+                self._current_file_total_frames = 0
         else:
             self._active_file_status = ""
         self._progress_status = ""
-        self._batch_status = ""
-        self._refresh_status_label()
-
-    def _refresh_status_label(self) -> None:
-        parts = [part for part in (self._active_file_status, self._progress_status) if part]
-        text = "  |  ".join(parts) if parts else "Ready"
-        if self._batch_status:
-            text = f"{text}  |  {self._batch_status}" if text else self._batch_status
-        self.status_label.setText(text)
-        self.status_label.setToolTip(self._active_file_status or text if text != "Ready" else "")
+        self._update_current_file_progress_ui()
+        self._update_batch_progress_ui()
+        self.status_label.setText("Processing…")
+        self.status_label.setToolTip(self._active_file_status if self._active_file_status else "")
 
     def _set_latest_output_path(self, path: Optional[Path]) -> None:
         self._latest_output_path = path
