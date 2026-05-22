@@ -654,6 +654,9 @@ class MainWindow(QMainWindow):
         self._queue_jobs: list[dict[str, Any]] = []
         self._queue_running: bool = False
         self._queue_entry_counter: int = 0
+        self._active_file_status: str = ""
+        self._progress_status: str = ""
+        self._batch_status: str = ""
         self._force_exit: bool = False
         self._tray_tip_shown: bool = False
         self._drop_highlight_count: int = 0
@@ -1562,6 +1565,7 @@ class MainWindow(QMainWindow):
         btn_row = QHBoxLayout()
         self.status_label = QLabel("Ready")
         self.status_label.setMinimumWidth(200)
+        self.status_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.fps_label = QLabel("0.0 fps")
         self.fps_label.setMinimumWidth(80)
 
@@ -2473,6 +2477,7 @@ class MainWindow(QMainWindow):
         self._worker.log_line.connect(self._on_log)
         self._worker.progress_update.connect(self._on_global_progress)
         self._worker.batch_progress_update.connect(self._on_batch_progress)
+        self._worker.queue_status_update.connect(self._on_queue_status_update)
         self._worker.finished.connect(self._on_finished)
         self._worker.started_signal.connect(lambda: self._set_running(True))
 
@@ -3188,6 +3193,10 @@ class MainWindow(QMainWindow):
 
     def _reset_progress_bars(self) -> None:
         self.fps_label.setText("0.0 fps")
+        self._active_file_status = ""
+        self._progress_status = ""
+        self._batch_status = ""
+        self.status_label.setToolTip("")
         self.status_label.setText("Ready")
 
     def _format_seconds(self, seconds: float) -> str:
@@ -3207,17 +3216,38 @@ class MainWindow(QMainWindow):
             if elapsed > 0:
                 fps_text = f"{(cur / elapsed):.1f} fps"
         self.fps_label.setText(fps_text)
-        self.status_label.setText(
-            f"Processing {cur}/{tot}  |  {self._format_seconds(elapsed)} elapsed  |  {eta_text}"
+        self._progress_status = (
+            f"Frames {cur}/{tot}  |  {self._format_seconds(elapsed)} elapsed  |  {eta_text}"
         )
+        self._refresh_status_label()
 
     def _on_batch_progress(self, cur: int, tot: int) -> None:
         if tot <= 0:
             return
-        self.status_label.setText(
-            self.status_label.text().split("  |  batch")[0]
-            + f"  |  batch {cur}/{tot}"
-        )
+        self._batch_status = f"Batch {cur}/{tot}"
+        self._refresh_status_label()
+
+    def _on_queue_status_update(
+        self, file_path: str, current: int, total: int, done: int, remaining: int
+    ) -> None:
+        if total > 0 and file_path:
+            self._active_file_status = (
+                f"Processing: {file_path} | File {current} of {total} "
+                f"[Done: {done}, Remaining: {remaining}]"
+            )
+        else:
+            self._active_file_status = ""
+        self._progress_status = ""
+        self._batch_status = ""
+        self._refresh_status_label()
+
+    def _refresh_status_label(self) -> None:
+        parts = [part for part in (self._active_file_status, self._progress_status) if part]
+        text = "  |  ".join(parts) if parts else "Ready"
+        if self._batch_status:
+            text = f"{text}  |  {self._batch_status}" if text else self._batch_status
+        self.status_label.setText(text)
+        self.status_label.setToolTip(self._active_file_status or text if text != "Ready" else "")
 
     def _set_latest_output_path(self, path: Optional[Path]) -> None:
         self._latest_output_path = path
@@ -3252,8 +3282,12 @@ class MainWindow(QMainWindow):
         was_preview = self._is_preview_run
         self._set_running(False)
         self._run_started_at = None
+        self._active_file_status = ""
+        self._progress_status = ""
+        self._batch_status = ""
         if success:
             self.status_label.setText(f"✅  {msg}")
+            self.status_label.setToolTip(msg)
             self._try_auto_load_output()
             # After a Preview run, automatically switch to Split View for comparison
             if was_preview and _MULTIMEDIA_AVAILABLE:
@@ -3276,6 +3310,7 @@ class MainWindow(QMainWindow):
                 self._on_mode_button(2, True)
         else:
             self.status_label.setText(f"⚠  {msg}")
+            self.status_label.setToolTip(msg)
         self._is_preview_run = False
         # Reset video-mode preview flag AFTER _on_mode_button has had a chance to read it.
         self._is_preview_video_mode = False

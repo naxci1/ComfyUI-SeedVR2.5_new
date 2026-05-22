@@ -47,6 +47,7 @@ Model Support:
 import sys
 import os
 import gc
+import json
 import argparse
 import time
 import platform
@@ -551,222 +552,240 @@ def process_single_file(input_path: str, args: "argparse.Namespace", device_list
     Returns:
         Number of frames written to output
     """
-    input_type = get_input_type(input_path)
-    
-    if input_type == "unknown":
-        debug.log(f"Skipping unsupported file: {input_path}", level="WARNING", category="file", force=True)
-        return 0
-    
-    debug.log(f"Processing {input_type}: {Path(input_path).name}", category="generation", force=True)
-    
-    # Generate or validate output path
-    if output_path is None:
-        output_path = generate_output_path(input_path, args.output_format, input_type=input_type)
-    elif not Path(output_path).suffix or (args.output_format == "png" and input_type != "image"):
-        # No extension or PNG sequence → treat as directory, generate filename
-        output_path = generate_output_path(input_path, args.output_format, 
-                                         output_dir=output_path, input_type=input_type)
-    else:
-        output_path = str(ensure_unique_output_path(output_path).resolve())
-    
-    # Guard: image inputs must never write to a video-extension path (OpenCV imwrite crash)
-    if input_type == "image" and Path(output_path).suffix.lower() not in _IMAGE_OUTPUT_EXTS:
-        output_path = str(Path(output_path).with_suffix(".png").resolve())
+    cap: Optional[cv2.VideoCapture] = None
+    video_writer: Optional[cv2.VideoWriter] = None
+    frames_tensor: Optional[torch.Tensor] = None
+    result: Optional[torch.Tensor] = None
 
-    # Guard: video/directory inputs must never write to an image-extension path when the
-    # requested output format is a video container.  This fixes the BrokenPipeError that
-    # occurs when FFmpeg is told to write ProRes/H.265/etc. into a path ending with .png,
-    # .jpg, or another image suffix (e.g. GUI preview paths like preview_frame_001.png).
-    if input_type in ("video", "directory") and args.output_format not in ("png",):
-        fmt_lower = (args.output_format or "mp4").lower()
-        correct_ext = _VIDEO_CONTAINER_EXTS.get(fmt_lower, f".{fmt_lower}")
-        if Path(output_path).suffix.lower() in _IMAGE_OUTPUT_EXTS:
-            output_path = str(Path(output_path).with_suffix(correct_ext).resolve())
-            debug.log(
-                f"Output path extension corrected to '{correct_ext}' to match "
-                f"container '{args.output_format}' (was an image extension)",
-                category="info", force=True, indent_level=1
-            )
-
-    # Show format with auto-detection indicator
-    format_prefix = "Auto-detected" if format_auto_detected else "Requested"
-    debug.log(f"{format_prefix} output format: {args.output_format}", category="info", force=True, indent_level=1)
-    
-    # === VIDEO PROCESSING ===
-    if input_type == "video":
-        if not os.path.exists(input_path):
-            raise FileNotFoundError(f"Video file not found: {input_path}")
+    try:
+        input_type = get_input_type(input_path)
         
-        cap = cv2.VideoCapture(input_path)
-        if not cap.isOpened():
-            raise ValueError(f"Cannot open video file: {input_path}")
-        
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        
-        debug.log(f"Video info: {total_frames} frames, {width}x{height}, {fps:.2f} FPS", category="info")
-        
-       # Skip initial frames
-        if args.skip_first_frames > 0:
-            debug.log(f"Skipping first {args.skip_first_frames} frames", category="info")
-            cap.set(cv2.CAP_PROP_POS_FRAMES, args.skip_first_frames)
-        
-        # Calculate frames to process (apply load_cap if set)
-        frames_to_process = total_frames - args.skip_first_frames
-        if args.load_cap > 0:
-            frames_to_process = min(frames_to_process, args.load_cap)
-        
-        # Early exit for empty/exhausted video
-        if frames_to_process <= 0:
-            debug.log(f"No frames to process after skipping {args.skip_first_frames} of {total_frames}", 
-                     level="WARNING", category="file", force=True)
-            cap.release()
+        if input_type == "unknown":
+            debug.log(f"Skipping unsupported file: {input_path}", level="WARNING", category="file", force=True)
             return 0
-
-        # --- Pre-downscale & X-Times resolution math ---
-        ds_factor = getattr(args, "pre_downscale", 1) or 1
-        if ds_factor > 1:
-            debug.log(
-                f"Pre-Downscale {ds_factor}:1 → processing baseline: "
-                f"{width // ds_factor}×{height // ds_factor} px",
-                category="info", force=True, indent_level=1,
-            )
-        args.resolution = _resolve_effective_resolution(args, width, height)
-        debug.log(f"Effective target resolution: {args.resolution} px (short side)", category="info", force=True, indent_level=1)
         
-        # Streaming mode: process in chunks
-        chunk_size = args.chunk_size if args.chunk_size > 0 else frames_to_process
-        streaming = args.chunk_size > 0
-        total_chunks = (frames_to_process + chunk_size - 1) // chunk_size  # ceiling division
+        debug.log(f"Processing {input_type}: {Path(input_path).name}", category="generation", force=True)
         
-        if streaming:
-            debug.log(f"Streaming mode: chunks of {chunk_size} frames, overlap={args.temporal_overlap}", 
-                     category="info", force=True, indent_level=1)
-        
-        # Image sequences: detect by format extension, not just "png"
-        _image_seq_exts = {"png", "tif", "tiff", "jpg", "jpeg", "dpx", "exr"}
-        is_png = (args.output_format or "").lower() in _image_seq_exts
-        video_writer = None
-        overlap = args.temporal_overlap
-        frames_written = 0
-        chunk_idx = 0
-        base_name = Path(input_path).stem
-        
-        # Extract custom ffmpeg video args if supplied
-        custom_video_args: Optional[List[str]] = getattr(args, "ffmpeg_video_args", None) or None
-        
-        # Multi-GPU: workers stream their own segments
-        if len(device_list) > 1:
-            cap.release()  # Workers will reopen
-            video_info = {
-                'video_path': input_path,
-                'start_frame': args.skip_first_frames,
-                'frames_to_process': frames_to_process,
-            }
-            result = _gpu_processing(None, device_list, args, video_info=video_info)
-            # NOTE: Lanczos downscale is now applied to INPUT frames inside
-            # _stream_video_chunks (called by each GPU worker), so no post-processing
-            # downscale is needed here.
-
-            # Save result
-            if is_png:
-                save_frames_to_image(result, output_path, base_name,
-                                     image_format=args.output_format)
-            else:
-                video_writer = save_frames_to_video(result, output_path, fps,
-                    video_backend=args.video_backend, use_10bit=args.use_10bit,
-                    custom_video_args=custom_video_args)
-                if video_writer is not None:
-                    video_writer.release()
-
-            frames_written = result.shape[0]
-
-        # Single GPU: stream in main process
+        # Generate or validate output path
+        if output_path is None:
+            output_path = generate_output_path(input_path, args.output_format, input_type=input_type)
+        elif not Path(output_path).suffix or (args.output_format == "png" and input_type != "image"):
+            # No extension or PNG sequence → treat as directory, generate filename
+            output_path = generate_output_path(input_path, args.output_format, 
+                                             output_dir=output_path, input_type=input_type)
         else:
-            chunk_count = 0
-            for result in _stream_video_chunks(
-                cap=cap,
-                frames_to_process=frames_to_process,
-                chunk_size=chunk_size,
-                overlap=overlap,
-                args=args,
-                device_id=device_list[0],
-                debug=debug,
-                runner_cache=runner_cache,
-                log_progress=streaming,
-                total_chunks=total_chunks,
-                cleanup_timer_name="chunk_cleanup"
-            ):
-                chunk_count += 1
-                # NOTE: Lanczos downscale is applied to input frames inside
-                # _stream_video_chunks, so the result here is already at the
-                # correct (upscaled) resolution.
-                # Save output
+            output_path = str(ensure_unique_output_path(output_path).resolve())
+        
+        # Guard: image inputs must never write to a video-extension path (OpenCV imwrite crash)
+        if input_type == "image" and Path(output_path).suffix.lower() not in _IMAGE_OUTPUT_EXTS:
+            output_path = str(Path(output_path).with_suffix(".png").resolve())
+
+        # Guard: video/directory inputs must never write to an image-extension path when the
+        # requested output format is a video container.  This fixes the BrokenPipeError that
+        # occurs when FFmpeg is told to write ProRes/H.265/etc. into a path ending with .png,
+        # .jpg, or another image suffix (e.g. GUI preview paths like preview_frame_001.png).
+        if input_type in ("video", "directory") and args.output_format not in ("png",):
+            fmt_lower = (args.output_format or "mp4").lower()
+            correct_ext = _VIDEO_CONTAINER_EXTS.get(fmt_lower, f".{fmt_lower}")
+            if Path(output_path).suffix.lower() in _IMAGE_OUTPUT_EXTS:
+                output_path = str(Path(output_path).with_suffix(correct_ext).resolve())
+                debug.log(
+                    f"Output path extension corrected to '{correct_ext}' to match "
+                    f"container '{args.output_format}' (was an image extension)",
+                    category="info", force=True, indent_level=1
+                )
+    
+        # Show format with auto-detection indicator
+        format_prefix = "Auto-detected" if format_auto_detected else "Requested"
+        debug.log(f"{format_prefix} output format: {args.output_format}", category="info", force=True, indent_level=1)
+        
+        # === VIDEO PROCESSING ===
+        if input_type == "video":
+            if not os.path.exists(input_path):
+                raise FileNotFoundError(f"Video file not found: {input_path}")
+            
+            cap = cv2.VideoCapture(input_path)
+            if not cap.isOpened():
+                raise ValueError(f"Cannot open video file: {input_path}")
+            
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            
+            debug.log(f"Video info: {total_frames} frames, {width}x{height}, {fps:.2f} FPS", category="info")
+            
+           # Skip initial frames
+            if args.skip_first_frames > 0:
+                debug.log(f"Skipping first {args.skip_first_frames} frames", category="info")
+                cap.set(cv2.CAP_PROP_POS_FRAMES, args.skip_first_frames)
+            
+            # Calculate frames to process (apply load_cap if set)
+            frames_to_process = total_frames - args.skip_first_frames
+            if args.load_cap > 0:
+                frames_to_process = min(frames_to_process, args.load_cap)
+            
+            # Early exit for empty/exhausted video
+            if frames_to_process <= 0:
+                debug.log(f"No frames to process after skipping {args.skip_first_frames} of {total_frames}", 
+                         level="WARNING", category="file", force=True)
+                return 0
+
+            # --- Pre-downscale & X-Times resolution math ---
+            ds_factor = getattr(args, "pre_downscale", 1) or 1
+            if ds_factor > 1:
+                debug.log(
+                    f"Pre-Downscale {ds_factor}:1 → processing baseline: "
+                    f"{width // ds_factor}×{height // ds_factor} px",
+                    category="info", force=True, indent_level=1,
+                )
+            args.resolution = _resolve_effective_resolution(args, width, height)
+            debug.log(f"Effective target resolution: {args.resolution} px (short side)", category="info", force=True, indent_level=1)
+            
+            # Streaming mode: process in chunks
+            chunk_size = args.chunk_size if args.chunk_size > 0 else frames_to_process
+            streaming = args.chunk_size > 0
+            total_chunks = (frames_to_process + chunk_size - 1) // chunk_size  # ceiling division
+            
+            if streaming:
+                debug.log(f"Streaming mode: chunks of {chunk_size} frames, overlap={args.temporal_overlap}", 
+                         category="info", force=True, indent_level=1)
+            
+            # Image sequences: detect by format extension, not just "png"
+            _image_seq_exts = {"png", "tif", "tiff", "jpg", "jpeg", "dpx", "exr"}
+            is_png = (args.output_format or "").lower() in _image_seq_exts
+            overlap = args.temporal_overlap
+            frames_written = 0
+            chunk_idx = 0
+            base_name = Path(input_path).stem
+            
+            # Extract custom ffmpeg video args if supplied
+            custom_video_args: Optional[List[str]] = getattr(args, "ffmpeg_video_args", None) or None
+            
+            # Multi-GPU: workers stream their own segments
+            if len(device_list) > 1:
+                cap.release()
+                cap = None
+                video_info = {
+                    'video_path': input_path,
+                    'start_frame': args.skip_first_frames,
+                    'frames_to_process': frames_to_process,
+                }
+                result = _gpu_processing(None, device_list, args, video_info=video_info)
+                # NOTE: Lanczos downscale is now applied to INPUT frames inside
+                # _stream_video_chunks (called by each GPU worker), so no post-processing
+                # downscale is needed here.
+
+                # Save result
                 if is_png:
                     save_frames_to_image(result, output_path, base_name,
-                                         start_index=frames_written,
                                          image_format=args.output_format)
                 else:
-                    video_writer = save_frames_to_video(result, output_path, fps, writer=video_writer,
+                    video_writer = save_frames_to_video(result, output_path, fps,
                         video_backend=args.video_backend, use_10bit=args.use_10bit,
                         custom_video_args=custom_video_args)
 
-                frames_written += result.shape[0]
-                del result
+                frames_written = result.shape[0]
 
-            chunk_idx = chunk_count
-            cap.release()
-            if video_writer is not None:
-                video_writer.release()
-        
-        if streaming:
-            debug.log("", category="none", force=True)
-            if len(device_list) > 1:
-                debug.log(f"Streaming complete: {frames_written} frames across {len(device_list)} GPUs", category="success", force=True)
+            # Single GPU: stream in main process
             else:
-                debug.log(f"Streaming complete: {frames_written} frames in {chunk_idx} chunks", category="success", force=True)
-        
-        debug.log(f"Output saved to: {output_path}", category="file", force=True)
-        return frames_written
-    
-    # === IMAGE PROCESSING ===
-    frames_tensor, _ = extract_frames_from_image(input_path)
+                chunk_count = 0
+                for result in _stream_video_chunks(
+                    cap=cap,
+                    frames_to_process=frames_to_process,
+                    chunk_size=chunk_size,
+                    overlap=overlap,
+                    args=args,
+                    device_id=device_list[0],
+                    debug=debug,
+                    runner_cache=runner_cache,
+                    log_progress=streaming,
+                    total_chunks=total_chunks,
+                    cleanup_timer_name="chunk_cleanup"
+                ):
+                    chunk_count += 1
+                    # NOTE: Lanczos downscale is applied to input frames inside
+                    # _stream_video_chunks, so the result here is already at the
+                    # correct (upscaled) resolution.
+                    # Save output
+                    if is_png:
+                        save_frames_to_image(result, output_path, base_name,
+                                             start_index=frames_written,
+                                             image_format=args.output_format)
+                    else:
+                        video_writer = save_frames_to_video(result, output_path, fps, writer=video_writer,
+                            video_backend=args.video_backend, use_10bit=args.use_10bit,
+                            custom_video_args=custom_video_args)
 
-    # Apply pre-downscale Lanczos to input image and resolve effective resolution
-    img_ds_factor = getattr(args, "pre_downscale", 1) or 1
-    _, img_h, img_w, _ = frames_tensor.shape
-    args.resolution = _resolve_effective_resolution(args, img_w, img_h)
-    if img_ds_factor > 1:
+                    frames_written += result.shape[0]
+                    del result
+                    result = None
+
+                chunk_idx = chunk_count
+            
+            if streaming:
+                debug.log("", category="none", force=True)
+                if len(device_list) > 1:
+                    debug.log(f"Streaming complete: {frames_written} frames across {len(device_list)} GPUs", category="success", force=True)
+                else:
+                    debug.log(f"Streaming complete: {frames_written} frames in {chunk_idx} chunks", category="success", force=True)
+            
+            debug.log(f"Output saved to: {output_path}", category="file", force=True)
+            return frames_written
+        
+        # === IMAGE PROCESSING ===
+        frames_tensor, _ = extract_frames_from_image(input_path)
+
+        # Apply pre-downscale Lanczos to input image and resolve effective resolution
+        img_ds_factor = getattr(args, "pre_downscale", 1) or 1
+        _, img_h, img_w, _ = frames_tensor.shape
+        args.resolution = _resolve_effective_resolution(args, img_w, img_h)
+        if img_ds_factor > 1:
+            debug.log(
+                f"Pre-Downscale {img_ds_factor}:1 on image: "
+                f"{img_w}×{img_h} → {img_w // img_ds_factor}×{img_h // img_ds_factor} px",
+                category="info", force=True, indent_level=1,
+            )
+            frames_tensor = _apply_lanczos_downscale(
+                frames_tensor.to(torch.float32), img_ds_factor
+            ).to(torch.float16)
         debug.log(
-            f"Pre-Downscale {img_ds_factor}:1 on image: "
-            f"{img_w}×{img_h} → {img_w // img_ds_factor}×{img_h // img_ds_factor} px",
+            f"Effective target resolution: {args.resolution} px (short side)",
             category="info", force=True, indent_level=1,
         )
-        frames_tensor = _apply_lanczos_downscale(
-            frames_tensor.to(torch.float32), img_ds_factor
-        ).to(torch.float16)
-    debug.log(
-        f"Effective target resolution: {args.resolution} px (short side)",
-        category="info", force=True, indent_level=1,
-    )
 
-    processing_start = time.time()
-    # Process frames (multiprocessing only for multi-GPU)
-    if len(device_list) > 1:
-        result = _gpu_processing(frames_tensor, device_list, args)
-    else:
-        result = _single_gpu_direct_processing(frames_tensor, args, device_list[0], runner_cache)
-    debug.log(f"Processing time: {time.time() - processing_start:.2f}s", category="timing")
+        processing_start = time.time()
+        # Process frames (multiprocessing only for multi-GPU)
+        if len(device_list) > 1:
+            result = _gpu_processing(frames_tensor, device_list, args)
+        else:
+            result = _single_gpu_direct_processing(frames_tensor, args, device_list[0], runner_cache)
+        debug.log(f"Processing time: {time.time() - processing_start:.2f}s", category="timing")
 
-    # Save single image
-    os.makedirs(Path(output_path).parent, exist_ok=True)
-    frame_np = (result[0].cpu().numpy() * 255.0).astype(np.uint8)
-    _save_image_bgr(frame_np, output_path)
+        # Save single image
+        os.makedirs(Path(output_path).parent, exist_ok=True)
+        frame_np = (result[0].cpu().numpy() * 255.0).astype(np.uint8)
+        _save_image_bgr(frame_np, output_path)
+        del frame_np
 
-    debug.log(f"Output saved to: {output_path}", category="file", force=True)
-    return 1
+        debug.log(f"Output saved to: {output_path}", category="file", force=True)
+        return 1
+    finally:
+        try:
+            if cap is not None:
+                cap.release()
+        except Exception:
+            pass
+        try:
+            if video_writer is not None:
+                video_writer.release()
+        except Exception:
+            pass
+        if result is not None:
+            del result
+        if frames_tensor is not None:
+            del frames_tensor
+        _release_post_file_resources()
 
 
 def _read_frames_from_cap(cap: cv2.VideoCapture, max_frames: int) -> Optional[torch.Tensor]:
@@ -916,6 +935,30 @@ def _save_image_bgr(frame_np: np.ndarray, file_path: str) -> None:
     cv2.imwrite(file_path, frame_bgr)
 
 
+def _emit_gui_queue_status(file_path: str, current: int, total: int) -> None:
+    """Emit a machine-readable queue update for the GUI worker."""
+    payload = {
+        "file_path": file_path,
+        "current": current,
+        "total": total,
+        "done": max(0, current - 1),
+        "remaining": max(0, total - current),
+    }
+    print(f"__SEEDVR2_GUI_STATUS__|{json.dumps(payload, ensure_ascii=False)}", flush=True)
+
+
+def _release_post_file_resources() -> None:
+    """Force Python and CUDA cleanup between sequential files."""
+    gc.collect()
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            if hasattr(torch.cuda, "ipc_collect"):
+                torch.cuda.ipc_collect()
+    except Exception:
+        pass
+
+
 def save_frames_to_video(
     frames_tensor: torch.Tensor, 
     output_path: str, 
@@ -975,13 +1018,31 @@ def save_frames_to_video(
             if not writer.isOpened():
                 raise ValueError(f"Cannot create video writer for: {output_path}")
 
-    # Stream one frame at a time to avoid materialising the full tensor in RAM.
-    for i in range(T):
-        frame_np = (frames_tensor[i].cpu().numpy() * 255.0).astype(np.uint8)
-        frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
-        writer.write(frame_bgr)
-        if debug.enabled and (i + 1) % 100 == 0:
-            debug.log(f"Written {i + 1}/{T} frames", category="file")
+    micro_batch = max(1, min(8, T))
+
+    for start_idx in range(0, T, micro_batch):
+        end_idx = min(start_idx + micro_batch, T)
+        cpu_chunk = (
+            frames_tensor[start_idx:end_idx]
+            .detach()
+            .clamp(0.0, 1.0)
+            .mul(255.0)
+            .to(device="cpu", dtype=torch.uint8)
+            .contiguous()
+        )
+
+        for offset in range(cpu_chunk.shape[0]):
+            frame_np = cpu_chunk[offset].numpy()
+            frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
+            writer.write(frame_bgr)
+            del frame_np, frame_bgr
+
+        if debug.enabled:
+            debug.log(f"Written {end_idx}/{T} frames", category="file")
+
+        del cpu_chunk
+        if frames_tensor.is_cuda and ((end_idx % 64 == 0) or end_idx == T):
+            torch.cuda.empty_cache()
 
     return writer  # Caller always closes
 
@@ -1878,7 +1939,13 @@ def main() -> None:
                     debug.log("━" * 60, category="none", force=True)
                     debug.log("", category="none", force=True)
                 
-                debug.log(f"Processing file {idx}/{len(media_files)}", category="generation", force=True)
+                total_files = len(media_files)
+                _emit_gui_queue_status(file_path, idx, total_files)
+                debug.log(
+                    f"Processing: {file_path} | File {idx} of {total_files} "
+                    f"[Done: {idx - 1}, Remaining: {total_files - idx}]",
+                    category="generation", force=True
+                )
                 
                 # Auto-detect format per file if not user-specified
                 if format_auto_detected:
@@ -1900,16 +1967,7 @@ def main() -> None:
                                             format_auto_detected=format_auto_detected,
                                             runner_cache=runner_cache)
                 total_frames_processed += frames
-                
-                # Release memory between files to prevent RAM accumulation.
-                gc.collect()
-                try:
-                    import torch as _torch
-                    if _torch.cuda.is_available():
-                        _torch.cuda.empty_cache()
-                        _torch.cuda.ipc_collect()
-                except Exception:
-                    pass
+                _release_post_file_resources()
                 
                 # Restore original format
                 args.output_format = original_format

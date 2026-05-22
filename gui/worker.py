@@ -11,6 +11,7 @@ import subprocess
 import os
 import sys
 import signal
+import json
 from pathlib import Path
 from typing import List, Optional
 
@@ -108,6 +109,7 @@ class InferenceWorker(QObject):
     # batch_progress_update → per-batch progress (batch token)
     progress_update = pyqtSignal(int, int)
     batch_progress_update = pyqtSignal(int, int)
+    queue_status_update = pyqtSignal(str, int, int, int, int)
     finished = pyqtSignal(bool, str)
     started_signal = pyqtSignal()
 
@@ -116,6 +118,7 @@ class InferenceWorker(QObject):
     # "batch N/M" / "frame N/M" / "chunk N/M" → overall batches → total bar (outer)
     _BATCH_TOKENS = ("step ", "steps: ", "steps ")
     _GLOBAL_TOKENS = ("batch ", "frame ", "chunk ")
+    _QUEUE_STATUS_PREFIX = "__SEEDVR2_GUI_STATUS__|"
 
     def __init__(
         self,
@@ -147,10 +150,19 @@ class InferenceWorker(QObject):
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONLEGACYWINDOWSFSENCODING"] = "1"
         # Blackwell / performance environment variables
-        env["PYTORCH_ALLOC_CONF"] = "backend:cudaMallocAsync"
-        env["CUDA_MODULE_LOADING"] = "LAZY"
-        env["NVIDIA_TF32_OVERRIDE"] = "1"
-        env["ATTENTION_BACKEND"] = "sageattention"
+        runtime_env = {
+            "PYTORCH_ALLOC_CONF": "backend:cudaMallocAsync,max_split_size_mb:256,garbage_collection_threshold:0.6",
+            "TORCH_CUDNN_BENCHMARK": "1",
+            "CUDA_MODULE_LOADING": "LAZY",
+            "TORCH_CUDNN_V8_API_ENABLED": "1",
+            "PYTORCH_NO_CUDA_MEMORY_CACHING": "0",
+            "CUDA_CACHE_MAXSIZE": "4294967296",
+            "NVIDIA_TF32_OVERRIDE": "1",
+            "ATTENTION_BACKEND": "sageattention",
+        }
+        for key, value in runtime_env.items():
+            os.environ[key] = value
+            env[key] = value
         if self._env:
             env.update(self._env)
 
@@ -200,6 +212,20 @@ class InferenceWorker(QObject):
                 break
 
             line = raw_line.rstrip("\n")
+            if line.startswith(self._QUEUE_STATUS_PREFIX):
+                try:
+                    payload = json.loads(line[len(self._QUEUE_STATUS_PREFIX):])
+                    self.queue_status_update.emit(
+                        str(payload.get("file_path", "")),
+                        int(payload.get("current", 0)),
+                        int(payload.get("total", 0)),
+                        int(payload.get("done", 0)),
+                        int(payload.get("remaining", 0)),
+                    )
+                except Exception:
+                    self.log_line.emit(line)
+                continue
+
             self.log_line.emit(line)
 
             # ── Parse progress tokens ───────────────────────────────────
