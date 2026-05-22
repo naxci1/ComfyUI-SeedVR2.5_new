@@ -46,6 +46,7 @@ Model Support:
 # Standard library imports
 import sys
 import os
+import gc
 import argparse
 import time
 import platform
@@ -947,8 +948,7 @@ def save_frames_to_video(
     Raises:
         ValueError: If video writer cannot be initialized
     """
-    frames_np = (frames_tensor.cpu().numpy() * 255.0).astype(np.uint8)
-    T, H, W, C = frames_np.shape
+    T, H, W, C = frames_tensor.shape
 
     effective_backend = video_backend if video_backend in ("ffmpeg", "opencv") else "ffmpeg"
 
@@ -975,8 +975,10 @@ def save_frames_to_video(
             if not writer.isOpened():
                 raise ValueError(f"Cannot create video writer for: {output_path}")
 
-    for i, frame in enumerate(frames_np):
-        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    # Stream one frame at a time to avoid materialising the full tensor in RAM.
+    for i in range(T):
+        frame_np = (frames_tensor[i].cpu().numpy() * 255.0).astype(np.uint8)
+        frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
         writer.write(frame_bgr)
         if debug.enabled and (i + 1) % 100 == 0:
             debug.log(f"Written {i + 1}/{T} frames", category="file")
@@ -1898,6 +1900,16 @@ def main() -> None:
                                             format_auto_detected=format_auto_detected,
                                             runner_cache=runner_cache)
                 total_frames_processed += frames
+                
+                # Release memory between files to prevent RAM accumulation.
+                gc.collect()
+                try:
+                    import torch as _torch
+                    if _torch.cuda.is_available():
+                        _torch.cuda.empty_cache()
+                        _torch.cuda.ipc_collect()
+                except Exception:
+                    pass
                 
                 # Restore original format
                 args.output_format = original_format
