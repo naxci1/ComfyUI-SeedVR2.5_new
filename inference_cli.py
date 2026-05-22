@@ -689,6 +689,9 @@ def process_single_file(input_path: str, args: "argparse.Namespace", device_list
                         custom_video_args=custom_video_args)
 
                 frames_written = result.shape[0]
+                del result
+                result = None
+                _strict_batch_flush()
 
             # Single GPU: stream in main process
             else:
@@ -707,21 +710,24 @@ def process_single_file(input_path: str, args: "argparse.Namespace", device_list
                     cleanup_timer_name="chunk_cleanup"
                 ):
                     chunk_count += 1
+                    batch_result = result
                     # NOTE: Lanczos downscale is applied to input frames inside
                     # _stream_video_chunks, so the result here is already at the
                     # correct (upscaled) resolution.
                     # Save output
                     if is_png:
-                        save_frames_to_image(result, output_path, base_name,
+                        save_frames_to_image(batch_result, output_path, base_name,
                                              start_index=frames_written,
                                              image_format=args.output_format)
                     else:
-                        video_writer = save_frames_to_video(result, output_path, fps, writer=video_writer,
+                        video_writer = save_frames_to_video(batch_result, output_path, fps, writer=video_writer,
                             video_backend=args.video_backend, use_10bit=args.use_10bit,
                             custom_video_args=custom_video_args)
 
-                    frames_written += result.shape[0]
+                    frames_written += batch_result.shape[0]
                     del result
+                    del batch_result
+                    _strict_batch_flush()
                     result = None
 
                 chunk_idx = chunk_count
@@ -917,10 +923,12 @@ def _stream_video_chunks(
         del frames
 
         yield result
+        del result
 
         # Memory cleanup between chunks
         if streaming:
             clear_memory(debug=debug, deep=True, force=True, timer_name=cleanup_timer_name)
+        _strict_batch_flush()
 
 
 def _save_image_bgr(frame_np: np.ndarray, file_path: str) -> None:
@@ -938,7 +946,12 @@ def _save_image_bgr(frame_np: np.ndarray, file_path: str) -> None:
     cv2.imwrite(file_path, frame_bgr)
 
 
-def _emit_gui_queue_status(file_path: str, current: int, total: int) -> None:
+def _emit_gui_queue_status(
+    file_path: str,
+    current: int,
+    total: int,
+    remaining_frames_queue: int = 0
+) -> None:
     """Emit a machine-readable queue update for the GUI worker."""
     payload = {
         "file_path": file_path,
@@ -946,12 +959,40 @@ def _emit_gui_queue_status(file_path: str, current: int, total: int) -> None:
         "total": total,
         "done": max(0, current - 1),
         "remaining": max(0, total - current),
+        "remaining_frames_queue": max(0, int(remaining_frames_queue)),
     }
     print(f"__SEEDVR2_GUI_STATUS__|{json.dumps(payload, ensure_ascii=False)}", flush=True)
 
 
-def _release_post_file_resources() -> None:
-    """Force Python and CUDA cleanup between sequential files."""
+def _estimate_total_frames_for_input(file_path: str) -> int:
+    """Best-effort frame-count estimate for queue-time remaining-frame calculations."""
+    file_type = get_input_type(file_path)
+    if file_type == "image":
+        return 1
+    if file_type != "video":
+        return 0
+
+    cap: Optional[cv2.VideoCapture] = None
+    try:
+        cap = cv2.VideoCapture(file_path)
+        if not cap.isOpened():
+            return 0
+        return max(0, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+    except Exception:
+        return 0
+    finally:
+        try:
+            if cap is not None:
+                cap.release()
+        except Exception:
+            pass
+
+
+def _strict_batch_flush(*objs: Any) -> None:
+    """
+    Aggressive per-batch memory cleanup for baseline-flat RAM/VRAM usage.
+    """
+    del objs
     gc.collect()
     try:
         if torch.cuda.is_available():
@@ -960,6 +1001,11 @@ def _release_post_file_resources() -> None:
                 torch.cuda.ipc_collect()
     except Exception:
         pass
+
+
+def _release_post_file_resources() -> None:
+    """Force Python and CUDA cleanup between sequential files."""
+    _strict_batch_flush()
 
 
 def save_frames_to_video(
@@ -1021,35 +1067,27 @@ def save_frames_to_video(
             if not writer.isOpened():
                 raise ValueError(f"Cannot create video writer for: {output_path}")
 
-    gc_interval = 32
+    frames_cpu_uint8 = (
+        frames_tensor
+        .detach()
+        .clamp(0.0, 1.0)
+        .mul(255.0)
+        .to(device="cpu", dtype=torch.uint8)
+        .contiguous()
+        .numpy()
+    )
 
-    for frame_idx in range(T):
-        frame_np = (
-            frames_tensor[frame_idx:frame_idx + 1]
-            .detach()
-            .clamp(0.0, 1.0)
-            .mul(255.0)
-            .to(device="cpu", dtype=torch.uint8)
-            .squeeze(0)
-            .contiguous()
-            .numpy()
-        )
-
-        if effective_backend == "ffmpeg":
-            frame_to_write = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
-        else:
-            frame_to_write = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
+    for frame_idx, frame_np in enumerate(frames_cpu_uint8):
+        frame_to_write = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
         writer.write(frame_to_write)
-        del frame_np, frame_to_write
+        del frame_to_write
 
         completed = frame_idx + 1
         if debug.enabled and ((completed % 32 == 0) or completed == T):
             debug.log(f"Written {completed}/{T} frames", category="file")
 
-        if (completed % gc_interval == 0) or completed == T:
-            gc.collect()
-            if frames_tensor.is_cuda:
-                torch.cuda.empty_cache()
+    del frames_cpu_uint8
+    _strict_batch_flush(frames_tensor)
 
     return writer  # Caller always closes
 
@@ -1104,9 +1142,12 @@ def save_frames_to_image(
         filename = f"{base_name}_{start_index + idx:0{digits}d}{ext}"
         file_path = os.path.join(output_dir, filename)
         _save_image_bgr(frame, file_path)
+        del frame
         if debug.enabled and (idx + 1) % 100 == 0:
             debug.log(f"Saved {idx + 1}/{total} images", category="file")
 
+    del frames_np
+    _strict_batch_flush(frames_tensor)
     debug.log(f"Saved {total} images to '{output_dir}'", category="success")
     return total
 
@@ -1925,6 +1966,7 @@ def main() -> None:
                 sys.exit(1)
             
             debug.log(f"Found {len(media_files)} media files to process", category="file", force=True)
+            queued_frame_estimates = [_estimate_total_frames_for_input(p) for p in media_files]
             
             # Multi-GPU caching requires streaming (workers cache within their chunk loops)
             if (args.cache_dit or args.cache_vae) and len(device_list) > 1 and args.chunk_size <= 0:
@@ -1947,7 +1989,8 @@ def main() -> None:
                     debug.log("", category="none", force=True)
                 
                 total_files = len(media_files)
-                _emit_gui_queue_status(file_path, idx, total_files)
+                remaining_frames_queue = sum(queued_frame_estimates[idx:])
+                _emit_gui_queue_status(file_path, idx, total_files, remaining_frames_queue)
                 debug.log(
                     f"Processing: {file_path} | File {idx} of {total_files} "
                     f"[Done: {idx - 1}, Remaining: {total_files - idx}]",

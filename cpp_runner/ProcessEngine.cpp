@@ -66,6 +66,8 @@ void ProcessEngine::startProcess(const QString &pythonExe,
     // Suppress expandable_segments allocator warnings via env as an extra
     // safety net (inference_cli.py also sets this via warnings.filterwarnings)
     env.insert(QStringLiteral("PYTHONWARNINGS"), QStringLiteral("ignore::UserWarning"));
+    env.insert(QStringLiteral("PYTHONUNBUFFERED"), QStringLiteral("1"));
+    env.insert(QStringLiteral("SEEDVR2_STRICT_MEMORY_FLUSH"), QStringLiteral("1"));
 
     // Blackwell / CUDA performance variables
     env.insert(QStringLiteral("PYTORCH_ALLOC_CONF"),
@@ -200,8 +202,9 @@ bool ProcessEngine::tryParseStatusToken(const QString &line)
     const int totalFrames   = obj.value(QLatin1String("total")).toInt(0);
     const int doneFiles     = obj.value(QLatin1String("done")).toInt(0);
     const int remainingFiles = obj.value(QLatin1String("remaining")).toInt(0);
+    const int remainingFramesQueue = obj.value(QLatin1String("remaining_frames_queue")).toInt(0);
 
-    emit fileProgressUpdated(filename, currentFrame, totalFrames, doneFiles, remainingFiles);
+    emit fileProgressUpdated(filename, currentFrame, totalFrames, doneFiles, remainingFiles, remainingFramesQueue);
     return true;
 }
 

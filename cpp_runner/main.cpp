@@ -36,6 +36,7 @@
 #include <QWidget>
 #include <QIcon>
 #include <QProcessEnvironment>
+#include <cmath>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Dark-mode QSS stylesheet
@@ -121,19 +122,26 @@ QPushButton#stopBtn:pressed { background-color: #660000; }
 QPushButton#stopBtn:disabled { background-color: #3D1111; color: #7A4444; }
 
 QProgressBar {
-    background-color: #2A2D32;
-    border: 1px solid #3A3E45;
-    border-radius: 8px;
+    background-color: #262626;
+    border: 1px solid #3C4D58;
+    border-radius: 6px;
     text-align: center;
     color: #E3E4E6;
     font-size: 11px;
     height: 22px;
+    padding: 1px;
 }
 QProgressBar::chunk {
-    background-color: qlineargradient(
+    background: qlineargradient(
         x1:0, y1:0, x2:1, y2:0,
-        stop:0 #0044BB, stop:1 #0088FF);
-    border-radius: 7px;
+        stop:0 #00B4DB, stop:1 #0083B0);
+    border-radius: 6px;
+    border: 1px solid #5BDCFF;
+}
+QProgressBar#fileProgressBar, QProgressBar#queueProgressBar {
+    background-color: #262626;
+    border: 1px solid #3B5260;
+    border-radius: 6px;
 }
 
 QLabel#progressLabel {
@@ -236,7 +244,7 @@ private slots:
     void onStopClicked();
     void onLogLine(const QString &line);
     void onFileProgress(const QString &filename, int current, int total,
-                        int doneFiles, int remainingFiles);
+                        int doneFiles, int remainingFiles, int remainingFramesQueue);
     void onBatchProgress(int current, int total);
     void onFinished(bool success, const QString &message);
 
@@ -274,6 +282,9 @@ private:
     double         m_fps             = 1.8;
     int            m_totalQueueFiles = 0;
     int            m_lastFileTotalFrames = 0;
+    double         m_fileRemainEmaSeconds = -1.0;
+    double         m_queueRemainEmaSeconds = -1.0;
+    static constexpr double kEmaAlpha = 0.18;
 };
 
 // ── Constructor ───────────────────────────────────────────────────────────────
@@ -284,6 +295,9 @@ MainWindow::MainWindow(QWidget *parent)
 {
     setWindowTitle(QStringLiteral("SeedVR2 Runner"));
     setMinimumSize(820, 680);
+    if (qApp) {
+        qApp->setStyleSheet(QString::fromLatin1(k_stylesheet));
+    }
     buildUi();
     loadSettings();
 
@@ -389,6 +403,7 @@ void MainWindow::buildUi()
     m_fileLabel = new QLabel(QStringLiteral("Current File: — | Remaining: --:--:-- | Frames: 0/0"), progressGroup);
     m_fileLabel->setObjectName(QStringLiteral("progressLabel"));
     m_fileBar   = new QProgressBar(progressGroup);
+    m_fileBar->setObjectName(QStringLiteral("fileProgressBar"));
     m_fileBar->setRange(0, 100);
     m_fileBar->setValue(0);
     m_fileBar->setTextVisible(false);
@@ -400,6 +415,7 @@ void MainWindow::buildUi()
         progressGroup);
     m_queueLabel->setObjectName(QStringLiteral("progressLabel"));
     m_queueBar   = new QProgressBar(progressGroup);
+    m_queueBar->setObjectName(QStringLiteral("queueProgressBar"));
     m_queueBar->setRange(0, 100);
     m_queueBar->setValue(0);
     m_queueBar->setTextVisible(false);
@@ -447,6 +463,8 @@ void MainWindow::onStartClicked()
     m_fps = m_fpsSpin->value();
     m_totalQueueFiles  = 0;
     m_lastFileTotalFrames = 0;
+    m_fileRemainEmaSeconds = -1.0;
+    m_queueRemainEmaSeconds = -1.0;
 
     // Reset progress bars
     m_fileBar->setValue(0);
@@ -484,7 +502,7 @@ void MainWindow::onLogLine(const QString &line)
 
 void MainWindow::onFileProgress(const QString &filename,
                                 int current, int total,
-                                int doneFiles, int remainingFiles)
+                                int doneFiles, int remainingFiles, int remainingFramesQueue)
 {
     m_lastFileTotalFrames = (total > 0) ? total : m_lastFileTotalFrames;
 
@@ -492,15 +510,20 @@ void MainWindow::onFileProgress(const QString &filename,
     const int filePercent = (total > 0) ? qBound(0, current * 100 / total, 100) : 0;
     m_fileBar->setValue(filePercent);
 
-    const double fileRemainSec = (m_fps > 0.0 && total > current)
-                                 ? static_cast<double>(total - current) / m_fps
-                                 : 0.0;
+    const double rawFileRemainSec = (m_fps > 0.0 && total > current)
+                                    ? static_cast<double>(total - current) / m_fps
+                                    : 0.0;
+    if (m_fileRemainEmaSeconds < 0.0) {
+        m_fileRemainEmaSeconds = rawFileRemainSec;
+    } else {
+        m_fileRemainEmaSeconds = (kEmaAlpha * rawFileRemainSec) + ((1.0 - kEmaAlpha) * m_fileRemainEmaSeconds);
+    }
 
     const QString baseName = QFileInfo(filename).fileName();
     m_fileLabel->setText(
         QStringLiteral("Current File: %1 | Remaining: %2 | Frames: %3/%4")
             .arg(baseName.isEmpty() ? QStringLiteral("—") : baseName)
-            .arg(formatHMS(fileRemainSec))
+            .arg(formatHMS(m_fileRemainEmaSeconds))
             .arg(current)
             .arg(total));
 
@@ -515,16 +538,23 @@ void MainWindow::onFileProgress(const QString &filename,
                              : 0;
     m_queueBar->setValue(queuePercent);
 
-    // Estimate total queue remaining: remaining files × current file frame count + frames left in current file
-    const double queueRemainSec = (m_fps > 0.0)
-        ? static_cast<double>(remainingFiles * m_lastFileTotalFrames + qMax(0, total - current)) / m_fps
+    const int currentFileRemainingFrames = qMax(0, total - current);
+    const int upcomingRemainingFrames = qMax(0, remainingFramesQueue);
+    const int totalRemainingFrames = upcomingRemainingFrames + currentFileRemainingFrames;
+    const double rawQueueRemainSec = (m_fps > 0.0)
+        ? static_cast<double>(totalRemainingFrames) / m_fps
         : 0.0;
+    if (m_queueRemainEmaSeconds < 0.0) {
+        m_queueRemainEmaSeconds = rawQueueRemainSec;
+    } else {
+        m_queueRemainEmaSeconds = (kEmaAlpha * rawQueueRemainSec) + ((1.0 - kEmaAlpha) * m_queueRemainEmaSeconds);
+    }
 
     m_queueLabel->setText(
         QStringLiteral("Overall Batch Progress | Completed: %1/%2 | Estimated Total Time Left: %3")
             .arg(doneFiles)
             .arg(queueTotal)
-            .arg(formatHMS(queueRemainSec)));
+            .arg(formatHMS(m_queueRemainEmaSeconds)));
 }
 
 void MainWindow::onBatchProgress(int current, int total)
@@ -615,7 +645,6 @@ int main(int argc, char *argv[])
     app.setApplicationName(QStringLiteral("SeedVR2 Runner"));
     app.setOrganizationName(QStringLiteral("SeedVR2"));
     app.setApplicationVersion(QStringLiteral("2.5"));
-    app.setStyleSheet(QString::fromLatin1(k_stylesheet));
 
     MainWindow window;
     window.show();

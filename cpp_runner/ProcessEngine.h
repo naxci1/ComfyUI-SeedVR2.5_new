@@ -52,12 +52,14 @@ signals:
      * @param totalFrames   Total frames in the current file.
      * @param doneFiles     Number of files fully processed.
      * @param remainingFiles Number of files still queued (excluding current).
+     * @param remainingFramesQueue Total frames still pending in upcoming queue files.
      */
     void fileProgressUpdated(const QString &filename,
                              int currentFrame,
                              int totalFrames,
                              int doneFiles,
-                             int remainingFiles);
+                             int remainingFiles,
+                             int remainingFramesQueue);
 
     /** Emitted when a step/batch token is parsed (inner progress bar). */
     void batchProgressUpdated(int current, int total);
