@@ -116,7 +116,7 @@ else:
 # Heavy dependency imports after environment configuration
 import torch
 torch._inductor.config.triton.cudagraphs = False
-torch._config.cudagraphs = False
+torch._dynamo.config.suppress_errors = True
 import cv2
 import numpy as np
 import subprocess
