@@ -625,20 +625,6 @@ def _force_disable_cudagraphs_for_safe_mode(args: "argparse.Namespace", mode_lab
             indent_level=1,
         )
 
-    try:
-        if hasattr(torch, "_config") and hasattr(torch._config, "cudagraphs"):
-            torch._config.cudagraphs = False
-        elif hasattr(torch, "_dynamo") and hasattr(torch._dynamo, "config") and hasattr(torch._dynamo.config, "cudagraphs"):
-            torch._dynamo.config.cudagraphs = False
-    except Exception as e:
-        debug.log(
-            f"Could not disable global cudagraphs config: {e}",
-            level="WARNING",
-            category="setup",
-            force=True,
-            indent_level=1,
-        )
-
     if hasattr(args, "compile_dynamic") and not bool(getattr(args, "compile_dynamic", False)):
         args.compile_dynamic = True
         debug.log(
