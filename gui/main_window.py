@@ -58,7 +58,6 @@ from PyQt6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
-    QProgressBar,
     QScrollArea,
     QSizePolicy,
     QSlider,
@@ -702,7 +701,7 @@ class MainWindow(QMainWindow):
             pass
 
         super().__init__()
-        self.setWindowTitle("SeedVR2.5 GUI by HB2k v1.5b")
+        self.setWindowTitle("SeedVR2.5 GUI by HB2k v1.6b")
         self.resize(1100, 900)
 
         # Create settings window first – it loads saved paths in its __init__
@@ -744,8 +743,8 @@ class MainWindow(QMainWindow):
         self._advanced_mode_enabled: bool = False
         self._last_batch_cur: int = 0
         self._last_batch_tot: int = 0
+        self._frozen_elapsed_seconds: Optional[float] = None
         self._elapsed_timer = QTimer(self)
-        self._elapsed_timer.setInterval(1000)
         self._elapsed_timer.timeout.connect(self._update_elapsed_progress_ui)
         self._simple_defaults: dict[str, Any] = {
             "pre_downscale": "1:1",
@@ -814,7 +813,7 @@ class MainWindow(QMainWindow):
         header_layout.setContentsMargins(6, 2, 6, 6)
         header_layout.setSpacing(10)
 
-        help_btn = QPushButton("Help")
+        help_btn = QPushButton("About")
         help_btn.setFlat(True)
         help_btn.clicked.connect(self._show_about_dialog)
 
@@ -1220,14 +1219,15 @@ class MainWindow(QMainWindow):
         )
         f.addRow("Pre-Downscale:", self.pre_downscale_combo)
 
-        # --- Resolution Mode (X Times / Pixel) + value control ---
+        # --- Resolution Mode (X Times / Pixel / Standard) + value control ---
         _res_mode_row = QHBoxLayout()
         _res_mode_row.setSpacing(4)
         self.resolution_mode_combo = QComboBox()
-        self.resolution_mode_combo.addItems(["Pixel", "X Times"])
+        self.resolution_mode_combo.addItems(["Pixel", "X Times", "Standard"])
         self.resolution_mode_combo.setToolTip(
             "Pixel: target the output at an exact pixel height.\n"
-            "X Times: multiply the (pre-downscaled) input height by this factor."
+            "X Times: multiply the (pre-downscaled) input height by this factor.\n"
+            "Standard: choose from common resolution presets (480/720/1080/1440/2160)."
         )
         _res_mode_row.addWidget(self.resolution_mode_combo)
 
@@ -1242,14 +1242,20 @@ class MainWindow(QMainWindow):
         self.resolution_times_combo.addItems(["1x", "2x", "3x", "4x", "5x"])
         self.resolution_times_combo.setCurrentText("2x")
 
+        # Standard mode: named presets (numeric value is extracted for the CLI)
+        self.resolution_standard_combo = QComboBox()
+        self.resolution_standard_combo.addItems(["480", "720 (HD)", "1080 (FHD)", "1440 (2K)", "2160 (4K)"])
+        self.resolution_standard_combo.setCurrentText("720 (HD)")
+
         _res_mode_row.addWidget(self.resolution_spin, stretch=1)
         _res_mode_row.addWidget(self.resolution_times_combo, stretch=1)
+        _res_mode_row.addWidget(self.resolution_standard_combo, stretch=1)
 
         # Wire up visibility
         def _update_res_mode(text: str) -> None:
-            pixel = (text == "Pixel")
-            self.resolution_spin.setVisible(pixel)
-            self.resolution_times_combo.setVisible(not pixel)
+            self.resolution_spin.setVisible(text == "Pixel")
+            self.resolution_times_combo.setVisible(text == "X Times")
+            self.resolution_standard_combo.setVisible(text == "Standard")
 
         self.resolution_mode_combo.currentTextChanged.connect(_update_res_mode)
         _update_res_mode(self.resolution_mode_combo.currentText())
@@ -1340,6 +1346,7 @@ class MainWindow(QMainWindow):
 
         # Memory (BlockSwap)
         g, f = _make_group("Memory (BlockSwap)")
+        self._memory_blockswap_group = g
         self.blocks_to_swap_spin = QSpinBox()
         self.blocks_to_swap_spin.setRange(0, 36)
         self.blocks_to_swap_spin.setValue(0)
@@ -1385,6 +1392,7 @@ class MainWindow(QMainWindow):
 
         # Performance
         g, f = _make_group("Performance")
+        self._performance_group = g
         self.attention_mode_combo = QComboBox()
         self.attention_mode_combo.addItems([
             "sdpa", "flash_attn_2", "flash_attn_3", "sageattn_2", "sageattn_3"
@@ -1393,20 +1401,12 @@ class MainWindow(QMainWindow):
         if _attn_idx >= 0:
             self.attention_mode_combo.setCurrentIndex(_attn_idx)
         f.addRow("Attention Mode:", self.attention_mode_combo)
-        self.estimated_processing_fps_spin = QDoubleSpinBox()
-        self.estimated_processing_fps_spin.setRange(0.1, 120.0)
-        self.estimated_processing_fps_spin.setDecimals(2)
-        self.estimated_processing_fps_spin.setSingleStep(0.1)
-        self.estimated_processing_fps_spin.setValue(1.8)
-        self.estimated_processing_fps_spin.setToolTip(
-            "Used by GUI time estimation: Remaining Seconds = Remaining Frames / Estimated FPS"
-        )
-        f.addRow("Estimated Processing Speed (FPS):", self.estimated_processing_fps_spin)
 
         adj_layout.addWidget(g)
 
         # Model Cache
         g, f = _make_group("Model Cache")
+        self._model_cache_group = g
         self.cache_dit_check = QCheckBox()
         f.addRow("Cache DiT:", self.cache_dit_check)
 
@@ -1549,8 +1549,8 @@ class MainWindow(QMainWindow):
         self.dit_model_combo.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
         )
-        # Pre-Downscale: compact ≈ 5 chars (~50 px).
-        self.pre_downscale_combo.setMaximumWidth(50)
+        # Pre-Downscale: compact ≈ 10 chars (~80 px).
+        self.pre_downscale_combo.setMaximumWidth(80)
         self.pre_downscale_combo.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToContents
         )
@@ -1745,29 +1745,12 @@ class MainWindow(QMainWindow):
         self.queue_progress_circle = _NoOpProgressIndicator()
         self.elapsed_progress_circle = _NoOpProgressIndicator()
 
-        self.batch_progress_bar = QProgressBar(self.progress_panel)
-        self.batch_progress_bar.setRange(0, 1000)
-        self.batch_progress_bar.setValue(0)
-        self.batch_progress_bar.setTextVisible(False)
-        self.batch_progress_bar.setFixedHeight(9)
-        self.batch_progress_bar.setMaximumHeight(10)
-        self.batch_progress_bar.setStyleSheet(
-            "QProgressBar {"
-            "background:#0F1114;"
-            "border:1px solid #2E3338;"
-            "border-radius:4px;"
-            "}"
-            "QProgressBar::chunk {"
-            "background:#0052CC;"
-            "border-radius:4px;"
-            "}"
-        )
-        panel_layout.addWidget(self.batch_progress_bar)
-
         self.current_file_progress_label = QLabel("Current File: -")
-        self.batch_progress_label = QLabel("Overall Batch Progress")
+        self.batch_progress_label = QLabel("Overall Batch Progress | Completed: 0/0")
+        self.video_proc_time_label = QLabel("Video Processing Time: 00:00")
         panel_layout.addWidget(self.current_file_progress_label)
         panel_layout.addWidget(self.batch_progress_label)
+        panel_layout.addWidget(self.video_proc_time_label)
         layout.addWidget(self.progress_panel)
 
         # Console + controls (70/30 split)
@@ -1835,10 +1818,14 @@ class MainWindow(QMainWindow):
             self.vae_decode_tiled_check.setChecked(bool(self._simple_defaults["vae_tiling"]))
             self.debug_check.setChecked(bool(self._simple_defaults["debug"]))
 
-        self._processing_settings_group.setVisible(advanced)
+        # Simple mode: show Processing Settings, VAE Tiling, Debug; hide Memory, Performance, Model Cache.
+        # Advanced mode: show everything.
         self._preview_processing_group.setVisible(advanced)
-        self._vae_tiling_group.setVisible(advanced)
-        self._debug_group.setVisible(advanced)
+        self._memory_blockswap_group.setVisible(advanced)
+        self._performance_group.setVisible(advanced)
+        self._model_cache_group.setVisible(advanced)
+        # These are always visible (simple or advanced):
+        # _processing_settings_group, _vae_tiling_group, _debug_group
 
     def _update_chunking_visibility(self, enabled: bool) -> None:
         self.chunk_duration_minutes_label.setVisible(enabled)
@@ -1850,7 +1837,7 @@ class MainWindow(QMainWindow):
         open_settings_action.triggered.connect(self._open_settings)
         settings_menu.addAction(open_settings_action)
 
-        help_menu = self.menuBar().addMenu("Help")
+        help_menu = self.menuBar().addMenu("About")
         about_action = QAction("About SeedVR2 GUI", self)
         about_action.triggered.connect(self._show_about_dialog)
         help_menu.addAction(about_action)
@@ -1869,7 +1856,7 @@ class MainWindow(QMainWindow):
             "About SeedVR2 GUI",
             (
                 "<b>SeedVR2.5 GUI by HB2k</b><br>"
-                "Version: v1.5b<br><br>"
+                "Version: v1.6b<br><br>"
                 "Topaz-style wrapper for SeedVR2 inference_cli.py.<br>"
                 "License: Apache-2.0<br><br>"
                 '<a href="https://github.com/naxci1/ComfyUI-SeedVR2.5_new">'
@@ -1894,6 +1881,7 @@ class MainWindow(QMainWindow):
             "pre_downscale_combo": self.pre_downscale_combo,
             "resolution_mode_combo": self.resolution_mode_combo,
             "resolution_times_combo": self.resolution_times_combo,
+            "resolution_standard_combo": self.resolution_standard_combo,
             "resolution_spin": self.resolution_spin,
             "max_resolution_spin": self.max_resolution_spin,
             "batch_size_spin": self.batch_size_spin,
@@ -1918,7 +1906,6 @@ class MainWindow(QMainWindow):
             "vae_decode_tile_overlap_spin": self.vae_decode_tile_overlap_spin,
             "tile_debug_combo": self.tile_debug_combo,
             "attention_mode_combo": self.attention_mode_combo,
-            "estimated_processing_fps_spin": self.estimated_processing_fps_spin,
             "cache_dit_check": self.cache_dit_check,
             "cache_vae_check": self.cache_vae_check,
             "auto_safeguard_check": self.auto_safeguard_check,
@@ -2134,7 +2121,7 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _seedvr_prefixed_stem(stem: str) -> str:
         clean_stem = stem.strip()
-        return clean_stem if clean_stem.startswith("seedvr_") else f"seedvr_{clean_stem}"
+        return clean_stem if clean_stem.startswith("seedvr2_") else f"seedvr2_{clean_stem}"
 
     @classmethod
     def _generate_export_output_path(cls, ext: str, output_dir: Path, part_idx: int = 1) -> Path:
@@ -2523,10 +2510,17 @@ class MainWindow(QMainWindow):
             else:
                 args += ["--output", out]
         else:
-            # No output path set: auto-generate with padded numerical naming convention.
+            # No output path set: derive from input filename when processing a single file,
+            # otherwise fall back to padded numerical naming convention.
             export_dir = self._resolve_export_output_dir()
             auto_ext = self._selected_export_extension()
-            auto_out = self._generate_export_output_path(auto_ext, export_dir)
+            inp_path = Path(inp) if inp else None
+            if inp_path and inp_path.is_file():
+                # Use seedvr2_<original_stem> as the output name, deduplicating as needed.
+                auto_stem = f"seedvr2_{inp_path.stem}"
+                auto_out = self._ensure_unique_file_path(export_dir / f"{auto_stem}{auto_ext}")
+            else:
+                auto_out = self._generate_export_output_path(auto_ext, export_dir)
             args += ["--output", str(auto_out)]
 
         # model dir
@@ -2592,7 +2586,7 @@ class MainWindow(QMainWindow):
             str(self._simple_defaults["resolution_mode"])
             if not self._advanced_mode_enabled
             else self.resolution_mode_combo.currentText()
-        )  # "Pixel" or "X Times"
+        )  # "Pixel", "X Times", or "Standard"
         if res_mode == "X Times":
             # Multiplier applied to the (already pre-downscaled) input height.
             # We don't know the actual input dimension at arg-build time, so we
@@ -2602,6 +2596,11 @@ class MainWindow(QMainWindow):
             times_text = self.resolution_times_combo.currentText()  # "1x".."5x"
             times_val = int(times_text.rstrip("x"))
             args += ["--resolution_mode", "xtimes", "--resolution_scale", str(times_val)]
+        elif res_mode == "Standard":
+            # Standard presets: extract the leading numeric value ("720 (HD)" → 720)
+            std_text = self.resolution_standard_combo.currentText()
+            std_val = int(std_text.split()[0])
+            args += ["--resolution", str(std_val)]
         else:
             # Pixel mode: direct target resolution
             res = int(self._simple_defaults["resolution"]) if not self._advanced_mode_enabled else self.resolution_spin.value()
@@ -2814,6 +2813,9 @@ class MainWindow(QMainWindow):
         self._worker.started_signal.connect(lambda: self._set_running(True))
 
         self._reset_progress_bars()
+        # Reset timer state for new export; video_proc_time_label shows 00:00 until first tick
+        self._frozen_elapsed_seconds = None
+        self.video_proc_time_label.setText("Video Processing Time: 00:00")
         self._run_started_at = time.time()
         self._elapsed_timer.start()
         self._prepare_queue_progress_context()
@@ -3550,13 +3552,12 @@ class MainWindow(QMainWindow):
         self._active_queue_index = -1
         self.status_label.setToolTip("")
         self.status_label.setText("Ready")
-        self.current_file_progress_label.setText("Current File: - | Remaining: 00:00:00 | Frames: 0/0")
-        self.batch_progress_label.setText("Overall Batch Progress | Completed: 0/0 | Estimated Total Time Left: 00:00:00")
+        self.current_file_progress_label.setText("Current File: -")
+        self.batch_progress_label.setText("Overall Batch Progress | Completed: 0/0")
         self._last_batch_cur = 0
         self._last_batch_tot = 0
         self.batch_progress_circle.set_progress(0.0)
         self.batch_progress_circle.set_text("0/0")
-        self.batch_progress_bar.setValue(0)
         self.phase_progress_circle.set_progress(0.0)
         self.phase_progress_circle.set_text("1/4")
         self.eta_progress_circle.set_progress(0.0)
@@ -3574,8 +3575,15 @@ class MainWindow(QMainWindow):
         secs = total % 60
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
+    def _format_mmss(self, seconds: float) -> str:
+        """Format elapsed seconds as MM:SS for the Video Processing Time label."""
+        total = max(0, int(seconds))
+        minutes = total // 60
+        secs = total % 60
+        return f"{minutes:02d}:{secs:02d}"
+
     def _estimated_processing_fps(self) -> float:
-        return max(0.1, float(self.estimated_processing_fps_spin.value()))
+        return 1.8
 
     def _count_frames_for_file(self, path: Path) -> int:
         suffix = path.suffix.lower()
@@ -3632,46 +3640,34 @@ class MainWindow(QMainWindow):
         self._current_file_processed_frames = 0
 
     def _update_current_file_progress_ui(self) -> None:
-        fps = self._estimated_processing_fps()
         total_frames = max(0, self._current_file_total_frames)
         current_frames = max(0, min(self._current_file_processed_frames, total_frames)) if total_frames > 0 else max(0, self._current_file_processed_frames)
-        remaining_seconds = max(0.0, (total_frames - current_frames) / fps) if total_frames > 0 else 0.0
         file_name = Path(self._current_file_path).name if self._current_file_path else "-"
         self.current_file_progress_label.setText(
-            f"Current File: {file_name} | Remaining: {self._format_seconds(remaining_seconds)} | Frames: {current_frames}/{total_frames}"
+            f"Current File: {file_name} | Batches: {current_frames}/{total_frames}"
         )
         ratio = (current_frames / total_frames) if total_frames > 0 else 0.0
         self.eta_progress_circle.set_progress(max(0.0, min(1.0, ratio)))
-        self.eta_progress_circle.set_text(self._format_seconds(remaining_seconds))
         phase = 1 if total_frames <= 0 else min(4, max(1, int(ratio * 4) + 1))
         self.phase_progress_circle.set_progress(phase / 4.0)
         self.phase_progress_circle.set_text(f"{phase}/4")
 
     def _update_batch_progress_ui(self) -> None:
-        fps = self._estimated_processing_fps()
         if self._queue_files_total <= 0:
             self.batch_progress_label.setText(
-                "Overall Batch Progress | Completed: 0/0 | Estimated Total Time Left: 00:00:00"
+                "Overall Batch Progress | Completed: 0/0"
             )
             self.batch_progress_circle.set_progress(0.0)
             self.batch_progress_circle.set_text("0/0")
-            self.batch_progress_bar.setValue(0)
             self.queue_progress_circle.set_progress(0.0)
             self.queue_progress_circle.set_text("0/0")
             return
 
         current_index = max(0, self._active_queue_index)
-        upcoming_start = min(current_index + 1, self._queue_files_total)
-        current_remaining = max(0, self._current_file_total_frames - self._current_file_processed_frames)
-        upcoming_remaining = 0
-        for file_path in self._queue_ordered_files[upcoming_start:]:
-            upcoming_remaining += max(0, self._queue_file_frame_counts.get(file_path, 0))
-        total_remaining_frames = current_remaining + upcoming_remaining
-        remaining_seconds = total_remaining_frames / fps
 
         completed_files = min(self._queue_files_total, max(self._queue_files_completed, current_index))
         self.batch_progress_label.setText(
-            f"Overall Batch Progress | Completed: {completed_files}/{self._queue_files_total} | Estimated Total Time Left: {self._format_seconds(remaining_seconds)}"
+            f"Overall Batch Progress | Completed: {completed_files}/{self._queue_files_total}"
         )
 
         processed_current = max(0, min(self._current_file_processed_frames, self._current_file_total_frames))
@@ -3683,7 +3679,6 @@ class MainWindow(QMainWindow):
         pct = max(0.0, min(1.0, ratio))
         self.batch_progress_circle.set_progress(pct)
         self.batch_progress_circle.set_text(f"{self._last_batch_cur}/{self._last_batch_tot}" if self._last_batch_tot > 0 else f"{completed_files}/{self._queue_files_total}")
-        self.batch_progress_bar.setValue(int(round(pct * self.batch_progress_bar.maximum())))
         queue_ratio = completed_files / max(1, self._queue_files_total)
         self.queue_progress_circle.set_progress(max(0.0, min(1.0, queue_ratio)))
         self.queue_progress_circle.set_text(f"{completed_files}/{self._queue_files_total}")
@@ -3692,9 +3687,16 @@ class MainWindow(QMainWindow):
         if self._run_started_at is None:
             self.elapsed_progress_circle.set_progress(0.0)
             self.elapsed_progress_circle.set_text("00:00:00")
+            # Show frozen elapsed time if available; do not reset to 00:00
+            if self._frozen_elapsed_seconds is not None:
+                self.video_proc_time_label.setText(
+                    f"Video Processing Time: {self._format_mmss(self._frozen_elapsed_seconds)}"
+                )
             return
         elapsed = max(0.0, time.time() - self._run_started_at)
+        self._frozen_elapsed_seconds = elapsed
         self.elapsed_progress_circle.set_text(self._format_seconds(elapsed))
+        self.video_proc_time_label.setText(f"Video Processing Time: {self._format_mmss(elapsed)}")
         total_frames = sum(max(0, v) for v in self._queue_file_frame_counts.values())
         if total_frames <= 0:
             self.elapsed_progress_circle.set_progress(0.0)
@@ -3790,6 +3792,12 @@ class MainWindow(QMainWindow):
     def _on_finished(self, success: bool, msg: str) -> None:
         was_preview = self._is_preview_run
         self._set_running(False)
+        # Freeze the elapsed processing time before nulling run_started_at
+        if self._run_started_at is not None:
+            self._frozen_elapsed_seconds = max(0.0, time.time() - self._run_started_at)
+            self.video_proc_time_label.setText(
+                f"Video Processing Time: {self._format_mmss(self._frozen_elapsed_seconds)}"
+            )
         self._elapsed_timer.stop()
         self._run_started_at = None
         self._active_file_status = ""
@@ -3799,6 +3807,14 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"✅  {msg}")
             self.status_label.setToolTip(msg)
             self._try_auto_load_output()
+            # Feed completed output path into the split tracking context so that
+            # multi-part chunk compilation can resolve input→output mappings.
+            if not was_preview and self._latest_output_path is not None:
+                inp_raw = self._settings_win.input_edit.text().strip()
+                if inp_raw:
+                    self._on_log(
+                        f"📂  Output: {self._latest_output_path.resolve()}"
+                    )
             # After a Preview run, automatically switch to Split View for comparison
             if was_preview and _MULTIMEDIA_AVAILABLE:
                 self._preview_compare_active = self._latest_output_path is not None
