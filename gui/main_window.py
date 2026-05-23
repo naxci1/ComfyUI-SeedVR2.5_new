@@ -379,6 +379,16 @@ class CircularProgressWidget(QWidget):
         painter.end()
 
 
+class _NoOpProgressIndicator:
+    """Compatibility shim for removed circular progress widgets."""
+
+    def set_progress(self, _value: float) -> None:
+        pass
+
+    def set_text(self, _text: str) -> None:
+        pass
+
+
 
 # ---------------------------------------------------------------------------
 # Styled splitter handle – thick, coloured, with a ⇔ arrow indicator
@@ -842,12 +852,15 @@ class MainWindow(QMainWindow):
 
         splitter.addWidget(self._build_right_panel())
         splitter.addWidget(self._build_left_panel())
-        splitter.setStretchFactor(0, 22)
-        splitter.setStretchFactor(1, 78)
-        splitter.setSizes([380, 1020])
+        splitter.setStretchFactor(0, 20)
+        splitter.setStretchFactor(1, 80)
+        splitter.setSizes([340, 1060])
 
         # ── 3. Bottom controls bar ─────────────────────────────────────
         root_layout.addWidget(self._build_bottom_bar())
+        root_layout.setStretch(0, 0)
+        root_layout.setStretch(1, 14)
+        root_layout.setStretch(2, 3)
         self._drop_overlay.raise_()
         self._sync_drop_overlay_geometry()
 
@@ -1074,6 +1087,11 @@ class MainWindow(QMainWindow):
         self._meta_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._meta_label.setStyleSheet("color:#888; font-size:11px; padding:1px 0;")
         layout.addWidget(self._meta_label)
+        layout.setStretch(0, 0)
+        layout.setStretch(1, 14)
+        layout.setStretch(2, 0)
+        layout.setStretch(3, 0)
+        layout.setStretch(4, 0)
 
         return panel
 
@@ -1681,7 +1699,7 @@ class MainWindow(QMainWindow):
         self.status_label.setMinimumWidth(200)
         self.status_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
-        self.abort_btn = QPushButton("⏹  Abort")
+        self.abort_btn = QPushButton("Abort")
         self.abort_btn.setObjectName("danger_button")
         self.abort_btn.clicked.connect(self._abort)
 
@@ -1698,47 +1716,37 @@ class MainWindow(QMainWindow):
 
         status_row.addWidget(self.status_label)
         status_row.addStretch(1)
-        status_row.addWidget(self.run_btn)
-        status_row.addWidget(self.abort_btn)
         layout.addLayout(status_row)
 
-        # Circular progress panel
+        self.run_btn.setText("Export")
+
+        # Minimal progress panel
         self.progress_panel = QFrame()
         self.progress_panel.setObjectName("progress_panel")
         self.progress_panel.setStyleSheet(
             "QFrame#progress_panel {"
             "background:#1A1D21;"
             "border:1px solid #2E3338;"
-            "border-radius:10px;"
-            "padding:4px;"
+            "border-radius:8px;"
+            "padding:2px;"
             "}"
         )
         panel_layout = QVBoxLayout(self.progress_panel)
-        panel_layout.setContentsMargins(8, 6, 8, 6)
-        panel_layout.setSpacing(4)
+        panel_layout.setContentsMargins(8, 4, 8, 4)
+        panel_layout.setSpacing(3)
 
-        row = QHBoxLayout()
-        row.setSpacing(6)
-        self.batch_progress_circle = CircularProgressWidget("Batch", self.progress_panel)
-        self.phase_progress_circle = CircularProgressWidget("Phase", self.progress_panel)
-        self.eta_progress_circle = CircularProgressWidget("ETA", self.progress_panel)
-        self.queue_progress_circle = CircularProgressWidget("Queue", self.progress_panel)
-        self.elapsed_progress_circle = CircularProgressWidget("Elapsed", self.progress_panel)
-        for w in (
-            self.batch_progress_circle,
-            self.phase_progress_circle,
-            self.eta_progress_circle,
-            self.queue_progress_circle,
-            self.elapsed_progress_circle,
-        ):
-            row.addWidget(w)
-        panel_layout.addLayout(row)
+        self.batch_progress_circle = _NoOpProgressIndicator()
+        self.phase_progress_circle = _NoOpProgressIndicator()
+        self.eta_progress_circle = _NoOpProgressIndicator()
+        self.queue_progress_circle = _NoOpProgressIndicator()
+        self.elapsed_progress_circle = _NoOpProgressIndicator()
 
         self.batch_progress_bar = QProgressBar(self.progress_panel)
         self.batch_progress_bar.setRange(0, 1000)
         self.batch_progress_bar.setValue(0)
         self.batch_progress_bar.setTextVisible(False)
         self.batch_progress_bar.setFixedHeight(9)
+        self.batch_progress_bar.setMaximumHeight(10)
         self.batch_progress_bar.setStyleSheet(
             "QProgressBar {"
             "background:#0F1114;"
@@ -1758,21 +1766,38 @@ class MainWindow(QMainWindow):
         panel_layout.addWidget(self.batch_progress_label)
         layout.addWidget(self.progress_panel)
 
-        util_row = QHBoxLayout()
-        util_row.addStretch(1)
-        util_row.addWidget(self.open_output_folder_btn)
-        util_row.addWidget(self.copy_log_btn)
-        util_row.addWidget(self.clear_log_btn)
-        layout.addLayout(util_row)
-
-        # Row 4 – Console
+        # Console + controls (70/30 split)
         self.console = QTextEdit()
         self.console.setReadOnly(True)
-        self.console.setMinimumHeight(120)
+        self.console.setMinimumHeight(96)
         mono = QFont("Consolas")
         mono.setStyleHint(QFont.StyleHint.Monospace)
         self.console.setFont(mono)
-        layout.addWidget(self.console)
+
+        controls_widget = QWidget()
+        controls_layout = QVBoxLayout(controls_widget)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setSpacing(6)
+        for btn in (
+            self.open_output_folder_btn,
+            self.copy_log_btn,
+            self.clear_log_btn,
+            self.run_btn,
+            self.abort_btn,
+        ):
+            btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            controls_layout.addWidget(btn)
+        controls_layout.addStretch(1)
+
+        log_row = QHBoxLayout()
+        log_row.setContentsMargins(0, 0, 0, 0)
+        log_row.setSpacing(8)
+        log_row.addWidget(self.console, 7)
+        log_row.addWidget(controls_widget, 3)
+        layout.addLayout(log_row, 1)
+        layout.setStretch(0, 0)
+        layout.setStretch(1, 0)
+        layout.setStretch(2, 1)
 
         return bar
 
