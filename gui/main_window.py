@@ -9,6 +9,7 @@ import ctypes
 import json
 import os
 import time
+import traceback
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import subprocess
@@ -329,6 +330,53 @@ def _form_row(label_text: str, widget: QWidget) -> QHBoxLayout:
     row.addWidget(lbl)
     row.addWidget(widget)
     return row
+
+
+class CircularProgressWidget(QWidget):
+    """Compact circular progress indicator with title and value text."""
+
+    def __init__(self, title: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._title = title
+        self._value = 0.0
+        self._text = "0%"
+        self.setMinimumSize(122, 122)
+        self.setMaximumSize(150, 150)
+
+    def set_progress(self, value: float) -> None:
+        self._value = max(0.0, min(1.0, value))
+        self.update()
+
+    def set_text(self, text: str) -> None:
+        self._text = text
+        self.update()
+
+    def paintEvent(self, _event) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = self.rect().adjusted(10, 16, -10, -10)
+        circle_rect = QRectF(rect.left(), rect.top() + 12, rect.width(), rect.width())
+
+        bg_pen = QPen(QColor("#2E3338"), 9)
+        painter.setPen(bg_pen)
+        painter.drawArc(circle_rect, 0, 360 * 16)
+
+        fg_pen = QPen(QColor("#11abda"), 9)
+        painter.setPen(fg_pen)
+        start_angle = 90 * 16
+        span_angle = int(-360 * 16 * self._value)
+        painter.drawArc(circle_rect, start_angle, span_angle)
+
+        painter.setPen(QColor("#E3E4E6"))
+        painter.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
+        painter.drawText(
+            QRectF(rect.left(), rect.top() - 2, rect.width(), 18),
+            Qt.AlignmentFlag.AlignCenter,
+            self._title,
+        )
+        painter.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        painter.drawText(circle_rect, Qt.AlignmentFlag.AlignCenter, self._text)
+        painter.end()
 
 
 
@@ -683,6 +731,21 @@ class MainWindow(QMainWindow):
         self._preview_saved_load_cap: Optional[int] = None  # restored after video-mode preview
         # True when the current/last preview run processed a VIDEO clip (not a PNG frame)
         self._is_preview_video_mode: bool = False
+        self._advanced_mode_enabled: bool = False
+        self._last_batch_cur: int = 0
+        self._last_batch_tot: int = 0
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.setInterval(1000)
+        self._elapsed_timer.timeout.connect(self._update_elapsed_progress_ui)
+        self._simple_defaults: dict[str, Any] = {
+            "pre_downscale": "1:1",
+            "resolution_mode": "Pixel",
+            "resolution": 720,
+            "batch_size": 81,
+            "split_minutes": 3,
+            "vae_tiling": False,
+            "debug": False,
+        }
 
         self._build_ui()
         self._build_menu_bar()
@@ -698,6 +761,7 @@ class MainWindow(QMainWindow):
         self._update_export_controls()
         self._load_model_settings()
         self._prompt_load_last_preset()
+        self._apply_mode_visibility()
 
         self._set_running(False)
 
@@ -749,14 +813,20 @@ class MainWindow(QMainWindow):
             lambda: QDesktopServices.openUrl(QUrl("https://github.com/naxci1/ComfyUI-SeedVR2.5_new"))
         )
 
-        settings_btn = QPushButton("⚙")
+        self.advanced_mode_btn = QPushButton("Simple Mode")
+        self.advanced_mode_btn.setCheckable(True)
+        self.advanced_mode_btn.setToolTip("Toggle between Simple Mode and Advanced Mode")
+        self.advanced_mode_btn.clicked.connect(self._toggle_advanced_mode)
+
+        settings_btn = QPushButton("Settings")
         settings_btn.setToolTip("Open Paths & Configuration settings")
-        settings_btn.setMinimumWidth(38)
+        settings_btn.setMinimumWidth(84)
         settings_btn.clicked.connect(self._open_settings)
 
         header_layout.addWidget(help_btn)
         header_layout.addWidget(github_btn)
         header_layout.addStretch(1)
+        header_layout.addWidget(self.advanced_mode_btn)
         header_layout.addWidget(settings_btn)
         root_layout.addWidget(header_widget)
 
@@ -1115,6 +1185,7 @@ class MainWindow(QMainWindow):
 
         # Processing Settings
         g, f = _make_group("Processing Settings")
+        self._processing_settings_group = g
 
         # --- Pre-Downscale ---
         self.pre_downscale_combo = QComboBox()
@@ -1190,6 +1261,7 @@ class MainWindow(QMainWindow):
 
         # Preview & Processing
         g, f = _make_group("Preview & Processing")
+        self._preview_processing_group = g
         self.seed_spin = QSpinBox()
         self.seed_spin.setRange(0, 2147483647)
         self.seed_spin.setValue(313)
@@ -1206,11 +1278,13 @@ class MainWindow(QMainWindow):
         self.load_cap_spin.setToolTip("0 = load all frames; Preview auto-sets this to 81 and restores it when done")
         f.addRow("Load Cap:", self.load_cap_spin)
 
-        self.chunk_size_spin = QSpinBox()
-        self.chunk_size_spin.setRange(0, 99999)
-        self.chunk_size_spin.setValue(0)
-        self.chunk_size_spin.setToolTip("0 = process all at once")
-        f.addRow("Chunk Size:", self.chunk_size_spin)
+        self.split_size_minutes_spin = QSpinBox()
+        self.split_size_minutes_spin.setRange(1, 9)
+        self.split_size_minutes_spin.setValue(3)
+        self.split_size_minutes_spin.setSuffix(" min")
+        self.split_size_minutes_spin.setToolTip("Split size in minutes. Converted to frame count via minutes × 60 × FPS.")
+        self.chunk_size_spin = self.split_size_minutes_spin  # backwards-compatible persistence key
+        f.addRow("Split Size:", self.split_size_minutes_spin)
         adj_layout.addWidget(g)
 
         # Device Management
@@ -1254,6 +1328,7 @@ class MainWindow(QMainWindow):
 
         # VAE Tiling
         g, f = _make_group("VAE Tiling")
+        self._vae_tiling_group = g
         self.vae_encode_tiled_check = QCheckBox()
         f.addRow("Encode Tiled:", self.vae_encode_tiled_check)
 
@@ -1319,6 +1394,7 @@ class MainWindow(QMainWindow):
 
         # Debug
         g, f = _make_group("Debug")
+        self._debug_group = g
         self.auto_safeguard_check = QCheckBox()
         f.addRow("Auto Safeguard:", self.auto_safeguard_check)
         self.debug_check = QCheckBox()
@@ -1380,7 +1456,7 @@ class MainWindow(QMainWindow):
         # Quality level row – visible only in Dynamic mode
         self._quality_row_lbl = QLabel("Quality Level:")
         self.quality_level_combo = QComboBox()
-        self.quality_level_combo.addItems(["High", "Medium", "Low"])
+        self.quality_level_combo.addItems(["Max", "High", "Medium", "Low"])
         vf.addRow(self._quality_row_lbl, self.quality_level_combo)
 
         # Target bitrate row – visible only in Constant mode
@@ -1610,7 +1686,7 @@ class MainWindow(QMainWindow):
         status_row.addWidget(self.abort_btn)
         layout.addLayout(status_row)
 
-        # Two-tier graphical progress panel
+        # Circular progress panel
         self.progress_panel = QFrame()
         self.progress_panel.setObjectName("progress_panel")
         self.progress_panel.setStyleSheet(
@@ -1625,26 +1701,27 @@ class MainWindow(QMainWindow):
         panel_layout.setContentsMargins(10, 8, 10, 10)
         panel_layout.setSpacing(8)
 
-        self.current_file_progress_label = QLabel(
-            "Current File: - | Remaining: 00:00:00 | Frames: 0/0"
-        )
-        self.current_file_progress_bar = QProgressBar()
-        self.current_file_progress_bar.setRange(0, 1000)
-        self.current_file_progress_bar.setValue(0)
-        self.current_file_progress_bar.setTextVisible(False)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.batch_progress_circle = CircularProgressWidget("Batch", self.progress_panel)
+        self.phase_progress_circle = CircularProgressWidget("Phase", self.progress_panel)
+        self.eta_progress_circle = CircularProgressWidget("ETA", self.progress_panel)
+        self.queue_progress_circle = CircularProgressWidget("Queue", self.progress_panel)
+        self.elapsed_progress_circle = CircularProgressWidget("Elapsed", self.progress_panel)
+        for w in (
+            self.batch_progress_circle,
+            self.phase_progress_circle,
+            self.eta_progress_circle,
+            self.queue_progress_circle,
+            self.elapsed_progress_circle,
+        ):
+            row.addWidget(w)
+        panel_layout.addLayout(row)
 
-        self.batch_progress_label = QLabel(
-            "Overall Batch Progress | Completed: 0/0 | Estimated Total Time Left: 00:00:00"
-        )
-        self.batch_progress_bar = QProgressBar()
-        self.batch_progress_bar.setRange(0, 1000)
-        self.batch_progress_bar.setValue(0)
-        self.batch_progress_bar.setTextVisible(False)
-
+        self.current_file_progress_label = QLabel("Current File: -")
+        self.batch_progress_label = QLabel("Overall Batch Progress")
         panel_layout.addWidget(self.current_file_progress_label)
-        panel_layout.addWidget(self.current_file_progress_bar)
         panel_layout.addWidget(self.batch_progress_label)
-        panel_layout.addWidget(self.batch_progress_bar)
         layout.addWidget(self.progress_panel)
 
         util_row = QHBoxLayout()
@@ -1675,7 +1752,35 @@ class MainWindow(QMainWindow):
         self._settings_win.raise_()
         self._settings_win.activateWindow()
 
+    def _toggle_advanced_mode(self, checked: bool) -> None:
+        self._advanced_mode_enabled = checked
+        self._apply_mode_visibility()
+
+    def _apply_mode_visibility(self) -> None:
+        advanced = bool(self._advanced_mode_enabled)
+        self.advanced_mode_btn.setText("Advanced Mode" if advanced else "Simple Mode")
+
+        if not advanced:
+            self.pre_downscale_combo.setCurrentText(str(self._simple_defaults["pre_downscale"]))
+            self.resolution_mode_combo.setCurrentText(str(self._simple_defaults["resolution_mode"]))
+            self.resolution_spin.setValue(int(self._simple_defaults["resolution"]))
+            self.batch_size_spin.setValue(int(self._simple_defaults["batch_size"]))
+            self.split_size_minutes_spin.setValue(int(self._simple_defaults["split_minutes"]))
+            self.vae_encode_tiled_check.setChecked(bool(self._simple_defaults["vae_tiling"]))
+            self.vae_decode_tiled_check.setChecked(bool(self._simple_defaults["vae_tiling"]))
+            self.debug_check.setChecked(bool(self._simple_defaults["debug"]))
+
+        self._processing_settings_group.setVisible(advanced)
+        self._preview_processing_group.setVisible(advanced)
+        self._vae_tiling_group.setVisible(advanced)
+        self._debug_group.setVisible(advanced)
+
     def _build_menu_bar(self) -> None:
+        settings_menu = self.menuBar().addMenu("Settings")
+        open_settings_action = QAction("Open Settings", self)
+        open_settings_action.triggered.connect(self._open_settings)
+        settings_menu.addAction(open_settings_action)
+
         help_menu = self.menuBar().addMenu("Help")
         about_action = QAction("About SeedVR2 GUI", self)
         about_action.triggered.connect(self._show_about_dialog)
@@ -1838,12 +1943,12 @@ class MainWindow(QMainWindow):
             quality = getattr(self, "quality_level_combo", None)
             qlvl = quality.currentText() if quality is not None else "Medium"
             _CRF_MAP: dict[str, dict[str, Any]] = {
-                "libx264":    {"High": ["-crf", "18"], "Medium": ["-crf", "23"], "Low": ["-crf", "28"]},
-                "libx265":    {"High": ["-crf", "20"], "Medium": ["-crf", "28"], "Low": ["-crf", "35"]},
-                "libaom-av1": {"High": ["-crf", "28"], "Medium": ["-crf", "40"], "Low": ["-crf", "52"]},
-                "h264_nvenc": {"High": ["-cq", "18"], "Medium": ["-cq", "23"], "Low": ["-cq", "28"]},
-                "av1_nvenc":  {"High": ["-cq", "28"], "Medium": ["-cq", "40"], "Low": ["-cq", "52"]},
-                "libvpx-vp9": {"High": ["-crf", "18", "-b:v", "0"], "Medium": ["-crf", "33", "-b:v", "0"], "Low": ["-crf", "42", "-b:v", "0"]},
+                "libx264":    {"High": ["-crf", "18"], "Medium": ["-crf", "23"], "Low": ["-crf", "28"], "Max": ["-preset", "placebo", "-crf", "12"]},
+                "libx265":    {"High": ["-crf", "20"], "Medium": ["-crf", "28"], "Low": ["-crf", "35"], "Max": ["-preset", "placebo", "-crf", "12"]},
+                "libaom-av1": {"High": ["-crf", "28"], "Medium": ["-crf", "40"], "Low": ["-crf", "52"], "Max": ["-preset", "placebo", "-crf", "12"]},
+                "h264_nvenc": {"High": ["-cq", "18"], "Medium": ["-cq", "23"], "Low": ["-cq", "28"], "Max": ["-preset", "placebo", "-crf", "12"]},
+                "av1_nvenc":  {"High": ["-cq", "28"], "Medium": ["-cq", "40"], "Low": ["-cq", "52"], "Max": ["-preset", "placebo", "-crf", "12"]},
+                "libvpx-vp9": {"High": ["-crf", "18", "-b:v", "0"], "Medium": ["-crf", "33", "-b:v", "0"], "Low": ["-crf", "42", "-b:v", "0"], "Max": ["-preset", "placebo", "-crf", "12"]},
             }
             # Determine encoder from base args ("-c:v" value)
             encoder = ""
@@ -2278,7 +2383,11 @@ class MainWindow(QMainWindow):
             else:
                 args += ["--output", str(self._resolve_export_output_dir())]
         elif out:
-            args += ["--output", out]
+            out_path = Path(out)
+            if out_path.suffix:
+                args += ["--output", str(self._ensure_unique_file_path(out_path))]
+            else:
+                args += ["--output", out]
         else:
             # No output path set: auto-generate with padded numerical naming convention.
             export_dir = self._resolve_export_output_dir()
@@ -2334,13 +2443,21 @@ class MainWindow(QMainWindow):
         args += ["--dit_model", self.dit_model_combo.currentText()]
 
         # pre-downscale (preprocessing factor before upscaling)
-        pre_ds_text = self.pre_downscale_combo.currentText()  # "1:1", "2:1", "3:1"
+        pre_ds_text = (
+            str(self._simple_defaults["pre_downscale"])
+            if not self._advanced_mode_enabled
+            else self.pre_downscale_combo.currentText()
+        )  # "1:1", "2:1", "3:1"
         pre_ds_factor = int(pre_ds_text.split(":")[0])  # 1, 2, or 3
         if pre_ds_factor > 1:
             args += ["--pre_downscale", str(pre_ds_factor)]
 
         # resolution – compute final target from mode + pre-downscale factor
-        res_mode = self.resolution_mode_combo.currentText()  # "Pixel" or "X Times"
+        res_mode = (
+            str(self._simple_defaults["resolution_mode"])
+            if not self._advanced_mode_enabled
+            else self.resolution_mode_combo.currentText()
+        )  # "Pixel" or "X Times"
         if res_mode == "X Times":
             # Multiplier applied to the (already pre-downscaled) input height.
             # We don't know the actual input dimension at arg-build time, so we
@@ -2352,14 +2469,14 @@ class MainWindow(QMainWindow):
             args += ["--resolution_mode", "xtimes", "--resolution_scale", str(times_val)]
         else:
             # Pixel mode: direct target resolution
-            res = self.resolution_spin.value()
+            res = int(self._simple_defaults["resolution"]) if not self._advanced_mode_enabled else self.resolution_spin.value()
             args += ["--resolution", str(res)]
 
         max_res = self.max_resolution_spin.value()
         if max_res != 0:
             args += ["--max_resolution", str(max_res)]
 
-        batch = self.batch_size_spin.value()
+        batch = int(self._simple_defaults["batch_size"]) if not self._advanced_mode_enabled else self.batch_size_spin.value()
         args += ["--batch_size", str(batch)]
 
         if self.uniform_batch_check.isChecked():
@@ -2382,9 +2499,14 @@ class MainWindow(QMainWindow):
             if load_cap:
                 args += ["--load_cap", str(load_cap)]
 
-        chunk = self.chunk_size_spin.value()
-        if chunk:
-            args += ["--chunk_size", str(chunk)]
+        split_minutes = (
+            int(self._simple_defaults["split_minutes"])
+            if not self._advanced_mode_enabled
+            else self.split_size_minutes_spin.value()
+        )
+        fps_for_split = self._estimated_processing_fps()
+        split_frames = max(1, int(round(split_minutes * 60 * fps_for_split)))
+        args += ["--chunk_size", str(split_frames)]
 
         prepend = self.prepend_frames_spin.value()
         if prepend:
@@ -2443,7 +2565,7 @@ class MainWindow(QMainWindow):
             args.append("--swap_io_components")
 
         # vae tiling
-        if self.vae_encode_tiled_check.isChecked():
+        if self._advanced_mode_enabled and self.vae_encode_tiled_check.isChecked():
             args.append("--vae_encode_tiled")
             enc_sz = self.vae_encode_tile_size_spin.value()
             if enc_sz != 1024:
@@ -2452,7 +2574,7 @@ class MainWindow(QMainWindow):
             if enc_ov != 128:
                 args += ["--vae_encode_tile_overlap", str(enc_ov)]
 
-        if self.vae_decode_tiled_check.isChecked():
+        if self._advanced_mode_enabled and self.vae_decode_tiled_check.isChecked():
             args.append("--vae_decode_tiled")
             dec_sz = self.vae_decode_tile_size_spin.value()
             if dec_sz != 1024:
@@ -2462,7 +2584,7 @@ class MainWindow(QMainWindow):
                 args += ["--vae_decode_tile_overlap", str(dec_ov)]
 
         tile_dbg = self.tile_debug_combo.currentText()
-        if tile_dbg != "false":
+        if self._advanced_mode_enabled and tile_dbg != "false":
             args += ["--tile_debug", tile_dbg]
 
         # performance
@@ -2482,7 +2604,7 @@ class MainWindow(QMainWindow):
             args.append("--auto_safeguard")
 
         # debug
-        if self.debug_check.isChecked():
+        if self._advanced_mode_enabled and self.debug_check.isChecked():
             args.append("--debug")
 
         return args
@@ -2545,11 +2667,13 @@ class MainWindow(QMainWindow):
         self._worker.finished.connect(self._on_finished)
         self._worker.started_signal.connect(lambda: self._set_running(True))
 
-        self._run_started_at = time.time()
         self._reset_progress_bars()
+        self._run_started_at = time.time()
+        self._elapsed_timer.start()
         self._prepare_queue_progress_context()
         self._update_current_file_progress_ui()
         self._update_batch_progress_ui()
+        self._update_elapsed_progress_ui()
         self._set_running(True)
         self.status_label.setText("Starting…")
         self._thread.start()
@@ -3224,6 +3348,7 @@ class MainWindow(QMainWindow):
         row.addWidget(minus_btn)
         row.addWidget(self.batch_size_spin, stretch=1)
         row.addWidget(plus_btn)
+        self._batch_stepper_widget = wrapper
         return wrapper
 
     def _snap_batch_size(self, val: int) -> None:
@@ -3255,6 +3380,9 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_log(self, line: str) -> None:
+        if line.startswith("__GUI_FATAL__|"):
+            self._show_execution_error_modal("Execution Crash", line.split("|", 1)[1])
+            return
         ts = datetime.now().strftime("%H:%M:%S")
         self.console.append(f"[{ts}] {line}")
 
@@ -3272,14 +3400,21 @@ class MainWindow(QMainWindow):
         self._active_queue_index = -1
         self.status_label.setToolTip("")
         self.status_label.setText("Ready")
-        self.current_file_progress_label.setText(
-            "Current File: - | Remaining: 00:00:00 | Frames: 0/0"
-        )
-        self.current_file_progress_bar.setValue(0)
-        self.batch_progress_label.setText(
-            "Overall Batch Progress | Completed: 0/0 | Estimated Total Time Left: 00:00:00"
-        )
-        self.batch_progress_bar.setValue(0)
+        self.current_file_progress_label.setText("Current File: - | Remaining: 00:00:00 | Frames: 0/0")
+        self.batch_progress_label.setText("Overall Batch Progress | Completed: 0/0 | Estimated Total Time Left: 00:00:00")
+        self._last_batch_cur = 0
+        self._last_batch_tot = 0
+        self.batch_progress_circle.set_progress(0.0)
+        self.batch_progress_circle.set_text("0/0")
+        self.phase_progress_circle.set_progress(0.0)
+        self.phase_progress_circle.set_text("1/4")
+        self.eta_progress_circle.set_progress(0.0)
+        self.eta_progress_circle.set_text("00:00:00")
+        self.queue_progress_circle.set_progress(0.0)
+        self.queue_progress_circle.set_text("0/0")
+        self.elapsed_progress_circle.set_progress(0.0)
+        self.elapsed_progress_circle.set_text("00:00:00")
+        self._elapsed_timer.stop()
 
     def _format_seconds(self, seconds: float) -> str:
         total = max(0, int(seconds))
@@ -3355,7 +3490,11 @@ class MainWindow(QMainWindow):
             f"Current File: {file_name} | Remaining: {self._format_seconds(remaining_seconds)} | Frames: {current_frames}/{total_frames}"
         )
         ratio = (current_frames / total_frames) if total_frames > 0 else 0.0
-        self.current_file_progress_bar.setValue(int(max(0.0, min(1.0, ratio)) * 1000))
+        self.eta_progress_circle.set_progress(max(0.0, min(1.0, ratio)))
+        self.eta_progress_circle.set_text(self._format_seconds(remaining_seconds))
+        phase = 1 if total_frames <= 0 else min(4, max(1, int(ratio * 4) + 1))
+        self.phase_progress_circle.set_progress(phase / 4.0)
+        self.phase_progress_circle.set_text(f"{phase}/4")
 
     def _update_batch_progress_ui(self) -> None:
         fps = self._estimated_processing_fps()
@@ -3363,7 +3502,10 @@ class MainWindow(QMainWindow):
             self.batch_progress_label.setText(
                 "Overall Batch Progress | Completed: 0/0 | Estimated Total Time Left: 00:00:00"
             )
-            self.batch_progress_bar.setValue(0)
+            self.batch_progress_circle.set_progress(0.0)
+            self.batch_progress_circle.set_text("0/0")
+            self.queue_progress_circle.set_progress(0.0)
+            self.queue_progress_circle.set_text("0/0")
             return
 
         current_index = max(0, self._active_queue_index)
@@ -3386,7 +3528,30 @@ class MainWindow(QMainWindow):
             processed_frames += max(0, self._queue_file_frame_counts.get(self._queue_ordered_files[idx], 0))
         total_frames = sum(max(0, v) for v in self._queue_file_frame_counts.values())
         ratio = (processed_frames / total_frames) if total_frames > 0 else (completed_files / self._queue_files_total)
-        self.batch_progress_bar.setValue(int(max(0.0, min(1.0, ratio)) * 1000))
+        pct = max(0.0, min(1.0, ratio))
+        self.batch_progress_circle.set_progress(pct)
+        self.batch_progress_circle.set_text(f"{self._last_batch_cur}/{self._last_batch_tot}" if self._last_batch_tot > 0 else f"{completed_files}/{self._queue_files_total}")
+        queue_ratio = completed_files / max(1, self._queue_files_total)
+        self.queue_progress_circle.set_progress(max(0.0, min(1.0, queue_ratio)))
+        self.queue_progress_circle.set_text(f"{completed_files}/{self._queue_files_total}")
+
+    def _update_elapsed_progress_ui(self) -> None:
+        if self._run_started_at is None:
+            self.elapsed_progress_circle.set_progress(0.0)
+            self.elapsed_progress_circle.set_text("00:00:00")
+            return
+        elapsed = max(0.0, time.time() - self._run_started_at)
+        self.elapsed_progress_circle.set_text(self._format_seconds(elapsed))
+        total_frames = sum(max(0, v) for v in self._queue_file_frame_counts.values())
+        if total_frames <= 0:
+            self.elapsed_progress_circle.set_progress(0.0)
+            return
+        processed_current = max(0, min(self._current_file_processed_frames, self._current_file_total_frames))
+        processed_frames = processed_current
+        current_index = max(0, self._active_queue_index)
+        for idx in range(min(current_index, self._queue_files_total)):
+            processed_frames += max(0, self._queue_file_frame_counts.get(self._queue_ordered_files[idx], 0))
+        self.elapsed_progress_circle.set_progress(max(0.0, min(1.0, processed_frames / total_frames)))
 
     def _on_global_progress(self, cur: int, tot: int) -> None:
         if tot <= 0:
@@ -3400,7 +3565,10 @@ class MainWindow(QMainWindow):
     def _on_batch_progress(self, cur: int, tot: int) -> None:
         if tot <= 0:
             return
+        self._last_batch_cur = max(0, cur)
+        self._last_batch_tot = max(0, tot)
         self._batch_status = f"Batch {cur}/{tot}"
+        self.batch_progress_circle.set_text(self._batch_status.replace("Batch ", ""))
         self.status_label.setToolTip(self._batch_status)
 
     def _on_queue_status_update(
@@ -3454,9 +3622,22 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._on_log(f"❌  Failed to open output folder: {exc}")
 
+    def _show_execution_error_modal(self, title: str, text: str) -> None:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Critical)
+        box.setWindowTitle(title)
+        box.setText("A processing error occurred. The application is still running.")
+        box.setDetailedText(text)
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        copy_btn = box.addButton("Copy to Clipboard", QMessageBox.ButtonRole.ActionRole)
+        box.exec()
+        if box.clickedButton() == copy_btn:
+            QApplication.clipboard().setText(text)
+
     def _on_finished(self, success: bool, msg: str) -> None:
         was_preview = self._is_preview_run
         self._set_running(False)
+        self._elapsed_timer.stop()
         self._run_started_at = None
         self._active_file_status = ""
         self._progress_status = ""
@@ -3487,6 +3668,12 @@ class MainWindow(QMainWindow):
         else:
             self.status_label.setText(f"⚠  {msg}")
             self.status_label.setToolTip(msg)
+            console_text = self.console.toPlainText()
+            tail = console_text[-12000:] if len(console_text) > 12000 else console_text
+            if "out of memory" in tail.lower() or "cuda out of memory" in tail.lower():
+                self._show_execution_error_modal("Out of Memory", tail or msg)
+            else:
+                self._show_execution_error_modal("Execution Error", tail or msg)
         self._is_preview_run = False
         # Reset video-mode preview flag AFTER _on_mode_button has had a chance to read it.
         self._is_preview_video_mode = False

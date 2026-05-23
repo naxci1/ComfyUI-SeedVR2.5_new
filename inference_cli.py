@@ -1037,7 +1037,7 @@ def save_frames_to_video(
             if not writer.isOpened():
                 raise ValueError(f"Cannot create video writer for: {output_path}")
 
-    gc_interval = 32
+    gc_interval = 1
 
     for frame_idx in range(T):
         frame_np = (
@@ -1120,6 +1120,9 @@ def save_frames_to_image(
         filename = f"{base_name}_{start_index + idx:0{digits}d}{ext}"
         file_path = os.path.join(output_dir, filename)
         _save_image_bgr(frame, file_path)
+        gc.collect()
+        if frames_tensor.is_cuda:
+            torch.cuda.empty_cache()
         if debug.enabled and (idx + 1) % 100 == 0:
             debug.log(f"Saved {idx + 1}/{total} images", category="file")
 

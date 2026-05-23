@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import platform
 import sys
+import traceback
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QMessageBox
 
 # Windows: bind this process to a unique AppUserModelID so Windows shows the
 # correct taskbar icon instead of the generic Python interpreter icon.
@@ -43,6 +44,21 @@ def main() -> int:
     app.setApplicationName("SeedVR2.5 Upscaler by HB2k")
     app.setOrganizationName("SeedVR2")
     app.setStyleSheet(DARK_STYLESHEET)
+
+    def _show_uncaught_exception(exc_type, exc_value, exc_tb) -> None:
+        trace = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        box = QMessageBox()
+        box.setIcon(QMessageBox.Icon.Critical)
+        box.setWindowTitle("Unhandled Error")
+        box.setText("A critical error occurred, but the application will remain open.")
+        box.setDetailedText(trace)
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        copy_btn = box.addButton("Copy to Clipboard", QMessageBox.ButtonRole.ActionRole)
+        box.exec()
+        if box.clickedButton() == copy_btn:
+            QApplication.clipboard().setText(trace)
+
+    sys.excepthook = _show_uncaught_exception
 
     window = MainWindow()
     window.show()
