@@ -1324,8 +1324,7 @@ def _configure_torch_compile(compile_args: Dict[str, Any], model_type: str,
                 f"\n"
                 f"To fix this issue:\n"
                 f"  1. Install Triton: pip install triton\n"
-                f"  2. OR change backend to 'cudagraphs' (lightweight, no Triton needed)\n"
-                f"  3. OR disable torch.compile\n"
+                f"  2. OR disable torch.compile\n"
                 f"\n"
                 f"For more info: https://github.com/triton-lang/triton"
             )

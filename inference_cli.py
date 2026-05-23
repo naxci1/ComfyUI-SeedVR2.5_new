@@ -115,6 +115,8 @@ else:
 
 # Heavy dependency imports after environment configuration
 import torch
+torch._inductor.config.triton.cudagraphs = False
+torch._config.cudagraphs = False
 import cv2
 import numpy as np
 import subprocess
@@ -1918,11 +1920,11 @@ Examples:
                         help="Enable torch.compile for DiT model (20-40%% speedup, requires PyTorch 2.0+ and Triton)")
     perf_group.add_argument("--compile_vae", action="store_true",
                         help="Enable torch.compile for VAE model (15-25%% speedup, requires PyTorch 2.0+ and Triton)")
-    perf_group.add_argument("--compile_backend", type=str, default="inductor", choices=["inductor", "cudagraphs"],
-                        help="Compilation backend: 'inductor' (full optimization with Triton) or 'cudagraphs' (lightweight, no kernel optimization) (default: inductor)")
-    perf_group.add_argument("--compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
+    perf_group.add_argument("--compile_backend", type=str, default="inductor", choices=["inductor"],
+                        help="Compilation backend: 'inductor' (full optimization with Triton) (default: inductor)")
+    perf_group.add_argument("--compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune"],
                         help="Optimization level: 'default' (fast compilation), 'reduce-overhead' (lower overhead), 'max-autotune' (best runtime, slow compilation), "
-                        "'max-autotune-no-cudagraphs' (like max-autotune without cudagraphs) (default: default)")
+                        "(default: default)")
     perf_group.add_argument("--compile_fullgraph", action="store_true",
                         help="Compile entire model as single graph (faster but less flexible). May fail with dynamic shapes (default: False)")
     perf_group.add_argument("--compile_dynamic", action="store_true",
