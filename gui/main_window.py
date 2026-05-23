@@ -2135,7 +2135,7 @@ class MainWindow(QMainWindow):
         return clean_stem if clean_stem.startswith("seedvr_") else f"seedvr_{clean_stem}"
 
     @classmethod
-    def _generate_export_output_path(ext: str, output_dir: Path, part_idx: int = 1) -> Path:
+    def _generate_export_output_path(cls, ext: str, output_dir: Path, part_idx: int = 1) -> Path:
         """Return a unique output path using padded numerical indexing.
 
         Format: ``seedvr_output_part_NNN_MMMMM<ext>``.
