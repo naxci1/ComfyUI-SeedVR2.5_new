@@ -21,6 +21,10 @@ jobs:
         with:
           submodules: true
       - name: Publish Custom Node
+        # continue-on-error prevents an async-handle / forceExit crash inside the
+        # publish-node-action Node.js runtime (triggered when git push reports
+        # "Everything up-to-date") from failing the whole workflow with exit code 1.
+        continue-on-error: true
         uses: Comfy-Org/publish-node-action@v1
         with:
           ## Add your own personal access token to your Github Repository secrets and reference it here.

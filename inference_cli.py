@@ -234,6 +234,24 @@ class FFMPEGVideoWriter:
                 if crf_val is not None:
                     args += ["-cq", str(crf_val)]
 
+                # CPU-only presets are invalid for NVENC; map them to the closest NVENC preset.
+                # veryslow/slower → p7 (highest quality), veryfast/superfast/ultrafast → p1 (fastest).
+                _CPU_TO_NVENC_PRESET = {
+                    "veryslow": "p7",
+                    "very slow": "p7",
+                    "slower": "p7",
+                    "veryfast": "p1",
+                    "very fast": "p1",
+                    "superfast": "p1",
+                    "ultrafast": "p1",
+                }
+                preset_val = cls._extract_flag_value(args, "-preset")
+                if preset_val is not None:
+                    nvenc_preset = _CPU_TO_NVENC_PRESET.get(preset_val.lower())
+                    if nvenc_preset is not None:
+                        args = cls._strip_flag_with_value(args, "-preset")
+                        args += ["-preset", nvenc_preset]
+
         return args
     
     def __init__(self, path: str, width: int, height: int, fps: float, use_10bit: bool = False,
