@@ -2142,6 +2142,7 @@ class MainWindow(QMainWindow):
         *part_idx* is the chunk/part number (1-based); the file counter increments
         until a non-existing path is found.
         """
+        output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         for file_idx in range(1, 100_000):
             stem = cls._seedvr_prefixed_stem(f"output_part_{part_idx:03d}_{file_idx:05d}")
@@ -2413,29 +2414,38 @@ class MainWindow(QMainWindow):
             return
         if self._current_input_is_image:
             return  # image meta already set in _load_preview
-        parts: list[str] = []
+        self._update_input_frame_counter_label(self._input_player.position())
+
+    def _update_input_frame_counter_label(self, position_ms: Optional[int] = None) -> None:
+        """Update input metadata as: Input: <file> | <current>/<total> frame."""
+        if not _MULTIMEDIA_AVAILABLE or not self._input_player or self._current_input_is_image:
+            return
+        input_path = self._settings_win.input_edit.text().strip()
+        if not input_path:
+            return
+        if position_ms is None:
+            position_ms = self._input_player.position()
+
+        fps_val: Optional[float] = None
         try:
             meta = self._input_player.metaData()
-            res = meta.value(QMediaMetaData.Key.Resolution)
-            if res is not None:
-                parts.append(f"{res.width()}×{res.height()} px")
             fps = meta.value(QMediaMetaData.Key.VideoFrameRate)
             if fps is not None:
-                try:
-                    parts.append(f"{float(fps):.0f} fps")
-                except (TypeError, ValueError):
-                    pass
+                fps_val = float(fps)
         except Exception:
-            pass
-        dur_ms = self._input_player.duration()
-        if dur_ms > 0:
-            secs = dur_ms // 1000
-            parts.append(f"{secs // 60:02d}:{secs % 60:02d} min")
-        if parts:
-            self._input_meta_text = "Input: " + ", ".join(parts)
-            self._meta_label.setText(self._input_meta_text)
-        elif self._meta_label.text() == "Loading…":
-            pass  # keep "Loading…" until metadata arrives
+            fps_val = None
+
+        duration_ms = self._input_player.duration()
+        total_frames = 0
+        current_frame = 0
+        if fps_val is not None and fps_val > 0 and duration_ms > 0:
+            total_frames = max(1, int(round((duration_ms / 1000.0) * fps_val)))
+            current_frame = max(1, int((max(0, position_ms) / 1000.0) * fps_val) + 1)
+            current_frame = min(current_frame, total_frames)
+
+        filename = Path(input_path).name
+        self._input_meta_text = f"Input: {filename} | {current_frame}/{total_frames} frame"
+        self._meta_label.setText(self._input_meta_text)
 
     def _on_output_meta_changed(self) -> None:
         """Update the metadata label with output video info (combined with input)."""
@@ -3190,6 +3200,7 @@ class MainWindow(QMainWindow):
         if not self._seek_slider.isSliderDown():
             self._seek_slider.setValue(position)
         self._update_time_label()
+        self._update_input_frame_counter_label(position)
 
     def _on_player_state(self, state) -> None:
         playing = state == QMediaPlayer.PlaybackState.PlayingState
