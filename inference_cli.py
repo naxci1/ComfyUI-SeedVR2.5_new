@@ -226,9 +226,11 @@ class FFMPEGVideoWriter:
             if "nvenc" in mapped_codec.lower():
                 crf_val = cls._extract_flag_value(args, "-crf", "-crf:v")
                 args = cls._strip_flag_with_value(args, "-crf", "-crf:v")
-                args = cls._strip_flag_with_value(args, "-rc", "-cq")
+                args = cls._strip_flag_with_value(args, "-rc", "-cq", "-qp", "-b:v")
+                if cls._extract_flag_value(args, "-spatial-aq") is None:
+                    args += ["-spatial-aq", "1"]
                 if crf_val is not None:
-                    args += ["-rc", "constqp", "-cq", str(crf_val)]
+                    args += ["-cq", str(crf_val)]
 
         return args
     
@@ -252,11 +254,24 @@ class FFMPEGVideoWriter:
             ['ffmpeg', '-y', '-f', 'rawvideo', '-pix_fmt', 'rgb24',
              '-s', f'{width}x{height}', '-r', str(fps), '-i', '-',
              *filter_args, *video_enc_args, path],
-            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
         )
     
     def write(self, frame_bgr: np.ndarray):
         if not self.isOpened():
+            ffmpeg_err = ""
+            if self.proc is not None and self.proc.stderr is not None:
+                try:
+                    ffmpeg_err_raw = self.proc.stderr.read()
+                    if ffmpeg_err_raw:
+                        ffmpeg_err = ffmpeg_err_raw.decode("utf-8", errors="replace").strip()
+                except Exception:
+                    ffmpeg_err = ""
+            if ffmpeg_err:
+                debug.log(
+                    f"ffmpeg startup failure details: {ffmpeg_err}",
+                    level="ERROR", force=True, category="file"
+                )
             raise RuntimeError("FFMPEGVideoWriter: ffmpeg process is not running")
         
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
