@@ -754,7 +754,6 @@ class MainWindow(QMainWindow):
             "batch_size": 81,
             "enable_video_chunking": False,
             "split_minutes": 3,
-            "enable_cuda_graphs": False,
             "vae_tiling": False,
             "debug": False,
         }
@@ -1409,12 +1408,6 @@ class MainWindow(QMainWindow):
         )
         f.addRow("Estimated Processing Speed (FPS):", self.estimated_processing_fps_spin)
 
-        self.enable_cuda_graphs_check = QCheckBox()
-        self.enable_cuda_graphs_check.setToolTip(
-            "Enable the CUDA-graphs torch.compile backend for DiT and VAE using the current live UI dimensions."
-        )
-        f.addRow("Enable CUDA Graphs:", self.enable_cuda_graphs_check)
-
         adj_layout.addWidget(g)
 
         # Model Cache
@@ -1826,7 +1819,6 @@ class MainWindow(QMainWindow):
             self.batch_size_spin.setValue(int(self._simple_defaults["batch_size"]))
             self.enable_video_chunking_check.setChecked(bool(self._simple_defaults["enable_video_chunking"]))
             self.split_size_minutes_spin.setValue(int(self._simple_defaults["split_minutes"]))
-            self.enable_cuda_graphs_check.setChecked(bool(self._simple_defaults["enable_cuda_graphs"]))
             self.vae_encode_tiled_check.setChecked(bool(self._simple_defaults["vae_tiling"]))
             self.vae_decode_tiled_check.setChecked(bool(self._simple_defaults["vae_tiling"]))
             self.debug_check.setChecked(bool(self._simple_defaults["debug"]))
@@ -1916,7 +1908,6 @@ class MainWindow(QMainWindow):
             "tile_debug_combo": self.tile_debug_combo,
             "attention_mode_combo": self.attention_mode_combo,
             "estimated_processing_fps_spin": self.estimated_processing_fps_spin,
-            "enable_cuda_graphs_check": self.enable_cuda_graphs_check,
             "cache_dit_check": self.cache_dit_check,
             "cache_vae_check": self.cache_vae_check,
             "auto_safeguard_check": self.auto_safeguard_check,
@@ -2722,15 +2713,6 @@ class MainWindow(QMainWindow):
         attn = self.attention_mode_combo.currentText()
         if attn != "sdpa":
             args += ["--attention_mode", attn]
-
-        if self.enable_cuda_graphs_check.isChecked():
-            args += [
-                "--compile_dit",
-                "--compile_vae",
-                "--compile_backend",
-                "cudagraphs",
-                "--compile_dynamic",
-            ]
 
         # cache
         if self.cache_dit_check.isChecked():
