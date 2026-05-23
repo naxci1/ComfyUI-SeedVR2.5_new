@@ -1428,6 +1428,13 @@ def _apply_vae_submodule_compile(model: torch.nn.Module, compile_args: Dict[str,
     Returns:
         VAE model with compiled submodules
     """
+    if debug:
+        debug.log(
+            "Force-disabling VAE compilation to avoid runtime dimension mismatch.",
+            category="compile"
+        )
+    return model
+
     try:
         # Force dynamic shapes for VAE: video chunks/tiles produce variable temporal
         # lengths that must not be baked into a static CUDA Graph.

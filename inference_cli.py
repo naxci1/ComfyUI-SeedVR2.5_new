@@ -609,6 +609,51 @@ def _apply_lanczos_downscale(frames_tensor: "torch.Tensor", factor: int) -> "tor
     return _torch.from_numpy(_np.stack(out, axis=0).astype("float32") / 255.0)
 
 
+def _force_disable_cudagraphs_for_safe_mode(args: "argparse.Namespace", mode_label: str) -> None:
+    """Disable CUDA Graph capture paths for dynamic-shape-safe execution modes."""
+    try:
+        import torch._inductor.config as _inductor_config
+        _inductor_config.triton.cudagraphs = False
+    except Exception as e:
+        debug.log(
+            f"Could not disable torch._inductor.config.triton.cudagraphs: {e}",
+            level="WARNING",
+            category="setup",
+            force=True,
+            indent_level=1,
+        )
+
+    try:
+        if hasattr(torch, "_config") and hasattr(torch._config, "cudagraphs"):
+            torch._config.cudagraphs = False
+        elif hasattr(torch, "_dynamo") and hasattr(torch._dynamo, "config") and hasattr(torch._dynamo.config, "cudagraphs"):
+            torch._dynamo.config.cudagraphs = False
+    except Exception as e:
+        debug.log(
+            f"Could not disable global cudagraphs config: {e}",
+            level="WARNING",
+            category="setup",
+            force=True,
+            indent_level=1,
+        )
+
+    if hasattr(args, "compile_dynamic") and not bool(getattr(args, "compile_dynamic", False)):
+        args.compile_dynamic = True
+        debug.log(
+            f"{mode_label}: forced compile_dynamic=True for dynamic-shape safety",
+            category="setup",
+            force=True,
+            indent_level=1,
+        )
+
+    debug.log(
+        f"{mode_label}: forced CUDA Graphs OFF for safe dynamic execution",
+        category="setup",
+        force=True,
+        indent_level=1,
+    )
+
+
 def process_single_file(input_path: str, args: "argparse.Namespace", device_list: "List[str]",
                        output_path: "Optional[str]" = None, format_auto_detected: bool = False,
                        runner_cache: "Optional[Dict[str, Any]]" = None) -> int:
@@ -640,6 +685,11 @@ def process_single_file(input_path: str, args: "argparse.Namespace", device_list
         if input_type == "unknown":
             debug.log(f"Skipping unsupported file: {input_path}", level="WARNING", category="file", force=True)
             return 0
+
+        if bool(getattr(args, "preview", False)):
+            _force_disable_cudagraphs_for_safe_mode(args, "Preview mode")
+        if input_type == "image":
+            _force_disable_cudagraphs_for_safe_mode(args, "Single-image mode")
         
         debug.log(f"Processing {input_type}: {Path(input_path).name}", category="generation", force=True)
         
