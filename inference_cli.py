@@ -175,6 +175,62 @@ class FFMPEGVideoWriter:
         Frames must be passed to write() in BGR format (same as cv2.VideoWriter).
         Internally converts to RGB for ffmpeg rawvideo input.
     """
+
+    @staticmethod
+    def _map_codec_to_nvenc(codec: str) -> str:
+        lowered = (codec or "").strip().lower()
+        if "libx264" in lowered or "h264" in lowered:
+            return "h264_nvenc"
+        if "libx265" in lowered or "h265" in lowered or "hevc" in lowered:
+            return "hevc_nvenc"
+        return codec
+
+    @staticmethod
+    def _extract_flag_value(args: List[str], *flags: str) -> Optional[str]:
+        for idx, token in enumerate(args):
+            if token in flags and idx + 1 < len(args):
+                return args[idx + 1]
+        return None
+
+    @staticmethod
+    def _strip_flag_with_value(args: List[str], *flags: str) -> List[str]:
+        stripped: List[str] = []
+        skip_next = False
+        for idx, token in enumerate(args):
+            if skip_next:
+                skip_next = False
+                continue
+            if token in flags:
+                if idx + 1 < len(args):
+                    skip_next = True
+                continue
+            stripped.append(token)
+        return stripped
+
+    @classmethod
+    def _normalize_video_encoder_args(cls, raw_args: List[str]) -> List[str]:
+        args = list(raw_args)
+
+        codec_idx = None
+        codec_val = None
+        for idx, token in enumerate(args):
+            if token == "-c:v" and idx + 1 < len(args):
+                codec_idx = idx + 1
+                codec_val = args[idx + 1]
+                break
+
+        if codec_val is not None and codec_idx is not None:
+            mapped_codec = cls._map_codec_to_nvenc(codec_val)
+            args[codec_idx] = mapped_codec
+
+            if "nvenc" in mapped_codec.lower():
+                crf_val = cls._extract_flag_value(args, "-crf", "-crf:v")
+                args = cls._strip_flag_with_value(args, "-crf", "-crf:v")
+                args = cls._strip_flag_with_value(args, "-rc", "-cq")
+                if crf_val is not None:
+                    args += ["-rc", "constqp", "-cq", str(crf_val)]
+
+        return args
     
     def __init__(self, path: str, width: int, height: int, fps: float, use_10bit: bool = False,
                  custom_video_args: Optional[List[str]] = None,
@@ -186,6 +242,7 @@ class FFMPEGVideoWriter:
             # Dynamic GPU default path (resolution/fps come from width/height/fps args above).
             bitrate = os.environ.get("SEEDVR2_DEFAULT_BITRATE", "8M")
             video_enc_args = ['-c:v', 'hevc_nvenc', '-preset', 'p7', '-b:v', bitrate, '-pix_fmt', pix_fmt]
+        video_enc_args = self._normalize_video_encoder_args(video_enc_args)
         
         filter_args: List[str] = []
         if lut_path:
