@@ -752,7 +752,9 @@ class MainWindow(QMainWindow):
         self.menuBar().hide()
 
         # Load window icon (PyInstaller-compatible path)
-        icon_path = Path(get_resource_path("assets/icon.ico"))
+        icon_path = Path(get_resource_path("assets/logo.png"))
+        if not icon_path.exists():
+            icon_path = Path(get_resource_path("assets/icon.ico"))
         if not icon_path.exists():
             icon_path = Path(get_resource_path("icon.ico"))
         self.setWindowIcon(QIcon(str(icon_path)))
