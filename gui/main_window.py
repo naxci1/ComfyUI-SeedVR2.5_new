@@ -1916,6 +1916,69 @@ class MainWindow(QMainWindow):
         container = self.container_combo.currentText().strip().lower()
         return "." + container if container else ".mp4"
 
+    @staticmethod
+    def _extract_encoder_from_args(ffmpeg_args: list[str], codec_fallback: str = "") -> str:
+        encoder = ""
+        for i, tok in enumerate(ffmpeg_args):
+            if tok == "-c:v" and i + 1 < len(ffmpeg_args):
+                encoder = str(ffmpeg_args[i + 1]).strip()
+                break
+        if not encoder:
+            encoder = codec_fallback.strip().lower().replace(" ", "_")
+        return encoder or "libx264"
+
+    @staticmethod
+    def _strip_quality_flags(ffmpeg_args: list[str]) -> list[str]:
+        flags_with_value = {
+            "-preset",
+            "-crf",
+            "-cq",
+            "-qp",
+            "-q:v",
+            "-qscale:v",
+            "-global_quality",
+            "-profile:v",
+            "-b:v",
+            "-maxrate",
+            "-bufsize",
+        }
+        stripped: list[str] = []
+        skip_next = False
+        for tok in ffmpeg_args:
+            if skip_next:
+                skip_next = False
+                continue
+            if tok in flags_with_value:
+                skip_next = True
+                continue
+            stripped.append(tok)
+        return stripped
+
+    def _ui_selected_bitrate(self) -> str:
+        mode = self.bitrate_mode_combo.currentText()
+        if "Constant" in mode:
+            return f"{self.target_bitrate_combo.currentText()}M"
+        dynamic_quality = self.quality_level_combo.currentText()
+        dynamic_map = {
+            "Max": "120M",
+            "High": "40M",
+            "Medium": "20M",
+            "Low": "8M",
+        }
+        return dynamic_map.get(dynamic_quality, "20M")
+
+    def _max_quality_flags_for_encoder(self, encoder: str, bitrate: str) -> list[str]:
+        enc = encoder.lower()
+        # Family detection is capability-based, not per-codec hardcoding.
+        if "nvenc" in enc:
+            return ["-preset", "p7", "-cq", "16", "-b:v", bitrate]
+        if "prores" in enc:
+            return ["-profile:v", "3"]
+        # Generic software/other encoders: apply aggressive quality-first defaults.
+        if "libx26" in enc or "libaom" in enc or "svt" in enc or "rav1e" in enc or "vpx" in enc:
+            return ["-preset", "veryslow", "-crf", "12", "-b:v", bitrate]
+        return ["-crf", "12", "-b:v", bitrate]
+
     def _selected_export_profile_to_ffmpeg_args(self) -> dict[str, Any]:
         """Return a backend mapping of current export choices to FFmpeg arguments."""
         if self.export_image_sequence_check.isChecked():
@@ -1935,41 +1998,16 @@ class MainWindow(QMainWindow):
         audio = self.audio_mode_combo.currentText()
         audio_args = AUDIO_PROFILES.get(audio, AUDIO_PROFILES["Copy Audio"])
 
-        # Start with the codec's base ffmpeg args and append bitrate/quality args.
+        # Codec-agnostic render argument negotiation:
+        # encoder from UI profile -> family detection -> universal max-quality flags.
         base_video_args = list(codec_profile.get("ffmpeg", []))
-        # Force GPU accelerated HEVC pipeline for H265-like output paths.
-        for idx, tok in enumerate(base_video_args):
-            if tok == "libx265":
-                base_video_args[idx] = "hevc_nvenc"
-        if "-c:v" in base_video_args and "hevc_nvenc" in base_video_args:
-            if "-preset" not in base_video_args:
-                base_video_args += ["-preset", "p7"]
-        bitrate_mode = getattr(self, "bitrate_mode_combo", None)
-        if bitrate_mode is not None and "Dynamic" in bitrate_mode.currentText():
-            # Dynamic (VBR/CRF) mode – map quality level to per-codec CRF/QP values
-            quality = getattr(self, "quality_level_combo", None)
-            qlvl = quality.currentText() if quality is not None else "Medium"
-            _CRF_MAP: dict[str, dict[str, Any]] = {
-                "libx264":    {"High": ["-crf", "18"], "Medium": ["-crf", "23"], "Low": ["-crf", "28"], "Max": ["-preset", "placebo", "-crf", "12"]},
-                "libx265":    {"High": ["-crf", "20"], "Medium": ["-crf", "28"], "Low": ["-crf", "35"], "Max": ["-preset", "placebo", "-crf", "12"]},
-                "libaom-av1": {"High": ["-crf", "28"], "Medium": ["-crf", "40"], "Low": ["-crf", "52"], "Max": ["-preset", "placebo", "-crf", "12"]},
-                "h264_nvenc": {"High": ["-cq", "18"], "Medium": ["-cq", "23"], "Low": ["-cq", "28"], "Max": ["-preset", "placebo", "-crf", "12"]},
-                "av1_nvenc":  {"High": ["-cq", "28"], "Medium": ["-cq", "40"], "Low": ["-cq", "52"], "Max": ["-preset", "placebo", "-crf", "12"]},
-                "libvpx-vp9": {"High": ["-crf", "18", "-b:v", "0"], "Medium": ["-crf", "33", "-b:v", "0"], "Low": ["-crf", "42", "-b:v", "0"], "Max": ["-preset", "placebo", "-crf", "12"]},
-            }
-            # Determine encoder from base args ("-c:v" value)
-            encoder = ""
-            for i, tok in enumerate(base_video_args):
-                if tok == "-c:v" and i + 1 < len(base_video_args):
-                    encoder = base_video_args[i + 1]
-            crf_args = _CRF_MAP.get(encoder, {}).get(qlvl, [])
-            base_video_args = base_video_args + crf_args
-        else:
-            # Constant (CBR) mode – append -b:v <target>M
-            target_bitrate = getattr(self, "target_bitrate_combo", None)
-            if target_bitrate is not None:
-                mbps = target_bitrate.currentText()
-                base_video_args = base_video_args + ["-b:v", f"{mbps}M"]
+        encoder = self._extract_encoder_from_args(base_video_args, codec_fallback=codec)
+        sanitized_video_args = self._strip_quality_flags(base_video_args)
+        bitrate = self._ui_selected_bitrate()
+        quality_flags = self._max_quality_flags_for_encoder(encoder, bitrate)
+        if "-c:v" not in sanitized_video_args:
+            sanitized_video_args = ["-c:v", encoder] + sanitized_video_args
+        base_video_args = sanitized_video_args + quality_flags
 
         return {
             "mode": "video",
