@@ -1198,8 +1198,7 @@ class MainWindow(QMainWindow):
             "seedvr2_ema_7b_sharp_fp16.safetensors",
         ]
         for _name in _dit_model_names:
-            _display = _name if len(_name) <= 30 else _name[:27] + "..."
-            self.dit_model_combo.addItem(_display, _name)
+            self.dit_model_combo.addItem(_name, _name)
         _idx = self.dit_model_combo.findData("seedvr2_ema_3b-Q8_0.gguf")
         if _idx >= 0:
             self.dit_model_combo.setCurrentIndex(_idx)
@@ -1285,10 +1284,6 @@ class MainWindow(QMainWindow):
         # Preview & Processing
         g, f = _make_group("Preview & Processing")
         self._preview_processing_group = g
-        self.seed_spin = QSpinBox()
-        self.seed_spin.setRange(0, 2147483647)
-        self.seed_spin.setValue(313)
-        f.addRow("Seed:", self.seed_spin)
 
         self.skip_first_frames_spin = QSpinBox()
         self.skip_first_frames_spin.setRange(0, 99999)
@@ -1299,7 +1294,7 @@ class MainWindow(QMainWindow):
         self.load_cap_spin.setRange(0, 99999)
         self.load_cap_spin.setValue(0)
         self.load_cap_spin.setToolTip("0 = load all frames; Preview auto-sets this to 81 and restores it when done")
-        f.addRow("Load Cap:", self.load_cap_spin)
+        f.addRow("Only Frames:", self.load_cap_spin)
 
         self.enable_video_chunking_check = QCheckBox()
         f.addRow("Enable Video Chunking:", self.enable_video_chunking_check)
@@ -1546,6 +1541,19 @@ class MainWindow(QMainWindow):
         for _cw in _host.findChildren(QCheckBox):
             _cw.setMaximumWidth(18)
             _cw.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+
+        # Per-widget width overrides (applied after the global loop above).
+        # DiT Model: closed button ≈ 30 chars (~240 px); popup auto-fits full names.
+        self.dit_model_combo.setMaximumWidth(240)
+        self.dit_model_combo.view().setMinimumWidth(460)
+        self.dit_model_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        # Pre-Downscale: compact ≈ 5 chars (~50 px).
+        self.pre_downscale_combo.setMaximumWidth(50)
+        self.pre_downscale_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToContents
+        )
 
         scroll.setWidget(_host)
         outer_layout.addWidget(scroll, stretch=1)
@@ -1892,7 +1900,6 @@ class MainWindow(QMainWindow):
             "uniform_batch_check": self.uniform_batch_check,
             "temporal_overlap_spin": self.temporal_overlap_spin,
             "prepend_frames_spin": self.prepend_frames_spin,
-            "seed_spin": self.seed_spin,
             "skip_first_frames_spin": self.skip_first_frames_spin,
             "load_cap_spin": self.load_cap_spin,
             "enable_video_chunking_check": self.enable_video_chunking_check,
@@ -2610,9 +2617,8 @@ class MainWindow(QMainWindow):
         if self.uniform_batch_check.isChecked():
             args.append("--uniform_batch_size")
 
-        # seed – always emit so the CLI uses the GUI value regardless of its own default
-        seed = self.seed_spin.value()
-        args += ["--seed", str(seed)]
+        # seed – always hardcoded so the CLI uses a fixed deterministic value
+        args += ["--seed", "313"]
 
         skip = self.skip_first_frames_spin.value()
         if skip:
