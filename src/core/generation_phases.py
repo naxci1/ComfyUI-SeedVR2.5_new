@@ -820,7 +820,8 @@ def decode_all_batches(
     ctx: Dict[str, Any],
     debug: 'Debug',
     progress_callback: Optional[Callable[[int, int, int, str], None]] = None,
-    cache_model: bool = False
+    cache_model: bool = False,
+    only_frames: int = 0
 ) -> Dict[str, Any]:
     """
     Phase 3: VAE Decoding.

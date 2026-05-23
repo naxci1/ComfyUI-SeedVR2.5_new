@@ -1428,7 +1428,8 @@ def _process_frames_core(
     # Phase 3: Decode
     ctx = decode_all_batches(
         runner, ctx=ctx, debug=debug, progress_callback=None,
-        cache_model=cache_vae
+        cache_model=cache_vae,
+        only_frames=args.only_frames
     )
     
     # Phase 4: Post-process
@@ -1841,6 +1842,8 @@ Examples:
                         help="Skip N initial frames (default: 0)")
     process_group.add_argument("--load_cap", type=int, default=0,
                         help="Load maximum N frames from video. 0 = load all (default: 0)")
+    process_group.add_argument("--only_frames", type=int, default=0,
+                        help="Limits the maximum number of frames processed per VAE decode chunk to prevent OOM. 0 = no limit (default: 0)")
     process_group.add_argument("--chunk_size", type=int, default=0,
                         help="Frames per chunk for streaming mode. When > 0, processes video in "
                              "memory-bounded chunks of N frames. 0 = load all frames at once (default: 0)")
