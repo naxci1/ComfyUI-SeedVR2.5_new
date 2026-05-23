@@ -221,6 +221,17 @@ def encode_all_batches(
     
     debug.log("", category="none", force=True)
     debug.log("━━━━━━━━ Phase 1: VAE encoding ━━━━━━━━", category="none", force=True)
+
+    # Flush Dynamo's compiled-graph cache before every encoding phase.  When
+    # processing videos in streaming/chunking mode each chunk may have a
+    # different temporal length, so stale compiled graphs that were captured for
+    # a previous tensor shape must be discarded to prevent shape-mismatch
+    # RuntimeErrors inside torch.compile / CUDA Graph replay.
+    try:
+        torch._dynamo.reset()
+    except Exception:
+        pass  # Best-effort: non-fatal if dynamo is not available
+
     debug.start_timer("phase1_encoding")
 
     # Context must be provided

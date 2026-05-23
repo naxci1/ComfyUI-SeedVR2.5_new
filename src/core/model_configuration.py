@@ -1265,7 +1265,7 @@ def apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionIn
             decoder_compiled = hasattr(model, 'decoder') and hasattr(model.decoder, '_orig_mod')
             
             if not (encoder_compiled and decoder_compiled):
-                model = _apply_vae_submodule_compile(model, runner._vae_compile_args, debug)
+                model = _apply_vae_submodule_compile(model, runner._vae_compile_args, debug, runner=runner)
             else:
                 debug.log("Reusing existing torch.compile for VAE submodules", category="reuse")
         
@@ -1403,7 +1403,8 @@ def _disable_compile_for_dynamic_modules(module: torch.nn.Module) -> None:
 
 
 def _apply_vae_submodule_compile(model: torch.nn.Module, compile_args: Dict[str, Any], 
-                                 debug: Optional['Debug'] = None) -> torch.nn.Module:
+                                 debug: Optional['Debug'] = None,
+                                 runner: Optional[Any] = None) -> torch.nn.Module:
     """
     Apply torch.compile to VAE core submodules instead of entire model.
     
@@ -1420,14 +1421,56 @@ def _apply_vae_submodule_compile(model: torch.nn.Module, compile_args: Dict[str,
         model: VAE model instance
         compile_args: Compilation configuration
         debug: Debug instance
+        runner: Optional runner instance; used to detect active tiling/slicing so that
+                CUDA Graph trees can be disabled for the VAE (causal 3-D convolutions
+                with overlapping tiles are incompatible with static cudagraphify trees).
         
     Returns:
         VAE model with compiled submodules
     """
     try:
+        # Force dynamic shapes for VAE: video chunks/tiles produce variable temporal
+        # lengths that must not be baked into a static CUDA Graph.
+        dynamic_compile_args = dict(compile_args)
+        dynamic_compile_args['dynamic'] = True
+        # Always use inductor + default mode so the compile configuration is
+        # deterministic regardless of the global CLI flags.
+        dynamic_compile_args.setdefault('backend', 'inductor')
+        dynamic_compile_args.setdefault('mode', 'default')
+
         # Configure compilation settings
-        settings, _ = _configure_torch_compile(compile_args, "VAE submodules", debug)
-        
+        settings, _ = _configure_torch_compile(dynamic_compile_args, "VAE submodules", debug)
+
+        # Detect whether VAE tiling or temporal slicing is active.  Causal 3-D
+        # convolutions with overlapping tiles produce tensor shapes that change
+        # across micro-chunks, which is mathematically incompatible with static
+        # deferred CUDA Graph trees.  Disable them for this scope only.
+        tiling_active = False
+        if runner is not None:
+            tiling_active = bool(
+                getattr(runner, 'encode_tiled', False)
+                or getattr(runner, 'decode_tiled', False)
+            )
+        if not tiling_active and hasattr(model, '_causal_slicing_enabled'):
+            tiling_active = bool(model._causal_slicing_enabled)
+
+        _prev_cudagraphs = None
+        if tiling_active:
+            try:
+                import torch._inductor.config as _inductor_cfg
+                _prev_cudagraphs = getattr(_inductor_cfg.triton, 'cudagraphs', True)
+                _inductor_cfg.triton.cudagraphs = False
+                debug.log(
+                    "VAE tiling/slicing active: disabled inductor CUDA Graph trees "
+                    "(triton.cudagraphs=False) to avoid causal convolution mismatches",
+                    category="setup", indent_level=1
+                )
+            except Exception as _cg_err:
+                debug.log(
+                    f"Could not disable triton.cudagraphs: {_cg_err}",
+                    level="WARNING", category="setup", indent_level=1
+                )
+
         # Compile submodules
         compiled_modules = []
         debug.start_timer("vae_submodule_compile")
@@ -1449,6 +1492,14 @@ def _apply_vae_submodule_compile(model: torch.nn.Module, compile_args: Dict[str,
         debug.end_timer("vae_submodule_compile", 
                        f"VAE submodules compiled: {', '.join(compiled_modules)}", force=True)
         debug.log(f"Actual compilation will happen on first batch (expect initial delay, then speedup)", category="info", indent_level=1)
+
+        # Restore the previous cudagraphs setting after compilation wrapping completes
+        if _prev_cudagraphs is not None:
+            try:
+                import torch._inductor.config as _inductor_cfg
+                _inductor_cfg.triton.cudagraphs = _prev_cudagraphs
+            except Exception:
+                pass
         
         return model
         
