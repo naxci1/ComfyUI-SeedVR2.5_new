@@ -1099,8 +1099,8 @@ class MainWindow(QMainWindow):
     def _build_right_panel(self) -> QWidget:
         # ── Outer container (never scrolls itself) ──────────────────────
         outer = QWidget()
-        outer.setMinimumWidth(460)
-        outer.setMaximumWidth(640)
+        outer.setMinimumWidth(560)
+        outer.setMaximumWidth(700)
         outer_layout = QVBoxLayout(outer)
         outer_layout.setContentsMargins(0, 0, 0, 0)
         outer_layout.setSpacing(0)
@@ -1166,7 +1166,7 @@ class MainWindow(QMainWindow):
         # ── Adjustments pane ───────────────────────────────────────────
         self._adj_pane = QWidget()
         adj_layout = QVBoxLayout(self._adj_pane)
-        adj_layout.setContentsMargins(10, 10, 10, 10)
+        adj_layout.setContentsMargins(10, 10, 15, 10)
         adj_layout.setSpacing(8)
 
         # Presets bar
@@ -1203,7 +1203,6 @@ class MainWindow(QMainWindow):
         _idx = self.dit_model_combo.findData("seedvr2_ema_3b-Q8_0.gguf")
         if _idx >= 0:
             self.dit_model_combo.setCurrentIndex(_idx)
-        self.dit_model_combo.setMinimumWidth(240)
         f.addRow("DiT Model:", self.dit_model_combo)
         adj_layout.addWidget(g)
 
@@ -1327,7 +1326,6 @@ class MainWindow(QMainWindow):
             "Auto/CPU are exclusive; multiple GPU N items may be checked together\n"
             "for multi-GPU inference (--cuda_device 0,1,…)."
         )
-        self.gpu_device_combo.setMinimumWidth(240)
         f.addRow("GPU Device:", self.gpu_device_combo)
 
         self.dit_offload_combo = QComboBox()
@@ -1399,7 +1397,6 @@ class MainWindow(QMainWindow):
         _attn_idx = self.attention_mode_combo.findText("sageattn_3")
         if _attn_idx >= 0:
             self.attention_mode_combo.setCurrentIndex(_attn_idx)
-        self.attention_mode_combo.setMinimumWidth(240)
         f.addRow("Attention Mode:", self.attention_mode_combo)
         self.estimated_processing_fps_spin = QDoubleSpinBox()
         self.estimated_processing_fps_spin.setRange(0.1, 120.0)
@@ -1437,7 +1434,7 @@ class MainWindow(QMainWindow):
         self._codec_pane = QWidget()
         self._codec_pane.setVisible(False)
         codec_layout = QVBoxLayout(self._codec_pane)
-        codec_layout.setContentsMargins(10, 10, 10, 10)
+        codec_layout.setContentsMargins(10, 10, 15, 10)
         codec_layout.setSpacing(8)
 
         # ── File Format selector (first item in Codec pane) ────────────
@@ -1534,13 +1531,16 @@ class MainWindow(QMainWindow):
         _host_layout.addWidget(self._adj_pane)
         _host_layout.addWidget(self._codec_pane)
 
-        # Constrain input widgets: comboboxes fill available width; spinboxes
-        # are capped at 80 px so they never stretch across the full panel.
-        # Checkboxes are constrained to a compact width (~40 px) to eliminate
-        # excess empty spacing around the bare toggle indicator.
+        # Constrain input widgets: comboboxes are capped at 180 px (~20 chars) so
+        # they never push past the right border of the panel.  Spinboxes are capped
+        # at 80 px.  Checkboxes are kept at a compact indicator-only width.
         for _cw in _host.findChildren(QComboBox):
             _cw.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            _cw.setMaximumWidth(180)
         for _cw in _host.findChildren(QSpinBox):
+            _cw.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+            _cw.setMaximumWidth(80)
+        for _cw in _host.findChildren(QDoubleSpinBox):
             _cw.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
             _cw.setMaximumWidth(80)
         for _cw in _host.findChildren(QCheckBox):
