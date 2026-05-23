@@ -1937,6 +1937,13 @@ class MainWindow(QMainWindow):
 
         # Start with the codec's base ffmpeg args and append bitrate/quality args.
         base_video_args = list(codec_profile.get("ffmpeg", []))
+        # Force GPU accelerated HEVC pipeline for H265-like output paths.
+        for idx, tok in enumerate(base_video_args):
+            if tok == "libx265":
+                base_video_args[idx] = "hevc_nvenc"
+        if "-c:v" in base_video_args and "hevc_nvenc" in base_video_args:
+            if "-preset" not in base_video_args:
+                base_video_args += ["-preset", "p7"]
         bitrate_mode = getattr(self, "bitrate_mode_combo", None)
         if bitrate_mode is not None and "Dynamic" in bitrate_mode.currentText():
             # Dynamic (VBR/CRF) mode – map quality level to per-codec CRF/QP values
@@ -2659,7 +2666,15 @@ class MainWindow(QMainWindow):
         ffmpeg_profile = self._selected_export_profile_to_ffmpeg_args()
         self._on_log(f"🎬  Export Profile: {json.dumps(ffmpeg_profile, ensure_ascii=False)}")
 
-        self._thread, self._worker = create_worker_thread(cli_script, args, python_exe)
+        bitrate_mode_text = self.bitrate_mode_combo.currentText()
+        if "Constant" in bitrate_mode_text:
+            bitrate_text = self.target_bitrate_combo.currentText().strip() or "8"
+        else:
+            dynamic_map = {"Max": "80", "High": "40", "Medium": "20", "Low": "8"}
+            bitrate_text = dynamic_map.get(self.quality_level_combo.currentText(), "20")
+        worker_env = {"SEEDVR2_DEFAULT_BITRATE": f"{bitrate_text}M"}
+
+        self._thread, self._worker = create_worker_thread(cli_script, args, python_exe, env=worker_env)
         self._worker.log_line.connect(self._on_log)
         self._worker.progress_update.connect(self._on_global_progress)
         self._worker.batch_progress_update.connect(self._on_batch_progress)

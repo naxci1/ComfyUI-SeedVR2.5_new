@@ -153,16 +153,15 @@ class FFMPEGVideoWriter:
     Video writer using ffmpeg subprocess for encoding with 10-bit support.
     
     Provides cv2.VideoWriter-compatible interface (write, isOpened, release) while
-    using ffmpeg for encoding. Enables 10-bit output (yuv420p10le with x265) which
-    reduces banding artifacts in gradients compared to standard 8-bit encodes.
+    using ffmpeg for encoding. Defaults to GPU-accelerated NVENC HEVC encoding.
     
     Args:
         path: Output video file path
         width: Frame width in pixels
         height: Frame height in pixels
         fps: Frames per second
-        use_10bit: If True, uses x265 codec with yuv420p10le pixel format.
-                   If False, uses x264 with yuv420p (default: False)
+        use_10bit: If True, uses yuv420p10le pixel format when default args are used.
+                   If False, uses yuv420p (default: False)
         custom_video_args: Optional list of ffmpeg video encoding args to use instead of
                            the default H264/H265 codec selection. When provided, ``use_10bit``
                            is ignored for codec/pix_fmt selection (but you may still rely on it
@@ -184,8 +183,9 @@ class FFMPEGVideoWriter:
             video_enc_args = custom_video_args
         else:
             pix_fmt = 'yuv420p10le' if use_10bit else 'yuv420p'
-            codec = 'libx265' if use_10bit else 'libx264'
-            video_enc_args = ['-c:v', codec, '-pix_fmt', pix_fmt, '-preset', 'medium', '-crf', '12']
+            # Dynamic GPU default path (resolution/fps come from width/height/fps args above).
+            bitrate = os.environ.get("SEEDVR2_DEFAULT_BITRATE", "8M")
+            video_enc_args = ['-c:v', 'hevc_nvenc', '-preset', 'p7', '-b:v', bitrate, '-pix_fmt', pix_fmt]
         
         filter_args: List[str] = []
         if lut_path:
