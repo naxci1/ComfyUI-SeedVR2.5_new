@@ -742,7 +742,9 @@ class MainWindow(QMainWindow):
             "resolution_mode": "Pixel",
             "resolution": 720,
             "batch_size": 81,
+            "enable_video_chunking": False,
             "split_minutes": 3,
+            "enable_cuda_graphs": False,
             "vae_tiling": False,
             "debug": False,
         }
@@ -840,9 +842,9 @@ class MainWindow(QMainWindow):
 
         splitter.addWidget(self._build_right_panel())
         splitter.addWidget(self._build_left_panel())
-        splitter.setStretchFactor(0, 35)
-        splitter.setStretchFactor(1, 65)
-        splitter.setSizes([420, 780])
+        splitter.setStretchFactor(0, 22)
+        splitter.setStretchFactor(1, 78)
+        splitter.setSizes([380, 1020])
 
         # ── 3. Bottom controls bar ─────────────────────────────────────
         root_layout.addWidget(self._build_bottom_bar())
@@ -1280,13 +1282,19 @@ class MainWindow(QMainWindow):
         self.load_cap_spin.setToolTip("0 = load all frames; Preview auto-sets this to 81 and restores it when done")
         f.addRow("Load Cap:", self.load_cap_spin)
 
+        self.enable_video_chunking_check = QCheckBox()
+        f.addRow("Enable Video Chunking:", self.enable_video_chunking_check)
+
+        self.chunk_duration_minutes_label = QLabel("Chunk Duration (Minutes):")
         self.split_size_minutes_spin = QSpinBox()
-        self.split_size_minutes_spin.setRange(1, 9)
+        self.split_size_minutes_spin.setRange(1, 120)
         self.split_size_minutes_spin.setValue(3)
         self.split_size_minutes_spin.setSuffix(" min")
-        self.split_size_minutes_spin.setToolTip("Split size in minutes. Converted to frame count via minutes × 60 × FPS.")
+        self.split_size_minutes_spin.setToolTip("Chunk duration in minutes. Converted at runtime via minutes × 60 × source FPS.")
         self.chunk_size_spin = self.split_size_minutes_spin  # backwards-compatible persistence key
-        f.addRow("Split Size:", self.split_size_minutes_spin)
+        f.addRow(self.chunk_duration_minutes_label, self.split_size_minutes_spin)
+        self.enable_video_chunking_check.toggled.connect(self._update_chunking_visibility)
+        self._update_chunking_visibility(self.enable_video_chunking_check.isChecked())
         adj_layout.addWidget(g)
 
         # Device Management
@@ -1382,6 +1390,12 @@ class MainWindow(QMainWindow):
             "Used by GUI time estimation: Remaining Seconds = Remaining Frames / Estimated FPS"
         )
         f.addRow("Estimated Processing Speed (FPS):", self.estimated_processing_fps_spin)
+
+        self.enable_cuda_graphs_check = QCheckBox()
+        self.enable_cuda_graphs_check.setToolTip(
+            "Enable the CUDA-graphs torch.compile backend for DiT and VAE using the current live UI dimensions."
+        )
+        f.addRow("Enable CUDA Graphs:", self.enable_cuda_graphs_check)
 
         adj_layout.addWidget(g)
 
@@ -1696,15 +1710,15 @@ class MainWindow(QMainWindow):
             "background:#1A1D21;"
             "border:1px solid #2E3338;"
             "border-radius:10px;"
-            "padding:8px;"
+            "padding:4px;"
             "}"
         )
         panel_layout = QVBoxLayout(self.progress_panel)
-        panel_layout.setContentsMargins(10, 8, 10, 10)
-        panel_layout.setSpacing(8)
+        panel_layout.setContentsMargins(8, 6, 8, 6)
+        panel_layout.setSpacing(4)
 
         row = QHBoxLayout()
-        row.setSpacing(8)
+        row.setSpacing(6)
         self.batch_progress_circle = CircularProgressWidget("Batch", self.progress_panel)
         self.phase_progress_circle = CircularProgressWidget("Phase", self.progress_panel)
         self.eta_progress_circle = CircularProgressWidget("ETA", self.progress_panel)
@@ -1719,6 +1733,24 @@ class MainWindow(QMainWindow):
         ):
             row.addWidget(w)
         panel_layout.addLayout(row)
+
+        self.batch_progress_bar = QProgressBar(self.progress_panel)
+        self.batch_progress_bar.setRange(0, 1000)
+        self.batch_progress_bar.setValue(0)
+        self.batch_progress_bar.setTextVisible(False)
+        self.batch_progress_bar.setFixedHeight(9)
+        self.batch_progress_bar.setStyleSheet(
+            "QProgressBar {"
+            "background:#0F1114;"
+            "border:1px solid #2E3338;"
+            "border-radius:4px;"
+            "}"
+            "QProgressBar::chunk {"
+            "background:#0052CC;"
+            "border-radius:4px;"
+            "}"
+        )
+        panel_layout.addWidget(self.batch_progress_bar)
 
         self.current_file_progress_label = QLabel("Current File: -")
         self.batch_progress_label = QLabel("Overall Batch Progress")
@@ -1767,7 +1799,9 @@ class MainWindow(QMainWindow):
             self.resolution_mode_combo.setCurrentText(str(self._simple_defaults["resolution_mode"]))
             self.resolution_spin.setValue(int(self._simple_defaults["resolution"]))
             self.batch_size_spin.setValue(int(self._simple_defaults["batch_size"]))
+            self.enable_video_chunking_check.setChecked(bool(self._simple_defaults["enable_video_chunking"]))
             self.split_size_minutes_spin.setValue(int(self._simple_defaults["split_minutes"]))
+            self.enable_cuda_graphs_check.setChecked(bool(self._simple_defaults["enable_cuda_graphs"]))
             self.vae_encode_tiled_check.setChecked(bool(self._simple_defaults["vae_tiling"]))
             self.vae_decode_tiled_check.setChecked(bool(self._simple_defaults["vae_tiling"]))
             self.debug_check.setChecked(bool(self._simple_defaults["debug"]))
@@ -1776,6 +1810,10 @@ class MainWindow(QMainWindow):
         self._preview_processing_group.setVisible(advanced)
         self._vae_tiling_group.setVisible(advanced)
         self._debug_group.setVisible(advanced)
+
+    def _update_chunking_visibility(self, enabled: bool) -> None:
+        self.chunk_duration_minutes_label.setVisible(enabled)
+        self.split_size_minutes_spin.setVisible(enabled)
 
     def _build_menu_bar(self) -> None:
         settings_menu = self.menuBar().addMenu("Settings")
@@ -1836,6 +1874,7 @@ class MainWindow(QMainWindow):
             "seed_spin": self.seed_spin,
             "skip_first_frames_spin": self.skip_first_frames_spin,
             "load_cap_spin": self.load_cap_spin,
+            "enable_video_chunking_check": self.enable_video_chunking_check,
             "chunk_size_spin": self.chunk_size_spin,
             "gpu_device_combo": self.gpu_device_combo,
             "dit_offload_combo": self.dit_offload_combo,
@@ -1852,6 +1891,7 @@ class MainWindow(QMainWindow):
             "tile_debug_combo": self.tile_debug_combo,
             "attention_mode_combo": self.attention_mode_combo,
             "estimated_processing_fps_spin": self.estimated_processing_fps_spin,
+            "enable_cuda_graphs_check": self.enable_cuda_graphs_check,
             "cache_dit_check": self.cache_dit_check,
             "cache_vae_check": self.cache_vae_check,
             "auto_safeguard_check": self.auto_safeguard_check,
@@ -2065,20 +2105,25 @@ class MainWindow(QMainWindow):
             counter += 1
 
     @staticmethod
+    def _seedvr_prefixed_stem(stem: str) -> str:
+        clean_stem = stem.strip()
+        return clean_stem if clean_stem.startswith("seedvr_") else f"seedvr_{clean_stem}"
+
+    @classmethod
     def _generate_export_output_path(ext: str, output_dir: Path, part_idx: int = 1) -> Path:
         """Return a unique output path using padded numerical indexing.
 
-        Format: ``output_part_NNN_MMMMM<ext>``  (e.g. ``output_part_001_00001.mp4``).
+        Format: ``seedvr_output_part_NNN_MMMMM<ext>``.
         *part_idx* is the chunk/part number (1-based); the file counter increments
         until a non-existing path is found.
         """
         output_dir.mkdir(parents=True, exist_ok=True)
         for file_idx in range(1, 100_000):
-            stem = f"output_part_{part_idx:03d}_{file_idx:05d}"
+            stem = cls._seedvr_prefixed_stem(f"output_part_{part_idx:03d}_{file_idx:05d}")
             candidate = output_dir / f"{stem}{ext}"
             if not candidate.exists():
                 return candidate
-        return output_dir / f"output_part_{part_idx:03d}_99999{ext}"
+        return output_dir / f"{cls._seedvr_prefixed_stem(f'output_part_{part_idx:03d}_99999')}{ext}"
 
     def _serialize_model_settings(self) -> dict[str, Any]:
         data: dict[str, Any] = {}
@@ -2546,14 +2591,18 @@ class MainWindow(QMainWindow):
             if load_cap:
                 args += ["--load_cap", str(load_cap)]
 
-        split_minutes = (
-            int(self._simple_defaults["split_minutes"])
+        chunking_enabled = (
+            bool(self._simple_defaults["enable_video_chunking"])
             if not self._advanced_mode_enabled
-            else self.split_size_minutes_spin.value()
+            else self.enable_video_chunking_check.isChecked()
         )
-        fps_for_split = self._estimated_processing_fps()
-        split_frames = max(1, int(round(split_minutes * 60 * fps_for_split)))
-        args += ["--chunk_size", str(split_frames)]
+        if chunking_enabled:
+            split_minutes = (
+                int(self._simple_defaults["split_minutes"])
+                if not self._advanced_mode_enabled
+                else self.split_size_minutes_spin.value()
+            )
+            args += ["--chunk_duration_minutes", str(split_minutes)]
 
         prepend = self.prepend_frames_spin.value()
         if prepend:
@@ -2638,6 +2687,15 @@ class MainWindow(QMainWindow):
         attn = self.attention_mode_combo.currentText()
         if attn != "sdpa":
             args += ["--attention_mode", attn]
+
+        if self.enable_cuda_graphs_check.isChecked():
+            args += [
+                "--compile_dit",
+                "--compile_vae",
+                "--compile_backend",
+                "cudagraphs",
+                "--compile_dynamic",
+            ]
 
         # cache
         if self.cache_dit_check.isChecked():
@@ -3314,7 +3372,10 @@ class MainWindow(QMainWindow):
                 key=lambda f: f.stat().st_mtime,
                 reverse=True,
             )
-            preferred_videos = [f for f in video_candidates if f.stem.startswith(inp_stem)]
+            preferred_videos = [
+                f for f in video_candidates
+                if f.stem.startswith(inp_stem) or f.stem.startswith(self._seedvr_prefixed_stem(inp_stem))
+            ]
             selected_video = preferred_videos[0] if preferred_videos else (video_candidates[0] if video_candidates else None)
             if selected_video is not None:
                 self._load_output_video(str(selected_video))
@@ -3461,6 +3522,7 @@ class MainWindow(QMainWindow):
         self._last_batch_tot = 0
         self.batch_progress_circle.set_progress(0.0)
         self.batch_progress_circle.set_text("0/0")
+        self.batch_progress_bar.setValue(0)
         self.phase_progress_circle.set_progress(0.0)
         self.phase_progress_circle.set_text("1/4")
         self.eta_progress_circle.set_progress(0.0)
@@ -3559,6 +3621,7 @@ class MainWindow(QMainWindow):
             )
             self.batch_progress_circle.set_progress(0.0)
             self.batch_progress_circle.set_text("0/0")
+            self.batch_progress_bar.setValue(0)
             self.queue_progress_circle.set_progress(0.0)
             self.queue_progress_circle.set_text("0/0")
             return
@@ -3586,6 +3649,7 @@ class MainWindow(QMainWindow):
         pct = max(0.0, min(1.0, ratio))
         self.batch_progress_circle.set_progress(pct)
         self.batch_progress_circle.set_text(f"{self._last_batch_cur}/{self._last_batch_tot}" if self._last_batch_tot > 0 else f"{completed_files}/{self._queue_files_total}")
+        self.batch_progress_bar.setValue(int(round(pct * self.batch_progress_bar.maximum())))
         queue_ratio = completed_files / max(1, self._queue_files_total)
         self.queue_progress_circle.set_progress(max(0.0, min(1.0, queue_ratio)))
         self.queue_progress_circle.set_text(f"{completed_files}/{self._queue_files_total}")

@@ -466,6 +466,12 @@ _VIDEO_CONTAINER_EXTS: Dict[str, str] = {
     "webm": ".webm",
     "avi": ".avi",
 }
+OUTPUT_FILE_PREFIX = "seedvr_"
+SECONDS_PER_MINUTE = 60.0
+
+
+def _seedvr_prefixed_name(name: str) -> str:
+    return name if name.startswith(OUTPUT_FILE_PREFIX) else f"{OUTPUT_FILE_PREFIX}{name}"
 
 
 def generate_output_path(input_path: str, output_format: str, output_dir: Optional[str] = None, 
@@ -484,40 +490,34 @@ def generate_output_path(input_path: str, output_format: str, output_dir: Option
         Absolute output path (file for single image/video, directory for sequences)
     """
     input_path_obj = Path(input_path)
-    input_name = input_path_obj.stem
+    input_name = _seedvr_prefixed_name(input_path_obj.stem)
     
     # Determine base directory and whether to add suffix
     if output_dir:
-        # User specified output directory - use as-is, no suffix
+        # User specified output directory - use as-is.
         base_dir = Path(output_dir)
-        add_suffix = False
     elif from_directory:
-        # Batch mode: create sibling folder with _upscaled, keep original filenames
+        # Batch mode: create sibling folder with _upscaled, using seedvr-prefixed filenames.
         original_dir = input_path_obj.parent
         base_dir = original_dir.parent / f"{original_dir.name}_upscaled"
-        add_suffix = False
     else:
-        # Single file mode: output to same directory with _upscaled suffix
+        # Single file mode: output to the same directory with a seedvr-prefixed filename.
         base_dir = input_path_obj.parent
-        add_suffix = True
-    
-    # Build filename with optional suffix
-    file_suffix = "_upscaled" if add_suffix else ""
     
     # Image input always produces an image output regardless of the video format flag
     if input_type == "image":
-        output_path = base_dir / f"{input_name}{file_suffix}.png"
+        output_path = base_dir / f"{input_name}.png"
         return str(ensure_unique_output_path(output_path).resolve())
 
     # Generate output path based on format
     if output_format == "png":
         # PNG sequence: output is a directory, not a file
-        output_path = base_dir / f"{input_name}{file_suffix}"
+        output_path = base_dir / input_name
     else:
         # Video output: pick the container extension
         fmt_lower = (output_format or "mp4").lower()
         ext = _VIDEO_CONTAINER_EXTS.get(fmt_lower, f".{fmt_lower}")
-        output_path = base_dir / f"{input_name}{file_suffix}{ext}"
+        output_path = base_dir / f"{input_name}{ext}"
     
     return str(ensure_unique_output_path(output_path).resolve())
 
@@ -705,13 +705,28 @@ def process_single_file(input_path: str, args: "argparse.Namespace", device_list
             debug.log(f"Effective target resolution: {args.resolution} px (short side)", category="info", force=True, indent_level=1)
             
             # Streaming mode: process in chunks
-            chunk_size = args.chunk_size if args.chunk_size > 0 else frames_to_process
-            streaming = args.chunk_size > 0
+            requested_chunk_size = int(getattr(args, "chunk_size", 0) or 0)
+            chunk_duration_minutes = float(getattr(args, "chunk_duration_minutes", 0.0) or 0.0)
+            runtime_chunk_size = 0
+            if requested_chunk_size > 0:
+                runtime_chunk_size = requested_chunk_size
+            elif chunk_duration_minutes > 0.0:
+                runtime_chunk_size = int(round(chunk_duration_minutes * SECONDS_PER_MINUTE * fps))
+            chunk_size = runtime_chunk_size if runtime_chunk_size > 0 else frames_to_process
+            streaming = runtime_chunk_size > 0
             total_chunks = (frames_to_process + chunk_size - 1) // chunk_size  # ceiling division
             
             if streaming:
-                debug.log(f"Streaming mode: chunks of {chunk_size} frames, overlap={args.temporal_overlap}", 
-                         category="info", force=True, indent_level=1)
+                if requested_chunk_size > 0:
+                    debug.log(
+                        f"Streaming mode: chunks of {chunk_size} frames, overlap={args.temporal_overlap}",
+                        category="info", force=True, indent_level=1
+                    )
+                else:
+                    debug.log(
+                        f"Streaming mode: {chunk_duration_minutes:g} minute chunks → {chunk_size} frames at {fps:.2f} FPS, overlap={args.temporal_overlap}",
+                        category="info", force=True, indent_level=1
+                    )
             
             # Image sequences: detect by format extension, not just "png"
             _image_seq_exts = {"png", "tif", "tiff", "jpg", "jpeg", "dpx", "exr"}
@@ -1771,6 +1786,8 @@ Examples:
     process_group.add_argument("--chunk_size", type=int, default=0,
                         help="Frames per chunk for streaming mode. When > 0, processes video in "
                              "memory-bounded chunks of N frames. 0 = load all frames at once (default: 0)")
+    process_group.add_argument("--chunk_duration_minutes", type=float, default=0.0,
+                        help="Chunk duration in minutes for streaming mode. Runtime chunk size is computed as minutes × 60 × source FPS. Ignored when --chunk_size is set.")
     process_group.add_argument("--prepend_frames", type=int, default=0,
                         help="Prepend N reversed frames to reduce start artifacts (auto-removed). Default: 0")
     process_group.add_argument("--temporal_overlap", type=int, default=0,
@@ -1957,6 +1974,8 @@ def main() -> None:
             category="cache", force=True
         )
 
+    chunking_requested = bool((args.chunk_size or 0) > 0 or (args.chunk_duration_minutes or 0.0) > 0.0)
+
     if args.debug:
         if platform.system() == "Darwin":
             debug.log("You are running on macOS and will use the MPS backend!", category="info", force=True)
@@ -2005,9 +2024,9 @@ def main() -> None:
             debug.log(f"Found {len(media_files)} media files to process", category="file", force=True)
             
             # Multi-GPU caching requires streaming (workers cache within their chunk loops)
-            if (args.cache_dit or args.cache_vae) and len(device_list) > 1 and args.chunk_size <= 0:
+            if (args.cache_dit or args.cache_vae) and len(device_list) > 1 and not chunking_requested:
                 debug.log(
-                    "Model caching requires streaming mode (--chunk_size > 0) for multi-GPU. "
+                    "Model caching requires streaming mode (--chunk_size > 0 or --chunk_duration_minutes > 0) for multi-GPU. "
                     "Disabling caching for this run.",
                     level="WARNING", category="cache", force=True
                 )
@@ -2064,13 +2083,13 @@ def main() -> None:
             
             # Caching: single-GPU streaming uses runner_cache, multi-GPU streaming workers cache internally
             runner_cache = None
-            streaming = args.chunk_size > 0
+            streaming = chunking_requested
             
             if args.cache_dit or args.cache_vae:
                 if len(device_list) > 1:
                     if not streaming:
                         debug.log(
-                            "Model caching requires streaming mode (--chunk_size > 0) for multi-GPU. "
+                            "Model caching requires streaming mode (--chunk_size > 0 or --chunk_duration_minutes > 0) for multi-GPU. "
                             "Disabling caching for this run.",
                             level="WARNING", category="cache", force=True
                         )
