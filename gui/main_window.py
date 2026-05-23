@@ -1099,8 +1099,8 @@ class MainWindow(QMainWindow):
     def _build_right_panel(self) -> QWidget:
         # ── Outer container (never scrolls itself) ──────────────────────
         outer = QWidget()
-        outer.setMinimumWidth(380)
-        outer.setMaximumWidth(520)
+        outer.setMinimumWidth(460)
+        outer.setMaximumWidth(640)
         outer_layout = QVBoxLayout(outer)
         outer_layout.setContentsMargins(0, 0, 0, 0)
         outer_layout.setSpacing(0)
@@ -1185,7 +1185,7 @@ class MainWindow(QMainWindow):
         # AI Model
         g, f = _make_group("AI Model")
         self.dit_model_combo = QComboBox()
-        self.dit_model_combo.addItems([
+        _dit_model_names = [
             "seedvr2_ema_3b_fp8_e4m3fn.safetensors",
             "seedvr2_ema_3b-Q4_K_M.gguf",
             "seedvr2_ema_3b-Q8_0.gguf",
@@ -1196,8 +1196,11 @@ class MainWindow(QMainWindow):
             "seedvr2_ema_7b_sharp-Q4_K_M.gguf",
             "seedvr2_ema_7b_sharp_fp8_e4m3fn_mixed_block35_fp16.safetensors",
             "seedvr2_ema_7b_sharp_fp16.safetensors",
-        ])
-        _idx = self.dit_model_combo.findText("seedvr2_ema_3b-Q8_0.gguf")
+        ]
+        for _name in _dit_model_names:
+            _display = _name if len(_name) <= 30 else _name[:27] + "..."
+            self.dit_model_combo.addItem(_display, _name)
+        _idx = self.dit_model_combo.findData("seedvr2_ema_3b-Q8_0.gguf")
         if _idx >= 0:
             self.dit_model_combo.setCurrentIndex(_idx)
         self.dit_model_combo.setMinimumWidth(240)
@@ -1768,6 +1771,7 @@ class MainWindow(QMainWindow):
         self.console.setFont(mono)
 
         controls_widget = QWidget()
+        controls_widget.setFixedWidth(170)
         controls_layout = QVBoxLayout(controls_widget)
         controls_layout.setContentsMargins(0, 0, 0, 0)
         controls_layout.setSpacing(6)
@@ -1786,7 +1790,7 @@ class MainWindow(QMainWindow):
         log_row.setContentsMargins(0, 0, 0, 0)
         log_row.setSpacing(8)
         log_row.addWidget(self.console, 7)
-        log_row.addWidget(controls_widget, 3)
+        log_row.addWidget(controls_widget)
         layout.addLayout(log_row, 1)
         layout.setStretch(0, 0)
         layout.setStretch(1, 0)
@@ -2148,7 +2152,9 @@ class MainWindow(QMainWindow):
             if isinstance(widget, CheckableComboBox):
                 data[key] = widget.checkedTexts()
             elif isinstance(widget, QComboBox):
-                data[key] = widget.currentText()
+                # Prefer item data (full value) over display text for combos using addItem(display, data)
+                item_data = widget.currentData()
+                data[key] = item_data if item_data is not None else widget.currentText()
             elif isinstance(widget, QSpinBox):
                 data[key] = widget.value()
             elif isinstance(widget, QDoubleSpinBox):
@@ -2165,7 +2171,10 @@ class MainWindow(QMainWindow):
             if isinstance(widget, CheckableComboBox) and isinstance(value, list):
                 widget.setCheckedTexts([str(v) for v in value])
             elif isinstance(widget, QComboBox):
-                idx = widget.findText(str(value))
+                # Try matching by item data (full value) first, then by display text
+                idx = widget.findData(str(value))
+                if idx < 0:
+                    idx = widget.findText(str(value))
                 if idx >= 0:
                     widget.setCurrentIndex(idx)
             elif isinstance(widget, QSpinBox):
@@ -2558,7 +2567,8 @@ class MainWindow(QMainWindow):
             args.append("--10bit")
 
         # dit model
-        args += ["--dit_model", self.dit_model_combo.currentText()]
+        _dit_model_val = self.dit_model_combo.currentData()
+        args += ["--dit_model", _dit_model_val if _dit_model_val is not None else self.dit_model_combo.currentText()]
 
         # pre-downscale (preprocessing factor before upscaling)
         pre_ds_text = (
