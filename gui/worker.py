@@ -12,10 +12,8 @@ import os
 import sys
 import signal
 import json
-import gc
-import tempfile
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import List, Optional
 
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
@@ -128,7 +126,6 @@ class InferenceWorker(QObject):
         args: List[str],
         python_exe: str = DEFAULT_PYTHON_EXE,
         env: Optional[dict] = None,
-        postprocess_config: Optional[dict[str, Any]] = None,
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
@@ -136,173 +133,8 @@ class InferenceWorker(QObject):
         self._args = args
         self._python_exe = python_exe
         self._env = env
-        self._postprocess_config = postprocess_config or {}
         self._process: Optional[subprocess.Popen] = None
         self._abort = False
-
-    @staticmethod
-    def _aggressive_cleanup() -> None:
-        gc.collect()
-        try:
-            import torch  # noqa: PLC0415
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                if hasattr(torch.cuda, "ipc_collect"):
-                    torch.cuda.ipc_collect()
-        except Exception:
-            pass
-
-    @staticmethod
-    def _ensure_unique_path(path: Path) -> Path:
-        if not path.exists():
-            return path
-        idx = 1
-        while True:
-            probe = path.with_name(f"{path.stem}_{idx}{path.suffix}")
-            if not probe.exists():
-                return probe
-            idx += 1
-
-    def _resolve_existing_output_asset(self, configured_output_path: Path) -> Optional[Path]:
-        """
-        Resolve the actual rendered video file path when CLI normalizes extensions.
-
-        Example mismatch:
-        - GUI arg:  ...\\preview_xxx.png
-        - CLI save: ...\\preview_xxx.mp4
-        """
-        # Force-check exact video counterparts first.
-        video_counterparts = [
-            configured_output_path.with_suffix(".mp4"),
-            configured_output_path.with_suffix(".mov"),
-        ]
-        for candidate in video_counterparts:
-            if candidate.exists():
-                self.log_line.emit(
-                    "ℹ  Video stabilizer output path synchronized: "
-                    f"{configured_output_path} -> {candidate}\n"
-                )
-                return candidate
-
-        if configured_output_path.exists() and configured_output_path.suffix.lower() in {".mp4", ".mov"}:
-            return configured_output_path
-
-        # Robust fallback: case-insensitive suffix match on same stem in directory.
-        parent = configured_output_path.parent
-        stem = configured_output_path.stem.lower()
-        if parent.exists():
-            for entry in parent.iterdir():
-                if not entry.is_file():
-                    continue
-                if entry.stem.lower() != stem:
-                    continue
-                if entry.suffix.lower() in {".mp4", ".mov"}:
-                    self.log_line.emit(
-                        "ℹ  Video stabilizer output path synchronized: "
-                        f"{configured_output_path} -> {entry}\n"
-                    )
-                    return entry
-        return None
-
-    def _run_video_stabilizer(self, env: dict[str, str]) -> bool:
-        if not self._postprocess_config.get("enabled", False):
-            return True
-        output_path_raw = str(self._postprocess_config.get("output_path", "")).strip().strip('"').strip("'")
-        if not output_path_raw:
-            self.log_line.emit("⚠  Video stabilizer skipped: output path missing.\n")
-            return True
-        configured_output_path = Path(output_path_raw)
-        output_path = self._resolve_existing_output_asset(configured_output_path)
-        if output_path is None:
-            self.log_line.emit(
-                "⚠  Video stabilizer skipped: output not found "
-                f"({configured_output_path}).\n"
-            )
-            return True
-
-        video_args = [str(x) for x in self._postprocess_config.get("video_args", [])]
-        audio_args = [str(x) for x in self._postprocess_config.get("audio_args", ["-c:a", "copy"])]
-        if not video_args:
-            self.log_line.emit(
-                "⚠  Video stabilizer skipped: no user-selected FFmpeg video args available.\n"
-            )
-            return True
-
-        stabilized_path = self._ensure_unique_path(
-            output_path.with_name(f"{output_path.stem}_stabilized{output_path.suffix}")
-        )
-
-        self.log_line.emit("🎥  Video stabilizer: pass 1/2 (motion analysis)…")
-        with tempfile.TemporaryDirectory(prefix="seedvr2_vidstab_") as tmp_dir:
-            trf_name = "transforms.trf"
-            pass1 = [
-                "ffmpeg",
-                "-y",
-                "-i",
-                str(output_path),
-                "-vf",
-                f"vidstabdetect=shakiness=5:accuracy=15:result={trf_name}",
-                "-f",
-                "null",
-                "-",
-            ]
-            run1 = subprocess.run(
-                pass1,
-                cwd=tmp_dir,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                creationflags=_CREATE_NO_WINDOW,
-                check=False,
-            )
-            if run1.returncode != 0:
-                self.log_line.emit(
-                    f"❌  Video stabilizer pass 1 failed (exit {run1.returncode}).\n{run1.stdout[-2000:]}"
-                )
-                return False
-
-            self.log_line.emit("🎥  Video stabilizer: pass 2/2 (transform + encode)…")
-            pass2 = [
-                "ffmpeg",
-                "-y",
-                "-i",
-                str(output_path),
-                "-vf",
-                f"vidstabtransform=input={trf_name}:smoothing=30:optzoom=1",
-                *video_args,
-                *audio_args,
-                str(stabilized_path),
-            ]
-            self.log_line.emit(
-                "ℹ  FFmpeg pass 2 command: "
-                f'ffmpeg -y -i "{output_path}" -vf '
-                f'"vidstabtransform=input={trf_name}:smoothing=30:optzoom=1" '
-                + " ".join(video_args + audio_args)
-                + f' "{stabilized_path}"\n'
-            )
-            run2 = subprocess.run(
-                pass2,
-                cwd=tmp_dir,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                creationflags=_CREATE_NO_WINDOW,
-                check=False,
-            )
-            if run2.returncode != 0:
-                self.log_line.emit(
-                    f"❌  Video stabilizer pass 2 failed (exit {run2.returncode}).\n{run2.stdout[-2000:]}"
-                )
-                return False
-
-        self.log_line.emit(f"✅  Stabilized output written: {stabilized_path}")
-        return True
 
     # ------------------------------------------------------------------
     # Public interface
@@ -442,19 +274,12 @@ class InferenceWorker(QObject):
 
         if self._abort:
             self.log_line.emit("\n⏹  Processing cancelled by user.\n")
-            self._aggressive_cleanup()
             self.finished.emit(False, "Cancelled.")
         elif rc == 0:
-            stabilized_ok = self._run_video_stabilizer(env)
-            self._aggressive_cleanup()
-            if stabilized_ok:
-                self.log_line.emit("\n✅  Processing completed successfully.\n")
-                self.finished.emit(True, "Done.")
-            else:
-                self.finished.emit(False, "Video stabilization failed.")
+            self.log_line.emit("\n✅  Processing completed successfully.\n")
+            self.finished.emit(True, "Done.")
         else:
             self.log_line.emit(f"\n❌  Process exited with code {rc}.\n")
-            self._aggressive_cleanup()
             self.finished.emit(False, f"Exit code {rc}.")
 
     def request_abort(self) -> None:
@@ -496,7 +321,6 @@ def create_worker_thread(
     args: List[str],
     python_exe: str = DEFAULT_PYTHON_EXE,
     env: Optional[dict] = None,
-    postprocess_config: Optional[dict[str, Any]] = None,
 ) -> tuple[QThread, InferenceWorker]:
     """
     Create a (QThread, InferenceWorker) pair ready to be started.
@@ -509,13 +333,7 @@ def create_worker_thread(
         thread.start()
     """
     thread = QThread()
-    worker = InferenceWorker(
-        cli_script,
-        args,
-        python_exe,
-        env,
-        postprocess_config=postprocess_config,
-    )
+    worker = InferenceWorker(cli_script, args, python_exe, env)
     worker.moveToThread(thread)
     thread.started.connect(worker.run)
     worker.finished.connect(thread.quit)
