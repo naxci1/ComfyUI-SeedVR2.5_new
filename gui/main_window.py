@@ -1128,6 +1128,14 @@ class MainWindow(QMainWindow):
         self._frame_forward_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
         self._frame_forward_btn.clicked.connect(lambda: self._step_frame(1))
 
+        self._audio_toggle_btn = QPushButton("🔊 Audio On")
+        self._audio_toggle_btn.setToolTip("Toggle preview audio mute/unmute")
+        self._audio_toggle_btn.setStyleSheet(_btn_css.replace("min-width: 34px", "min-width: 96px"))
+        self._audio_toggle_btn.setCheckable(True)
+        self._audio_toggle_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
+        self._audio_toggle_btn.clicked.connect(self._on_mute_toggled)
+        self._on_mute_toggled(False)
+
         self._time_lbl = QLabel("0:00/0:00")
         self._time_lbl.setMinimumWidth(72)
         self._time_lbl.setStyleSheet("color:#aaa; font-size:10px; padding: 0 2px;")
@@ -1186,6 +1194,7 @@ class MainWindow(QMainWindow):
         under_row.addWidget(self._play_btn)
         under_row.addWidget(self._pause_btn)
         under_row.addWidget(self._frame_forward_btn)
+        under_row.addWidget(self._audio_toggle_btn)
         under_row.addWidget(self._trim_in_btn)
         under_row.addWidget(self._trim_clear_btn)
         under_row.addWidget(self._trim_out_btn)
@@ -3662,7 +3671,7 @@ class MainWindow(QMainWindow):
             self._output_audio.setVolume(v)
 
     def _on_mute_toggled(self, muted: bool) -> None:
-        self._mute_btn.setText("\U0001f507" if muted else "\U0001f50a")  # 🔇 / 🔊
+        self._audio_toggle_btn.setText("🔇 Audio Off" if muted else "🔊 Audio On")
         if self._input_audio:
             self._input_audio.setMuted(muted)
         if self._output_audio:
