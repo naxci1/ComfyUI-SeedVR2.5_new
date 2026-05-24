@@ -171,19 +171,21 @@ class InferenceWorker(QObject):
         - GUI arg:  ...\\preview_xxx.png
         - CLI save: ...\\preview_xxx.mp4
         """
-        if configured_output_path.exists():
-            return configured_output_path
-
-        # First-pass exact stem extension substitutions requested by bug report.
-        candidate_suffixes = [".mp4", ".mov"]
-        for suffix in candidate_suffixes:
-            candidate = configured_output_path.with_suffix(suffix)
+        # Force-check exact video counterparts first.
+        video_counterparts = [
+            configured_output_path.with_suffix(".mp4"),
+            configured_output_path.with_suffix(".mov"),
+        ]
+        for candidate in video_counterparts:
             if candidate.exists():
                 self.log_line.emit(
                     "ℹ  Video stabilizer output path synchronized: "
                     f"{configured_output_path} -> {candidate}\n"
                 )
                 return candidate
+
+        if configured_output_path.exists() and configured_output_path.suffix.lower() in {".mp4", ".mov"}:
+            return configured_output_path
 
         # Robust fallback: case-insensitive suffix match on same stem in directory.
         parent = configured_output_path.parent
@@ -205,7 +207,7 @@ class InferenceWorker(QObject):
     def _run_video_stabilizer(self, env: dict[str, str]) -> bool:
         if not self._postprocess_config.get("enabled", False):
             return True
-        output_path_raw = str(self._postprocess_config.get("output_path", "")).strip()
+        output_path_raw = str(self._postprocess_config.get("output_path", "")).strip().strip('"').strip("'")
         if not output_path_raw:
             self.log_line.emit("⚠  Video stabilizer skipped: output path missing.\n")
             return True
