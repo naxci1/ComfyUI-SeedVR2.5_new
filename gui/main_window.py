@@ -1152,10 +1152,36 @@ class MainWindow(QMainWindow):
         self._open_output_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
         self._open_output_btn.clicked.connect(self._browse_output_video)
 
+        # Trim control buttons: [ Set In | X Clear | ] Set Out
+        _trim_css = (
+            _btn_css
+            + "QPushButton { min-width: 24px; font-weight: bold; }"
+        )
+        self._trim_in_btn = QPushButton("[")
+        self._trim_in_btn.setToolTip("Set In-Point to current frame  (shortcut: [)")
+        self._trim_in_btn.setStyleSheet(_trim_css)
+        self._trim_in_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
+        self._trim_in_btn.clicked.connect(self._set_in_point)
+
+        self._trim_clear_btn = QPushButton("✕")
+        self._trim_clear_btn.setToolTip("Clear In/Out trim range")
+        self._trim_clear_btn.setStyleSheet(_trim_css)
+        self._trim_clear_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
+        self._trim_clear_btn.clicked.connect(self._clear_trim_range)
+
+        self._trim_out_btn = QPushButton("]")
+        self._trim_out_btn.setToolTip("Set Out-Point to current frame  (shortcut: ])")
+        self._trim_out_btn.setStyleSheet(_trim_css)
+        self._trim_out_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
+        self._trim_out_btn.clicked.connect(self._set_out_point)
+
         under_row.addWidget(self._frame_back_btn)
         under_row.addWidget(self._play_btn)
         under_row.addWidget(self._pause_btn)
         under_row.addWidget(self._frame_forward_btn)
+        under_row.addWidget(self._trim_in_btn)
+        under_row.addWidget(self._trim_clear_btn)
+        under_row.addWidget(self._trim_out_btn)
         under_row.addWidget(self._time_lbl)
         under_row.addWidget(self._timecode_lbl)
         under_row.addWidget(self._seek_slider, stretch=1)
@@ -3441,6 +3467,15 @@ class MainWindow(QMainWindow):
             f"]  Out-Point set → frame {out_frame} ({self._ms_to_hhmmss(pos_ms)}) "
             f"→ Load Cap: {total} frames"
         )
+
+    def _clear_trim_range(self) -> None:
+        """Clear In/Out markers, remove the blue timeline highlight, and reset spinboxes."""
+        self._in_point_ms = None
+        self._out_point_ms = None
+        self._seek_slider.set_trim_fractions(None, None)
+        self.skip_first_frames_spin.setValue(0)
+        self.load_cap_spin.setValue(0)
+        self._on_log("✕  Trim range cleared → Skip First Frames and Load Cap reset to 0")
 
     def _update_time_label(self) -> None:
         p = self._active_player()
