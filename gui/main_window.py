@@ -8,7 +8,6 @@ from __future__ import annotations
 import ctypes
 import json
 import os
-import re
 import time
 import traceback
 
@@ -2083,34 +2082,43 @@ class MainWindow(QMainWindow):
             cfg_path = Path(__file__).resolve().parent.parent / cfg_name
             if not cfg_path.exists():
                 return defaults
-            content = cfg_path.read_text(encoding="utf-8")
+            lines = cfg_path.read_text(encoding="utf-8").splitlines()
+            section: Optional[str] = None
+            for raw_line in lines:
+                stripped = raw_line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
 
-            sampler_match = re.search(
-                r"(?ms)^\s*sampler:\s*?\n(?:\s+.*\n)*?\s*type:\s*([A-Za-z0-9_]+)",
-                content,
-            )
-            if sampler_match:
-                parsed_sampler = sampler_match.group(1).strip().lower()
-                if parsed_sampler in {"euler", "dpmpp_2m"}:
-                    defaults["sampler"] = parsed_sampler
+                if raw_line[:1] not in (" ", "\t") and stripped.endswith(":"):
+                    section = stripped[:-1].strip().lower()
+                    continue
 
-            schedule_match = re.search(
-                r"(?ms)^\s*schedule:\s*?\n(?:\s+.*\n)*?\s*type:\s*([A-Za-z0-9_]+)",
-                content,
-            )
-            if schedule_match:
-                schedule_type = schedule_match.group(1).strip().lower()
-                defaults["scheduler"] = "normal" if schedule_type == "lerp" else schedule_type
-                if defaults["scheduler"] not in {"normal", "karras", "exponential"}:
-                    defaults["scheduler"] = "normal"
+                if ":" not in stripped:
+                    continue
+                key, value = [part.strip() for part in stripped.split(":", 1)]
+                value = value.strip("'\"").lower()
 
-            cfg_match = re.search(
-                r"(?ms)^\s*cfg:\s*?\n(?:\s+.*\n)*?\s*scale:\s*([0-9]*\.?[0-9]+)",
-                content,
-            )
-            if cfg_match:
-                cfg_val = float(cfg_match.group(1))
-                defaults["cfg_scale"] = max(1.0, min(10.0, cfg_val))
+                if key == "sampler":
+                    section = "sampler"
+                    continue
+                if key == "schedule":
+                    section = "schedule"
+                    continue
+                if key == "cfg":
+                    section = "cfg"
+                    continue
+
+                if key == "type" and section == "sampler" and value in {"euler", "dpmpp_2m"}:
+                    defaults["sampler"] = value
+                elif key == "type" and section == "schedule":
+                    mapped = "normal" if value == "lerp" else value
+                    defaults["scheduler"] = mapped if mapped in {"normal", "karras", "exponential"} else "normal"
+                elif key == "scale" and section == "cfg":
+                    try:
+                        cfg_val = float(value)
+                        defaults["cfg_scale"] = max(1.0, min(10.0, cfg_val))
+                    except ValueError:
+                        pass
         except Exception:
             return defaults
         return defaults
