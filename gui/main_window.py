@@ -1300,7 +1300,13 @@ class MainWindow(QMainWindow):
         self.load_cap_spin.setRange(0, 99999)
         self.load_cap_spin.setValue(0)
         self.load_cap_spin.setToolTip("0 = load all frames; Preview auto-sets this to 81 and restores it when done")
-        f.addRow("Only Frames:", self.load_cap_spin)
+        f.addRow("Load Cap Frames:", self.load_cap_spin)
+
+        self.only_frames_spin = QSpinBox()
+        self.only_frames_spin.setRange(0, 99999)
+        self.only_frames_spin.setValue(0)
+        self.only_frames_spin.setToolTip("0 = no limit; limits the maximum number of frames processed per VAE decode chunk to prevent OOM.")
+        f.addRow("Only Frames:", self.only_frames_spin)
 
         self.enable_video_chunking_check = QCheckBox()
         f.addRow("Enable Video Chunking:", self.enable_video_chunking_check)
@@ -1890,6 +1896,7 @@ class MainWindow(QMainWindow):
             "prepend_frames_spin": self.prepend_frames_spin,
             "skip_first_frames_spin": self.skip_first_frames_spin,
             "load_cap_spin": self.load_cap_spin,
+            "only_frames_spin": self.only_frames_spin,
             "enable_video_chunking_check": self.enable_video_chunking_check,
             "chunk_size_spin": self.chunk_size_spin,
             "gpu_device_combo": self.gpu_device_combo,
@@ -2631,6 +2638,10 @@ class MainWindow(QMainWindow):
             load_cap = self.load_cap_spin.value()
             if load_cap:
                 args += ["--load_cap", str(load_cap)]
+
+        only_frames = self.only_frames_spin.value()
+        if only_frames:
+            args += ["--only_frames", str(only_frames)]
 
         chunking_enabled = (
             bool(self._simple_defaults["enable_video_chunking"])

@@ -1027,6 +1027,19 @@ def decode_all_batches(
                     category="memory", force=True
                 )
 
+            # ── only_frames definitive chunk override ────────────────────────────
+            # When --only_frames > 0, it acts as a hard cap on the number of frames
+            # per VAE decode pass (analogous to --load_cap for loading).  It takes
+            # priority over both the VRAM-based micro-chunk heuristic and the
+            # auto-safeguard cap so the user has explicit, deterministic control.
+            if only_frames > 0 and num_frames_check > only_frames:
+                _micro_chunk_size = only_frames
+                debug.log(
+                    f"[Only Frames] Chunking VAE decode at {only_frames} frames/pass "
+                    f"({num_frames_check} frames total)",
+                    category="memory", force=True
+                )
+
             # Move to VAE device with correct dtype for decoding (no-op if already there)
             upscaled_latent = manage_tensor(
                 tensor=upscaled_latent,
@@ -1061,6 +1074,8 @@ def decode_all_batches(
                         _mm2.soft_empty_cache()
                     except Exception:
                         pass
+                    import torch as _torch_cache
+                    _torch_cache.cuda.empty_cache()
                     _start = _end
                 sample = _torch.cat(_chunk_parts, dim=0)
                 del _chunk_parts
