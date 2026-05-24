@@ -77,6 +77,13 @@ except ImportError:
     cv2 = None  # type: ignore[assignment]
 
 try:
+    import winsound as _winsound
+    _WINSOUND_AVAILABLE = True
+except ImportError:
+    _winsound = None  # type: ignore[assignment]
+    _WINSOUND_AVAILABLE = False
+
+try:
     from PyQt6.QtMultimedia import QAudioOutput, QMediaMetaData, QMediaPlayer, QVideoFrame, QVideoSink
     from PyQt6.QtMultimediaWidgets import QVideoWidget
     _MULTIMEDIA_AVAILABLE = True
@@ -924,9 +931,9 @@ class MainWindow(QMainWindow):
 
         splitter.addWidget(self._build_right_panel())
         splitter.addWidget(self._build_left_panel())
-        splitter.setStretchFactor(0, 20)
-        splitter.setStretchFactor(1, 80)
-        splitter.setSizes([340, 1060])
+        splitter.setStretchFactor(0, 30)
+        splitter.setStretchFactor(1, 70)
+        splitter.setSizes([300, 700])
 
         # ── 3. Bottom controls bar ─────────────────────────────────────
         root_layout.addWidget(self._build_bottom_bar())
@@ -1562,6 +1569,11 @@ class MainWindow(QMainWindow):
         f.addRow("Auto Safeguard:", self.auto_safeguard_check)
         self.debug_check = QCheckBox()
         f.addRow("Verbose Debug:", self.debug_check)
+        self.enable_audio_notifications_check = QCheckBox()
+        self.enable_audio_notifications_check.setToolTip(
+            "Play a Windows system sound when processing finishes (success) or errors."
+        )
+        f.addRow("Sound Notifications:", self.enable_audio_notifications_check)
         adj_layout.addWidget(g)
 
         adj_layout.addStretch(1)
@@ -1695,6 +1707,9 @@ class MainWindow(QMainWindow):
         self.pre_downscale_combo.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToContents
         )
+        # Resolution container and Batch stepper: cap to 280 px so they stay compact.
+        _res_mode_container.setMaximumWidth(280)
+        self._batch_stepper_widget.setMaximumWidth(280)
 
         scroll.setWidget(_host)
         outer_layout.addWidget(scroll, stretch=1)
@@ -2070,6 +2085,7 @@ class MainWindow(QMainWindow):
             "cache_vae_check": self.cache_vae_check,
             "auto_safeguard_check": self.auto_safeguard_check,
             "debug_check": self.debug_check,
+            "enable_audio_notifications_check": self.enable_audio_notifications_check,
             "file_format_combo": self.file_format_combo,
         }
 
@@ -3181,8 +3197,14 @@ class MainWindow(QMainWindow):
         # Also set an explicit output PNG path so the CLI never tries to create a video from
         # a single-image input (which caused the cv2.imwrite crash on .mp4 extension).
         self._settings_win.input_edit.setText(self._preview_temp_path)
+        # Derive preview output name from the original input filename.
+        _orig_for_preview = Path(self._preview_original_input_path) if self._preview_original_input_path else None
+        if _orig_for_preview and _orig_for_preview.stem:
+            _preview_out_stem = f"seedvr2_{_orig_for_preview.stem}"
+        else:
+            _preview_out_stem = "seedvr2_preview_frame"
         preview_out_png = str(
-            self._ensure_unique_file_path(export_dir / "preview_upscaled_frame_001.png")
+            self._ensure_unique_file_path(export_dir / f"{_preview_out_stem}.png")
         )
         self._settings_win.output_edit.setText(preview_out_png)
         self.batch_size_spin.setValue(1)
@@ -4081,6 +4103,17 @@ class MainWindow(QMainWindow):
                     self._on_log(
                         f"📂  Output: {self._latest_output_path.resolve()}"
                     )
+            # Play success notification if enabled
+            if (
+                _WINSOUND_AVAILABLE
+                and _winsound is not None
+                and hasattr(self, "enable_audio_notifications_check")
+                and self.enable_audio_notifications_check.isChecked()
+            ):
+                try:
+                    _winsound.MessageBeep(_winsound.MB_ICONASTERISK)
+                except Exception:
+                    pass
             # After a Preview run, automatically switch to Split View for comparison
             if was_preview and _MULTIMEDIA_AVAILABLE:
                 self._preview_compare_active = self._latest_output_path is not None
@@ -4103,6 +4136,17 @@ class MainWindow(QMainWindow):
         else:
             self.status_label.setText(f"⚠  {msg}")
             self.status_label.setToolTip(msg)
+            # Play error notification if enabled
+            if (
+                _WINSOUND_AVAILABLE
+                and _winsound is not None
+                and hasattr(self, "enable_audio_notifications_check")
+                and self.enable_audio_notifications_check.isChecked()
+            ):
+                try:
+                    _winsound.MessageBeep(_winsound.MB_ICONHAND)
+                except Exception:
+                    pass
             console_text = self.console.toPlainText()
             tail = console_text[-12000:] if len(console_text) > 12000 else console_text
             if "out of memory" in tail.lower() or "cuda out of memory" in tail.lower():
