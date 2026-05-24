@@ -9,6 +9,7 @@ import ctypes
 import json
 import os
 import time
+import traceback
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import subprocess
@@ -17,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from PyQt6.QtCore import Qt, QRectF, QSettings, QUrl, QEvent, pyqtSignal
+from PyQt6.QtCore import Qt, QPoint, QRectF, QSettings, QUrl, QEvent, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QColor,
@@ -31,6 +32,7 @@ from PyQt6.QtGui import (
     QPixmap,
     QPainter,
     QPen,
+    QPolygon,
     QStandardItem,
     QStandardItemModel,
     QWheelEvent,
@@ -40,6 +42,7 @@ from PyQt6.QtWidgets import (
     QAbstractSpinBox,
     QButtonGroup,
     QFileDialog,
+    QFrame,
     QGraphicsPixmapItem,
     QGraphicsScene,
     QGraphicsView,
@@ -51,10 +54,10 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFormLayout,
+    QDoubleSpinBox,
     QMainWindow,
     QMenu,
     QMessageBox,
-    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -63,11 +66,22 @@ from PyQt6.QtWidgets import (
     QSplitter,
     QSplitterHandle,
     QStackedWidget,
-    QSystemTrayIcon,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None  # type: ignore[assignment]
+
+try:
+    import winsound as _winsound
+    _WINSOUND_AVAILABLE = True
+except ImportError:
+    _winsound = None  # type: ignore[assignment]
+    _WINSOUND_AVAILABLE = False
 
 try:
     from PyQt6.QtMultimedia import QAudioOutput, QMediaMetaData, QMediaPlayer, QVideoFrame, QVideoSink
@@ -234,10 +248,12 @@ INPUT_DIALOG_FILTER = (
 EXPORT_CODEC_PROFILES: dict[str, dict[str, dict[str, Any]]] = {
     "MP4": {
         "H.264 High (8-bit)": {"ffmpeg": ["-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p"], "is_10bit": False},
+        "H.264 (NVIDIA NVENC)": {"ffmpeg": ["-c:v", "h264_nvenc", "-preset", "p4", "-pix_fmt", "yuv420p"], "is_10bit": False},
         "H.265 (HEVC) Main (8-bit)": {"ffmpeg": ["-c:v", "libx265", "-profile:v", "main", "-pix_fmt", "yuv420p"], "is_10bit": False},
         "H.265 (HEVC) Main10 (10-bit)": {"ffmpeg": ["-c:v", "libx265", "-profile:v", "main10", "-pix_fmt", "yuv420p10le"], "is_10bit": True},
-        "AV1 (8-bit)": {"ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p"], "is_10bit": False},
-        "AV1 (10-bit)": {"ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p10le"], "is_10bit": True},
+        "AV1 (8-bit)": {"ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p", "-strict", "experimental", "-cpu-used", "4", "-row-mt", "1"], "is_10bit": False},
+        "AV1 (10-bit)": {"ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p10le", "-strict", "experimental", "-cpu-used", "4", "-row-mt", "1"], "is_10bit": True},
+        "AV1 (NVIDIA NVENC)": {"ffmpeg": ["-c:v", "av1_nvenc", "-preset", "p4", "-pix_fmt", "yuv420p"], "is_10bit": False},
     },
     "MOV": {
         "ProRes 422 Proxy": {"ffmpeg": ["-c:v", "prores_ks", "-profile:v", "0", "-pix_fmt", "yuv422p10le"], "is_10bit": True},
@@ -245,23 +261,32 @@ EXPORT_CODEC_PROFILES: dict[str, dict[str, dict[str, Any]]] = {
         "ProRes 422": {"ffmpeg": ["-c:v", "prores_ks", "-profile:v", "2", "-pix_fmt", "yuv422p10le"], "is_10bit": True},
         "ProRes 422 HQ": {"ffmpeg": ["-c:v", "prores_ks", "-profile:v", "3", "-pix_fmt", "yuv422p10le"], "is_10bit": True},
         "ProRes 4444 XQ": {"ffmpeg": ["-c:v", "prores_ks", "-profile:v", "5", "-pix_fmt", "yuva444p12le"], "is_10bit": True},
-        "QuickTime Animation (Alpha)": {"ffmpeg": ["-c:v", "qtrle", "-pix_fmt", "argb"], "is_10bit": False},
+        "H.264 High (8-bit)": {"ffmpeg": ["-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p"], "is_10bit": False},
+        "H.264 (NVIDIA NVENC)": {"ffmpeg": ["-c:v", "h264_nvenc", "-preset", "p4", "-pix_fmt", "yuv420p"], "is_10bit": False},
+        "H.265 (HEVC) Main (8-bit)": {"ffmpeg": ["-c:v", "libx265", "-profile:v", "main", "-pix_fmt", "yuv420p"], "is_10bit": False},
+        "H.265 (HEVC) Main10 (10-bit)": {"ffmpeg": ["-c:v", "libx265", "-profile:v", "main10", "-pix_fmt", "yuv420p10le"], "is_10bit": True},
+        "Uncompressed YUV (V210)": {"ffmpeg": ["-c:v", "v210"], "is_10bit": True},
         "Uncompressed RGB (R210)": {"ffmpeg": ["-c:v", "r210"], "is_10bit": True},
+        "QuickTime Animation (Alpha)": {"ffmpeg": ["-c:v", "qtrle", "-pix_fmt", "argb"], "is_10bit": False},
     },
     "MKV": {
         "H.264 High (8-bit)": {"ffmpeg": ["-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p"], "is_10bit": False},
+        "H.264 (NVIDIA NVENC)": {"ffmpeg": ["-c:v", "h264_nvenc", "-preset", "p4", "-pix_fmt", "yuv420p"], "is_10bit": False},
         "H.265 (HEVC) Main (8-bit)": {"ffmpeg": ["-c:v", "libx265", "-profile:v", "main", "-pix_fmt", "yuv420p"], "is_10bit": False},
         "H.265 (HEVC) Main10 (10-bit)": {"ffmpeg": ["-c:v", "libx265", "-profile:v", "main10", "-pix_fmt", "yuv420p10le"], "is_10bit": True},
-        "AV1 (8-bit)": {"ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p"], "is_10bit": False},
-        "AV1 (10-bit)": {"ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p10le"], "is_10bit": True},
+        "AV1 (8-bit)": {"ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p", "-strict", "experimental", "-cpu-used", "4", "-row-mt", "1"], "is_10bit": False},
+        "AV1 (10-bit)": {"ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p10le", "-strict", "experimental", "-cpu-used", "4", "-row-mt", "1"], "is_10bit": True},
+        "AV1 (NVIDIA NVENC)": {"ffmpeg": ["-c:v", "av1_nvenc", "-preset", "p4", "-pix_fmt", "yuv420p"], "is_10bit": False},
+        "VP9 (Good)": {"ffmpeg": ["-c:v", "libvpx-vp9", "-deadline", "good"], "is_10bit": False},
+        "VP9 (Best)": {"ffmpeg": ["-c:v", "libvpx-vp9", "-deadline", "best"], "is_10bit": False},
         "FFV1 (Lossless 8/10/12-bit)": {"ffmpeg": ["-c:v", "ffv1", "-level", "3"], "is_10bit": True},
         "Uncompressed YUV (V210)": {"ffmpeg": ["-c:v", "v210"], "is_10bit": True},
     },
     "WEBM": {
         "VP9 (Good)": {"ffmpeg": ["-c:v", "libvpx-vp9", "-deadline", "good"], "is_10bit": False},
         "VP9 (Best)": {"ffmpeg": ["-c:v", "libvpx-vp9", "-deadline", "best"], "is_10bit": False},
-        "AV1 (8-bit)": {"ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p"], "is_10bit": False},
-        "AV1 (10-bit)": {"ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p10le"], "is_10bit": True},
+        "AV1 (8-bit)": {"ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p", "-strict", "experimental", "-cpu-used", "4", "-row-mt", "1"], "is_10bit": False},
+        "AV1 (10-bit)": {"ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p10le", "-strict", "experimental", "-cpu-used", "4", "-row-mt", "1"], "is_10bit": True},
     },
 }
 
@@ -314,6 +339,63 @@ def _form_row(label_text: str, widget: QWidget) -> QHBoxLayout:
     return row
 
 
+class CircularProgressWidget(QWidget):
+    """Compact circular progress indicator with title and value text."""
+
+    def __init__(self, title: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._title = title
+        self._value = 0.0
+        self._text = "0%"
+        self.setMinimumSize(122, 122)
+        self.setMaximumSize(150, 150)
+
+    def set_progress(self, value: float) -> None:
+        self._value = max(0.0, min(1.0, value))
+        self.update()
+
+    def set_text(self, text: str) -> None:
+        self._text = text
+        self.update()
+
+    def paintEvent(self, _event) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = self.rect().adjusted(10, 16, -10, -10)
+        circle_rect = QRectF(rect.left(), rect.top() + 12, rect.width(), rect.width())
+
+        bg_pen = QPen(QColor("#2E3338"), 9)
+        painter.setPen(bg_pen)
+        painter.drawArc(circle_rect, 0, 360 * 16)
+
+        fg_pen = QPen(QColor("#11abda"), 9)
+        painter.setPen(fg_pen)
+        start_angle = 90 * 16
+        span_angle = int(-360 * 16 * self._value)
+        painter.drawArc(circle_rect, start_angle, span_angle)
+
+        painter.setPen(QColor("#E3E4E6"))
+        painter.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
+        painter.drawText(
+            QRectF(rect.left(), rect.top() - 2, rect.width(), 18),
+            Qt.AlignmentFlag.AlignCenter,
+            self._title,
+        )
+        painter.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        painter.drawText(circle_rect, Qt.AlignmentFlag.AlignCenter, self._text)
+        painter.end()
+
+
+class _NoOpProgressIndicator:
+    """Compatibility shim for removed circular progress widgets."""
+
+    def set_progress(self, _value: float) -> None:
+        pass
+
+    def set_text(self, _text: str) -> None:
+        pass
+
+
 
 # ---------------------------------------------------------------------------
 # Styled splitter handle – thick, coloured, with a ⇔ arrow indicator
@@ -339,6 +421,75 @@ class _StyledSplitter(QSplitter):
 
     def createHandle(self) -> QSplitterHandle:  # type: ignore[override]
         return _StyledSplitterHandle(Qt.Orientation.Horizontal, self)
+
+
+# ---------------------------------------------------------------------------
+# Trim-aware timeline slider
+# ---------------------------------------------------------------------------
+
+class _TrimSlider(QSlider):
+    """QSlider subclass that draws a coloured In/Out region and triangle markers."""
+
+    def __init__(self, orientation=Qt.Orientation.Horizontal, parent=None) -> None:
+        super().__init__(orientation, parent)
+        self._in_frac: Optional[float] = None   # [0, 1] fraction of total range
+        self._out_frac: Optional[float] = None
+
+    def set_trim_fractions(self, in_frac: Optional[float], out_frac: Optional[float]) -> None:
+        self._in_frac = in_frac
+        self._out_frac = out_frac
+        self.update()
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        super().paintEvent(event)
+        if self._in_frac is None and self._out_frac is None:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w = self.width()
+        h = self.height()
+        # Small inset so markers align with the actual track groove
+        pad = 8
+        track_w = w - 2 * pad
+        track_cy = h // 2
+
+        in_frac = self._in_frac if self._in_frac is not None else 0.0
+        out_frac = self._out_frac if self._out_frac is not None else 1.0
+        in_x = pad + int(in_frac * track_w)
+        out_x = pad + int(out_frac * track_w)
+
+        # Highlight selected range
+        region_color = QColor("#11abda")
+        region_color.setAlpha(60)
+        painter.fillRect(in_x, track_cy - 3, max(1, out_x - in_x), 6, region_color)
+
+        marker_top = track_cy - 11
+
+        # In-point: green downward triangle ▼
+        if self._in_frac is not None:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#00cc66"))
+            painter.drawPolygon(
+                QPolygon([
+                    QPoint(in_x - 4, marker_top),
+                    QPoint(in_x + 4, marker_top),
+                    QPoint(in_x, track_cy - 2),
+                ])
+            )
+
+        # Out-point: red downward triangle ▼
+        if self._out_frac is not None:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#ff4444"))
+            painter.drawPolygon(
+                QPolygon([
+                    QPoint(out_x - 4, marker_top),
+                    QPoint(out_x + 4, marker_top),
+                    QPoint(out_x, track_cy - 2),
+                ])
+            )
+
+        painter.end()
 
 
 # ---------------------------------------------------------------------------
@@ -627,7 +778,7 @@ class MainWindow(QMainWindow):
             pass
 
         super().__init__()
-        self.setWindowTitle("SeedVR2.5 GUI by HB2k v.1.4 beta")
+        self.setWindowTitle("SeedVR2.5 GUI by HB2k v1.6b")
         self.resize(1100, 900)
 
         # Create settings window first – it loads saved paths in its __init__
@@ -644,30 +795,66 @@ class MainWindow(QMainWindow):
         self._queue_jobs: list[dict[str, Any]] = []
         self._queue_running: bool = False
         self._queue_entry_counter: int = 0
+        self._active_file_status: str = ""
+        self._progress_status: str = ""
+        self._batch_status: str = ""
         self._force_exit: bool = False
         self._tray_tip_shown: bool = False
         self._drop_highlight_count: int = 0
+        self._current_file_path: str = ""
+        self._current_file_total_frames: int = 0
+        self._current_file_processed_frames: int = 0
+        self._queue_files_total: int = 0
+        self._queue_files_completed: int = 0
+        self._queue_file_frame_counts: dict[str, int] = {}
+        self._queue_ordered_files: list[str] = []
+        self._active_queue_index: int = -1
         self._preview_original_input_path: Optional[str] = None
         self._preview_original_input_mode: str = "File"
         self._preview_original_position: int = 0
         self._preview_compare_active: bool = False
         self._preview_saved_batch_size: int = 81
+        self._preview_saved_load_cap: Optional[int] = None  # restored after video-mode preview
+        # True when the current/last preview run processed a VIDEO clip (not a PNG frame)
+        self._is_preview_video_mode: bool = False
+        self._advanced_mode_enabled: bool = False
+        self._last_batch_cur: int = 0
+        self._last_batch_tot: int = 0
+        self._frozen_elapsed_seconds: Optional[float] = None
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.timeout.connect(self._update_elapsed_progress_ui)
+        # In/Out trim point state (milliseconds in the media timeline)
+        self._in_point_ms: Optional[int] = None
+        self._out_point_ms: Optional[int] = None
+        self._current_fps: float = 0.0  # cached from QMediaPlayer metadata
+        self._simple_defaults: dict[str, Any] = {
+            "pre_downscale": "1:1",
+            "resolution_mode": "Pixel",
+            "resolution": 720,
+            "batch_size": 81,
+            "enable_video_chunking": False,
+            "split_minutes": 3,
+            "vae_tiling": False,
+            "debug": False,
+        }
 
         self._build_ui()
         self._build_menu_bar()
         self.menuBar().hide()
 
         # Load window icon (PyInstaller-compatible path)
-        icon_path = Path(get_resource_path("assets/icon.ico"))
+        icon_path = Path(get_resource_path("assets/logo.png"))
+        if not icon_path.exists():
+            icon_path = Path(get_resource_path("assets/icon.ico"))
         if not icon_path.exists():
             icon_path = Path(get_resource_path("icon.ico"))
         self.setWindowIcon(QIcon(str(icon_path)))
         self._enable_global_drop_targets()
-        self._setup_system_tray()
         self._persistable_widgets = self._build_persistable_widget_map()
         self._update_export_controls()
         self._load_model_settings()
         self._prompt_load_last_preset()
+        self._apply_mode_visibility()
 
         self._set_running(False)
 
@@ -707,7 +894,7 @@ class MainWindow(QMainWindow):
         header_layout.setContentsMargins(6, 2, 6, 6)
         header_layout.setSpacing(10)
 
-        help_btn = QPushButton("Help")
+        help_btn = QPushButton("About")
         help_btn.setFlat(True)
         help_btn.clicked.connect(self._show_about_dialog)
 
@@ -719,14 +906,20 @@ class MainWindow(QMainWindow):
             lambda: QDesktopServices.openUrl(QUrl("https://github.com/naxci1/ComfyUI-SeedVR2.5_new"))
         )
 
-        settings_btn = QPushButton("⚙")
+        self.advanced_mode_btn = QPushButton("Simple Mode")
+        self.advanced_mode_btn.setCheckable(True)
+        self.advanced_mode_btn.setToolTip("Toggle between Simple Mode and Advanced Mode")
+        self.advanced_mode_btn.clicked.connect(self._toggle_advanced_mode)
+
+        settings_btn = QPushButton("Settings")
         settings_btn.setToolTip("Open Paths & Configuration settings")
-        settings_btn.setMinimumWidth(38)
+        settings_btn.setMinimumWidth(84)
         settings_btn.clicked.connect(self._open_settings)
 
         header_layout.addWidget(help_btn)
         header_layout.addWidget(github_btn)
         header_layout.addStretch(1)
+        header_layout.addWidget(self.advanced_mode_btn)
         header_layout.addWidget(settings_btn)
         root_layout.addWidget(header_widget)
 
@@ -736,14 +929,17 @@ class MainWindow(QMainWindow):
         splitter.setChildrenCollapsible(True)
         root_layout.addWidget(splitter, stretch=1)
 
-        splitter.addWidget(self._build_left_panel())
         splitter.addWidget(self._build_right_panel())
-        splitter.setStretchFactor(0, 65)
-        splitter.setStretchFactor(1, 35)
-        splitter.setSizes([780, 420])
+        splitter.addWidget(self._build_left_panel())
+        splitter.setStretchFactor(0, 30)
+        splitter.setStretchFactor(1, 70)
+        splitter.setSizes([300, 700])
 
         # ── 3. Bottom controls bar ─────────────────────────────────────
         root_layout.addWidget(self._build_bottom_bar())
+        root_layout.setStretch(0, 0)
+        root_layout.setStretch(1, 14)
+        root_layout.setStretch(2, 3)
         self._drop_overlay.raise_()
         self._sync_drop_overlay_geometry()
 
@@ -879,83 +1075,217 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(self._viewer_stack, stretch=1)
 
-        # ── File metadata label ────────────────────────────────────────
+        # ── Thin separator between viewer and under-viewer controls ───
+        _under_sep = QWidget()
+        _under_sep.setFixedHeight(1)
+        _under_sep.setStyleSheet("background:#272A2D;")
+        layout.addWidget(_under_sep)
+
+        # ── Single strict horizontal row: all controls under preview ───
+        # Contains: ⏮ ◀ ⏸ ⏭ | timecode | seek slider | Preview | Export | Split | Open Output
         self._current_input_is_image: bool = False
-        self._meta_label = QLabel("")
-        self._meta_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._meta_label.setStyleSheet("color:#888; font-size:11px; padding:2px 0;")
-        layout.addWidget(self._meta_label)
 
-        # ── Seek slider ────────────────────────────────────────────────
-        self._seek_slider = QSlider(Qt.Orientation.Horizontal)
-        self._seek_slider.setRange(0, 0)
-        self._seek_slider.setEnabled(_MULTIMEDIA_AVAILABLE)
-        self._seek_slider.sliderMoved.connect(self._on_seek)
-        layout.addWidget(self._seek_slider)
+        under_row = QHBoxLayout()
+        under_row.setContentsMargins(0, 4, 0, 4)
+        under_row.setSpacing(3)
 
-        # ── Control bar ────────────────────────────────────────────────
-        ctrl = QHBoxLayout()
+        _btn_css = (
+            "QPushButton {"
+            "  min-width: 34px; min-height: 26px;"
+            "  padding: 2px 4px;"
+            "  font-size: 14px;"
+            "  color: #e8e8e8;"
+            "  background: #3a3a3a;"
+            "  border: 1px solid #555;"
+            "  border-radius: 4px;"
+            "}"
+            "QPushButton:hover  { background: #505050; border-color: #888; }"
+            "QPushButton:pressed { background: #222; }"
+            "QPushButton:disabled { color: #555; background: #2a2a2a; border-color: #3a3a3a; }"
+        )
+
+        self._frame_back_btn = QPushButton("⏮")
+        self._frame_back_btn.setToolTip("Previous frame")
+        self._frame_back_btn.setStyleSheet(_btn_css)
+        self._frame_back_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
+        self._frame_back_btn.clicked.connect(lambda: self._step_frame(-1))
 
         self._play_btn = QPushButton("▶")
-        self._play_btn.setFixedWidth(36)
+        self._play_btn.setToolTip("Play")
+        self._play_btn.setStyleSheet(_btn_css)
         self._play_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
         self._play_btn.clicked.connect(self._on_play_pause)
 
         self._pause_btn = QPushButton("⏸")
-        self._pause_btn.setFixedWidth(36)
+        self._pause_btn.setToolTip("Pause")
+        self._pause_btn.setStyleSheet(_btn_css)
         self._pause_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
         self._pause_btn.clicked.connect(self._pause_playback)
 
-        self._frame_back_btn = QPushButton("⏮")
-        self._frame_back_btn.setFixedWidth(36)
-        self._frame_back_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
-        self._frame_back_btn.clicked.connect(lambda: self._step_frame(-1))
-
         self._frame_forward_btn = QPushButton("⏭")
-        self._frame_forward_btn.setFixedWidth(36)
+        self._frame_forward_btn.setToolTip("Next frame")
+        self._frame_forward_btn.setStyleSheet(_btn_css)
         self._frame_forward_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
         self._frame_forward_btn.clicked.connect(lambda: self._step_frame(1))
 
-        self._time_lbl = QLabel("0:00 / 0:00")
-        self._time_lbl.setMinimumWidth(100)
-        self._time_lbl.setStyleSheet("color:#888; font-size:11px;")
+        self._time_lbl = QLabel("0:00/0:00")
+        self._time_lbl.setMinimumWidth(72)
+        self._time_lbl.setStyleSheet("color:#aaa; font-size:10px; padding: 0 2px;")
 
-        self._split_toggle = QCheckBox("Split View")
+        # Detailed timecode label: "HH:MM:SS | F:N" — updated on every position change
+        self._timecode_lbl = QLabel("00:00:00 | F:0")
+        self._timecode_lbl.setToolTip(
+            "Current position: HH:MM:SS | Frame index\n"
+            "Press [ to set In-Point, ] to set Out-Point"
+        )
+        self._timecode_lbl.setStyleSheet("color:#11abda; font-size:10px; padding: 0 2px;")
+        self._timecode_lbl.setEnabled(_MULTIMEDIA_AVAILABLE)
+
+        self._seek_slider = _TrimSlider(Qt.Orientation.Horizontal)
+        self._seek_slider.setRange(0, 0)
+        self._seek_slider.setEnabled(_MULTIMEDIA_AVAILABLE)
+        self._seek_slider.sliderMoved.connect(self._on_seek)
+
+        self._split_toggle = QCheckBox("⊣⊢")
+        self._split_toggle.setToolTip("Split View")
         self._split_toggle.setEnabled(_MULTIMEDIA_AVAILABLE)
+        self._split_toggle.setMaximumWidth(22)
         self._split_toggle.toggled.connect(self._on_split_toggle_changed)
 
-        self._open_output_btn = QPushButton("Open Output…")
+        _out_css = _btn_css.replace("min-width: 34px", "min-width: 60px")
+        self._open_output_btn = QPushButton("📂 Out")
+        self._open_output_btn.setToolTip("Select Output Video…")
+        self._open_output_btn.setStyleSheet(_out_css)
         self._open_output_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
         self._open_output_btn.clicked.connect(self._browse_output_video)
 
-        ctrl.addWidget(self._frame_back_btn)
-        ctrl.addWidget(self._play_btn)
-        ctrl.addWidget(self._pause_btn)
-        ctrl.addWidget(self._frame_forward_btn)
-        ctrl.addWidget(self._time_lbl)
-        ctrl.addStretch(1)
-        ctrl.addWidget(self._split_toggle)
-        ctrl.addWidget(self._open_output_btn)
-        layout.addLayout(ctrl)
+        # Trim control buttons: [ Set In | X Clear | ] Set Out
+        _trim_css = (
+            _btn_css
+            + "QPushButton { min-width: 24px; font-weight: bold; }"
+        )
+        self._trim_in_btn = QPushButton("[")
+        self._trim_in_btn.setToolTip("Set In-Point to current frame  (shortcut: [)")
+        self._trim_in_btn.setStyleSheet(_trim_css)
+        self._trim_in_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
+        self._trim_in_btn.clicked.connect(self._set_in_point)
+
+        self._trim_clear_btn = QPushButton("✕")
+        self._trim_clear_btn.setToolTip("Clear In/Out trim range")
+        self._trim_clear_btn.setStyleSheet(_trim_css)
+        self._trim_clear_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
+        self._trim_clear_btn.clicked.connect(self._clear_trim_range)
+
+        self._trim_out_btn = QPushButton("]")
+        self._trim_out_btn.setToolTip("Set Out-Point to current frame  (shortcut: ])")
+        self._trim_out_btn.setStyleSheet(_trim_css)
+        self._trim_out_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
+        self._trim_out_btn.clicked.connect(self._set_out_point)
+
+        under_row.addWidget(self._frame_back_btn)
+        under_row.addWidget(self._play_btn)
+        under_row.addWidget(self._pause_btn)
+        under_row.addWidget(self._frame_forward_btn)
+        under_row.addWidget(self._trim_in_btn)
+        under_row.addWidget(self._trim_clear_btn)
+        under_row.addWidget(self._trim_out_btn)
+        under_row.addWidget(self._time_lbl)
+        under_row.addWidget(self._timecode_lbl)
+        under_row.addWidget(self._seek_slider, stretch=1)
+        under_row.addWidget(self.preview_btn)
+        under_row.addWidget(self._split_toggle)
+        under_row.addWidget(self._open_output_btn)
+        layout.addLayout(under_row)
+
+        # ── File metadata label ────────────────────────────────────────
+        self._meta_label = QLabel("")
+        self._meta_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._meta_label.setStyleSheet("color:#888; font-size:11px; padding:1px 0;")
+        layout.addWidget(self._meta_label)
+        layout.setStretch(0, 0)
+        layout.setStretch(1, 14)
+        layout.setStretch(2, 0)
+        layout.setStretch(3, 0)
+        layout.setStretch(4, 0)
 
         return panel
 
     # ── Right panel ────────────────────────────────────────────────────
 
     def _build_right_panel(self) -> QWidget:
+        # ── Outer container (never scrolls itself) ──────────────────────
+        outer = QWidget()
+        outer.setMinimumWidth(560)
+        outer.setMaximumWidth(700)
+        outer_layout = QVBoxLayout(outer)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+
+        # ── Tab header bar (Adjustments | Codec settings) ───────────────
+        _TAB_SS = (
+            "QPushButton{"
+            "  background:transparent; border:none;"
+            "  border-bottom:2px solid transparent;"
+            "  color:#888; padding:6px 14px; font-size:13px;"
+            "}"
+            "QPushButton:checked{ color:#E3E4E6; border-bottom:2px solid #0052CC; }"
+            "QPushButton:hover:!checked{ color:#BFC3CA; }"
+        )
+        tab_header = QWidget()
+        tab_header.setObjectName("tab_bar")
+        tab_header.setFixedHeight(38)
+        th_layout = QHBoxLayout(tab_header)
+        th_layout.setContentsMargins(6, 0, 6, 0)
+        th_layout.setSpacing(0)
+
+        self._tab_adj_btn = QPushButton("Adjustments")
+        self._tab_adj_btn.setCheckable(True)
+        self._tab_adj_btn.setChecked(True)
+        self._tab_adj_btn.setStyleSheet(_TAB_SS)
+
+        self._tab_codec_btn = QPushButton("Codec settings")
+        self._tab_codec_btn.setCheckable(True)
+        self._tab_codec_btn.setStyleSheet(_TAB_SS)
+
+        _tab_grp = QButtonGroup(outer)
+        _tab_grp.setExclusive(True)
+        _tab_grp.addButton(self._tab_adj_btn, 0)
+        _tab_grp.addButton(self._tab_codec_btn, 1)
+        _tab_grp.idToggled.connect(
+            lambda idx, checked: self._switch_right_tab(idx) if checked else None
+        )
+
+        th_layout.addWidget(self._tab_adj_btn)
+        th_layout.addWidget(self._tab_codec_btn)
+        th_layout.addStretch(1)
+
+        tab_sep = QWidget()
+        tab_sep.setFixedHeight(1)
+        tab_sep.setStyleSheet("background:#272A2D;")
+
+        outer_layout.addWidget(tab_header)
+        outer_layout.addWidget(tab_sep)
+
+        # ── Single scroll area that holds BOTH panes ────────────────────
         scroll = QScrollArea()
-        scroll.setMinimumWidth(380)
-        scroll.setMaximumWidth(520)
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
 
-        container = QWidget()
-        container.setMaximumWidth(500)
-        container_layout = QVBoxLayout(container)
-        container_layout.setContentsMargins(10, 10, 10, 10)
-        container_layout.setSpacing(8)
+        # Host: stacks the two panes vertically; only one is visible at a time
+        _host = QWidget()
+        _host_layout = QVBoxLayout(_host)
+        _host_layout.setContentsMargins(0, 0, 0, 0)
+        _host_layout.setSpacing(0)
 
-        # ── Presets ────────────────────────────────────────────────────
+        # ── Adjustments pane ───────────────────────────────────────────
+        self._adj_pane = QWidget()
+        adj_layout = QVBoxLayout(self._adj_pane)
+        adj_layout.setContentsMargins(10, 10, 15, 10)
+        adj_layout.setSpacing(8)
+
+        # Presets bar
         preset_bar = QHBoxLayout()
         self.save_preset_btn = QPushButton("Save Preset…")
         self.save_preset_btn.setToolTip("Save model/processing settings to a JSON preset")
@@ -966,12 +1296,12 @@ class MainWindow(QMainWindow):
         preset_bar.addWidget(self.save_preset_btn)
         preset_bar.addWidget(self.load_preset_btn)
         preset_bar.addStretch(1)
-        container_layout.addLayout(preset_bar)
+        adj_layout.addLayout(preset_bar)
 
-        # ── AI Model ───────────────────────────────────────────────────
+        # AI Model
         g, f = _make_group("AI Model")
         self.dit_model_combo = QComboBox()
-        self.dit_model_combo.addItems([
+        _dit_model_names = [
             "seedvr2_ema_3b_fp8_e4m3fn.safetensors",
             "seedvr2_ema_3b-Q4_K_M.gguf",
             "seedvr2_ema_3b-Q8_0.gguf",
@@ -982,54 +1312,74 @@ class MainWindow(QMainWindow):
             "seedvr2_ema_7b_sharp-Q4_K_M.gguf",
             "seedvr2_ema_7b_sharp_fp8_e4m3fn_mixed_block35_fp16.safetensors",
             "seedvr2_ema_7b_sharp_fp16.safetensors",
-        ])
-        _idx = self.dit_model_combo.findText("seedvr2_ema_3b-Q8_0.gguf")
+        ]
+        for _name in _dit_model_names:
+            self.dit_model_combo.addItem(_name, _name)
+        _idx = self.dit_model_combo.findData("seedvr2_ema_3b-Q8_0.gguf")
         if _idx >= 0:
             self.dit_model_combo.setCurrentIndex(_idx)
         f.addRow("DiT Model:", self.dit_model_combo)
-        container_layout.addWidget(g)
+        adj_layout.addWidget(g)
 
-        # ── Output Settings ────────────────────────────────────────────
-        g, f = _make_group("Export Settings")
-        self.container_combo = QComboBox()
-        self.container_combo.addItems(list(EXPORT_CODEC_PROFILES.keys()))
-        self.container_combo.currentTextChanged.connect(self._update_export_controls)
-        f.addRow("Container:", self.container_combo)
-
-        self.video_codec_combo = QComboBox()
-        f.addRow("Video Codec:", self.video_codec_combo)
-
-        self.export_image_sequence_check = QCheckBox()
-        self.export_image_sequence_check.toggled.connect(self._update_export_controls)
-        f.addRow("Export as Image Sequence:", self.export_image_sequence_check)
-
-        self.image_sequence_format_combo = QComboBox()
-        self.image_sequence_format_combo.addItems(list(IMAGE_SEQUENCE_PROFILES.keys()))
-        f.addRow("Image Sequence Format:", self.image_sequence_format_combo)
-
-        self.audio_mode_combo = QComboBox()
-        self.audio_mode_combo.addItems(list(AUDIO_PROFILES.keys()))
-        f.addRow("Audio:", self.audio_mode_combo)
-
-        self.video_backend_combo = QComboBox()
-        self.video_backend_combo.addItems(["ffmpeg"])
-        self.video_backend_combo.setEnabled(False)
-        f.addRow("Video Backend:", self.video_backend_combo)
-
-        self.use_10bit_check = QCheckBox()
-        f.addRow("10-bit Output:", self.use_10bit_check)
-
-        self.color_correction_combo = QComboBox()
-        self.color_correction_combo.addItems(["lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none"])
-        f.addRow("Color Correction:", self.color_correction_combo)
-        container_layout.addWidget(g)
-
-        # ── Enhancement (Upscaling) ────────────────────────────────────
+        # Processing Settings
         g, f = _make_group("Processing Settings")
+        self._processing_settings_group = g
+
+        # --- Pre-Downscale ---
+        self.pre_downscale_combo = QComboBox()
+        self.pre_downscale_combo.addItems(["1:1", "2:1", "3:1"])
+        self.pre_downscale_combo.setToolTip(
+            "Downscale the input before upscaling.\n"
+            "1:1 = no downscale (passthrough)\n"
+            "2:1 = halve input dimensions via Lanczos before feeding the model\n"
+            "3:1 = reduce to 1/3 input dimensions via Lanczos"
+        )
+        f.addRow("Pre-Downscale:", self.pre_downscale_combo)
+
+        # --- Resolution Mode (X Times / Pixel / Standard) + value control ---
+        _res_mode_row = QHBoxLayout()
+        _res_mode_row.setSpacing(4)
+        self.resolution_mode_combo = QComboBox()
+        self.resolution_mode_combo.addItems(["Pixel", "X Times", "Standard"])
+        self.resolution_mode_combo.setToolTip(
+            "Pixel: target the output at an exact pixel height.\n"
+            "X Times: multiply the (pre-downscaled) input height by this factor.\n"
+            "Standard: choose from common resolution presets (480/720/1080/1440/2160)."
+        )
+        _res_mode_row.addWidget(self.resolution_mode_combo)
+
+        # Pixel mode: plain spinbox
         self.resolution_spin = QSpinBox()
         self.resolution_spin.setRange(128, 7680)
         self.resolution_spin.setValue(720)
-        f.addRow("Resolution:", self.resolution_spin)
+        self.resolution_spin.setSingleStep(1)
+
+        # X Times mode: combo with preset multipliers
+        self.resolution_times_combo = QComboBox()
+        self.resolution_times_combo.addItems(["1x", "2x", "3x", "4x", "5x"])
+        self.resolution_times_combo.setCurrentText("2x")
+
+        # Standard mode: named presets (numeric value is extracted for the CLI)
+        self.resolution_standard_combo = QComboBox()
+        self.resolution_standard_combo.addItems(["480", "720 (HD)", "1080 (FHD)", "1440 (2K)", "2160 (4K)"])
+        self.resolution_standard_combo.setCurrentText("720 (HD)")
+
+        _res_mode_row.addWidget(self.resolution_spin, stretch=1)
+        _res_mode_row.addWidget(self.resolution_times_combo, stretch=1)
+        _res_mode_row.addWidget(self.resolution_standard_combo, stretch=1)
+
+        # Wire up visibility
+        def _update_res_mode(text: str) -> None:
+            self.resolution_spin.setVisible(text == "Pixel")
+            self.resolution_times_combo.setVisible(text == "X Times")
+            self.resolution_standard_combo.setVisible(text == "Standard")
+
+        self.resolution_mode_combo.currentTextChanged.connect(_update_res_mode)
+        _update_res_mode(self.resolution_mode_combo.currentText())
+
+        _res_mode_container = QWidget()
+        _res_mode_container.setLayout(_res_mode_row)
+        f.addRow("Resolution:", _res_mode_container)
 
         self.max_resolution_spin = QSpinBox()
         self.max_resolution_spin.setRange(0, 7680)
@@ -1037,6 +1387,7 @@ class MainWindow(QMainWindow):
         self.max_resolution_spin.setToolTip("0 = no limit")
         f.addRow("Max Resolution:", self.max_resolution_spin)
 
+        # Batch Size – custom ±4 stepper enforces strict 4k+1 values
         f.addRow("Batch Size:", self._build_batch_stepper())
 
         self.uniform_batch_check = QCheckBox()
@@ -1051,14 +1402,11 @@ class MainWindow(QMainWindow):
         self.prepend_frames_spin.setRange(0, 100)
         self.prepend_frames_spin.setValue(0)
         f.addRow("Prepend Frames:", self.prepend_frames_spin)
-        container_layout.addWidget(g)
+        adj_layout.addWidget(g)
 
-        # ── Processing ─────────────────────────────────────────────────
+        # Preview & Processing
         g, f = _make_group("Preview & Processing")
-        self.seed_spin = QSpinBox()
-        self.seed_spin.setRange(0, 2147483647)
-        self.seed_spin.setValue(313)
-        f.addRow("Seed:", self.seed_spin)
+        self._preview_processing_group = g
 
         self.skip_first_frames_spin = QSpinBox()
         self.skip_first_frames_spin.setRange(0, 99999)
@@ -1068,21 +1416,35 @@ class MainWindow(QMainWindow):
         self.load_cap_spin = QSpinBox()
         self.load_cap_spin.setRange(0, 99999)
         self.load_cap_spin.setValue(0)
-        self.load_cap_spin.setToolTip("0 = load all frames")
-        f.addRow("Load Cap:", self.load_cap_spin)
+        self.load_cap_spin.setToolTip("0 = load all frames; Preview auto-sets this to 81 and restores it when done")
+        f.addRow("Load Cap Frames:", self.load_cap_spin)
 
-        self.chunk_size_spin = QSpinBox()
-        self.chunk_size_spin.setRange(0, 99999)
-        self.chunk_size_spin.setValue(0)
-        self.chunk_size_spin.setToolTip("0 = process all at once")
-        f.addRow("Chunk Size:", self.chunk_size_spin)
-        container_layout.addWidget(g)
+        self.only_frames_spin = QSpinBox()
+        self.only_frames_spin.setRange(0, 99999)
+        self.only_frames_spin.setValue(0)
+        self.only_frames_spin.setToolTip("0 = no limit; limits the maximum number of frames processed per VAE decode chunk to prevent OOM.")
+        f.addRow("Only Frames:", self.only_frames_spin)
 
-        # ── Device Management ──────────────────────────────────────────
+        self.enable_video_chunking_check = QCheckBox()
+        f.addRow("Enable Video Chunking:", self.enable_video_chunking_check)
+
+        self.chunk_duration_minutes_label = QLabel("Chunk Duration (Minutes):")
+        self.split_size_minutes_spin = QSpinBox()
+        self.split_size_minutes_spin.setRange(1, 120)
+        self.split_size_minutes_spin.setValue(3)
+        self.split_size_minutes_spin.setSuffix(" min")
+        self.split_size_minutes_spin.setToolTip("Chunk duration in minutes. Converted at runtime via minutes × 60 × source FPS.")
+        self.chunk_size_spin = self.split_size_minutes_spin  # backwards-compatible persistence key
+        f.addRow(self.chunk_duration_minutes_label, self.split_size_minutes_spin)
+        self.enable_video_chunking_check.toggled.connect(self._update_chunking_visibility)
+        self._update_chunking_visibility(self.enable_video_chunking_check.isChecked())
+        adj_layout.addWidget(g)
+
+        # Device Management
         g, f = _make_group("Device Management")
         self.gpu_device_combo = CheckableComboBox()
         self.gpu_device_combo.addItems(_detect_gpus())
-        self.gpu_device_combo.setCurrentText("Auto")  # default: Auto checked
+        self.gpu_device_combo.setCurrentText("Auto")
         self.gpu_device_combo.setToolTip(
             "Select one or more GPUs.\n"
             "Auto/CPU are exclusive; multiple GPU N items may be checked together\n"
@@ -1103,10 +1465,11 @@ class MainWindow(QMainWindow):
         self.tensor_offload_combo = QComboBox()
         self.tensor_offload_combo.addItems(["none", "cpu"])
         f.addRow("Tensor Offload:", self.tensor_offload_combo)
-        container_layout.addWidget(g)
+        adj_layout.addWidget(g)
 
-        # ── Memory (BlockSwap) ─────────────────────────────────────────
+        # Memory (BlockSwap)
         g, f = _make_group("Memory (BlockSwap)")
+        self._memory_blockswap_group = g
         self.blocks_to_swap_spin = QSpinBox()
         self.blocks_to_swap_spin.setRange(0, 36)
         self.blocks_to_swap_spin.setValue(0)
@@ -1114,10 +1477,11 @@ class MainWindow(QMainWindow):
 
         self.swap_io_check = QCheckBox()
         f.addRow("Swap I/O Components:", self.swap_io_check)
-        container_layout.addWidget(g)
+        adj_layout.addWidget(g)
 
-        # ── VAE Tiling ─────────────────────────────────────────────────
+        # VAE Tiling
         g, f = _make_group("VAE Tiling")
+        self._vae_tiling_group = g
         self.vae_encode_tiled_check = QCheckBox()
         f.addRow("Encode Tiled:", self.vae_encode_tiled_check)
 
@@ -1147,10 +1511,11 @@ class MainWindow(QMainWindow):
         self.tile_debug_combo = QComboBox()
         self.tile_debug_combo.addItems(["false", "encode", "decode"])
         f.addRow("Tile Debug:", self.tile_debug_combo)
-        container_layout.addWidget(g)
+        adj_layout.addWidget(g)
 
-        # ── Performance ────────────────────────────────────────────────
+        # Performance
         g, f = _make_group("Performance")
+        self._performance_group = g
         self.attention_mode_combo = QComboBox()
         self.attention_mode_combo.addItems([
             "sdpa", "flash_attn_2", "flash_attn_3", "sageattn_2", "sageattn_3"
@@ -1160,97 +1525,325 @@ class MainWindow(QMainWindow):
             self.attention_mode_combo.setCurrentIndex(_attn_idx)
         f.addRow("Attention Mode:", self.attention_mode_combo)
 
-        self.compile_dit_check = QCheckBox()
-        f.addRow("Compile DiT:", self.compile_dit_check)
+        adj_layout.addWidget(g)
 
-        self.compile_vae_check = QCheckBox()
-        f.addRow("Compile VAE:", self.compile_vae_check)
+        # Quality Control (noise injection — advanced only)
+        g, f = _make_group("Quality Control")
+        self._quality_control_group = g
 
-        self.compile_backend_combo = QComboBox()
-        self.compile_backend_combo.addItems(["inductor", "cudagraphs"])
-        f.addRow("Compile Backend:", self.compile_backend_combo)
+        self.input_noise_scale_spin = QDoubleSpinBox()
+        self.input_noise_scale_spin.setRange(0.0, 1.0)
+        self.input_noise_scale_spin.setValue(0.0)
+        self.input_noise_scale_spin.setSingleStep(0.05)
+        self.input_noise_scale_spin.setDecimals(2)
+        self.input_noise_scale_spin.setToolTip(
+            "Input noise injection scale. Reduces artifacts at high resolutions."
+        )
+        f.addRow("Input Noise Scale:", self.input_noise_scale_spin)
 
-        self.compile_mode_combo = QComboBox()
-        self.compile_mode_combo.addItems([
-            "default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"
-        ])
-        f.addRow("Compile Mode:", self.compile_mode_combo)
+        self.latent_noise_scale_spin = QDoubleSpinBox()
+        self.latent_noise_scale_spin.setRange(0.0, 1.0)
+        self.latent_noise_scale_spin.setValue(0.0)
+        self.latent_noise_scale_spin.setSingleStep(0.05)
+        self.latent_noise_scale_spin.setDecimals(2)
+        self.latent_noise_scale_spin.setToolTip(
+            "Latent space noise scale. Softens details if needed."
+        )
+        f.addRow("Latent Noise Scale:", self.latent_noise_scale_spin)
+        adj_layout.addWidget(g)
 
-        self.compile_fullgraph_check = QCheckBox()
-        f.addRow("Full Graph:", self.compile_fullgraph_check)
-
-        self.compile_dynamic_check = QCheckBox()
-        f.addRow("Dynamic:", self.compile_dynamic_check)
-
-        self.dynamo_cache_spin = QSpinBox()
-        self.dynamo_cache_spin.setRange(1, 1000)
-        self.dynamo_cache_spin.setValue(64)
-        f.addRow("Dynamo Cache Limit:", self.dynamo_cache_spin)
-
-        self.dynamo_recompile_spin = QSpinBox()
-        self.dynamo_recompile_spin.setRange(1, 1000)
-        self.dynamo_recompile_spin.setValue(128)
-        f.addRow("Dynamo Recompile Limit:", self.dynamo_recompile_spin)
-        container_layout.addWidget(g)
-
-        # ── Model Cache ────────────────────────────────────────────────
+        # Model Cache
         g, f = _make_group("Model Cache")
+        self._model_cache_group = g
         self.cache_dit_check = QCheckBox()
         f.addRow("Cache DiT:", self.cache_dit_check)
 
         self.cache_vae_check = QCheckBox()
         f.addRow("Cache VAE:", self.cache_vae_check)
-        container_layout.addWidget(g)
+        adj_layout.addWidget(g)
 
-        # ── Debug ──────────────────────────────────────────────────────
+        # Debug
         g, f = _make_group("Debug")
+        self._debug_group = g
+        self.auto_safeguard_check = QCheckBox()
+        f.addRow("Auto Safeguard:", self.auto_safeguard_check)
         self.debug_check = QCheckBox()
         f.addRow("Verbose Debug:", self.debug_check)
-        container_layout.addWidget(g)
-
-        # ── Job Queue ──────────────────────────────────────────────────
-        qg = QGroupBox("Job Queue")
-        qg.setCheckable(True)
-        qg.setChecked(False)
-        qv = QVBoxLayout(qg)
-        qv.setContentsMargins(8, 8, 8, 8)
-        qv.setSpacing(6)
-
-        self.queue_list = QListWidget()
-        self.queue_list.setMinimumHeight(120)
-        qv.addWidget(self.queue_list)
-
-        queue_btns_row = QHBoxLayout()
-        self.queue_add_btn = QPushButton("Add Current")
-        self.queue_add_btn.clicked.connect(self._queue_add_current_job)
-        self.queue_remove_btn = QPushButton("Remove Selected")
-        self.queue_remove_btn.clicked.connect(self._queue_remove_selected)
-        self.queue_clear_btn = QPushButton("Clear")
-        self.queue_clear_btn.clicked.connect(self._queue_clear_all)
-        queue_btns_row.addWidget(self.queue_add_btn)
-        queue_btns_row.addWidget(self.queue_remove_btn)
-        queue_btns_row.addWidget(self.queue_clear_btn)
-        qv.addLayout(queue_btns_row)
-
-        self.queue_run_btn = QPushButton("Run Queue")
-        self.queue_run_btn.clicked.connect(self._queue_run)
-        qv.addWidget(self.queue_run_btn)
-
-        container_layout.addWidget(qg)
-
-        container_layout.addStretch(1)
-
-        # Constrain input widgets and set flexible size policy to prevent overflow
-        container.setSizePolicy(
-            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.MinimumExpanding
+        self.enable_audio_notifications_check = QCheckBox()
+        self.enable_audio_notifications_check.setToolTip(
+            "Play a Windows system sound when processing finishes (success) or errors."
         )
-        # Make input widgets fill the available horizontal space
-        for _cw in container.findChildren((QComboBox, QSpinBox, QLineEdit)):
-            _cw.setMaximumWidth(16777215)  # Qt default – no cap
-            _cw.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        f.addRow("Sound Notifications:", self.enable_audio_notifications_check)
+        adj_layout.addWidget(g)
 
-        scroll.setWidget(container)
-        return scroll
+        adj_layout.addStretch(1)
+
+        # ── Codec settings pane ────────────────────────────────────────
+        self._codec_pane = QWidget()
+        self._codec_pane.setVisible(False)
+        codec_layout = QVBoxLayout(self._codec_pane)
+        codec_layout.setContentsMargins(10, 10, 15, 10)
+        codec_layout.setSpacing(8)
+
+        # ── File Format selector (first item in Codec pane) ────────────
+        _ff_row = QHBoxLayout()
+        _ff_row.setContentsMargins(0, 0, 0, 4)
+        _ff_row.setSpacing(8)
+        _ff_lbl = QLabel("File Format:")
+        _ff_lbl.setStyleSheet("color:#B0B3B8; font-size:12px;")
+        _ff_row.addWidget(_ff_lbl)
+        self.file_format_combo = QComboBox()
+        self.file_format_combo.addItems([
+            "MP4", "MOV", "MKV", "WEBM",
+            "PNG Sequence", "TIFF Sequence", "DPX Sequence", "EXR Sequence",
+        ])
+        self.file_format_combo.setCurrentText("MP4")
+        self.file_format_combo.currentTextChanged.connect(self._on_file_format_changed)
+        _ff_row.addWidget(self.file_format_combo, stretch=1)
+        codec_layout.addLayout(_ff_row)
+
+        # Invisible backing state — read by _build_args, _selected_export_extension,
+        # _selected_export_profile_to_ffmpeg_args, and preset load/save.
+        # Driven by the file_format_combo; also accepts setChecked() from preset restore.
+        self.export_image_sequence_check = QCheckBox()
+        self.export_image_sequence_check.toggled.connect(self._update_export_controls)
+        self.export_image_sequence_check.toggled.connect(self._on_image_sequence_toggled)
+
+        # ── Video export group (visible when Video Mode is active) ──────
+        self._video_export_group, vf = _make_group("Video Export")
+        # container_combo is the backing store – driven by file_format_combo; not shown as a row
+        self.container_combo = QComboBox()
+        self.container_combo.addItems(list(EXPORT_CODEC_PROFILES.keys()))
+        self.container_combo.currentTextChanged.connect(self._update_export_controls)
+
+        self.video_codec_combo = QComboBox()
+        vf.addRow("Video Codec:", self.video_codec_combo)
+
+        self.audio_mode_combo = QComboBox()
+        self.audio_mode_combo.addItems(list(AUDIO_PROFILES.keys()))
+        vf.addRow("Audio:", self.audio_mode_combo)
+
+        # ── Bitrate / Quality Mode ────────────────────────────────────────
+        self.bitrate_mode_combo = QComboBox()
+        self.bitrate_mode_combo.addItems(["Dynamic (VBR/CRF)", "Constant (CBR)"])
+        vf.addRow("Bitrate Mode:", self.bitrate_mode_combo)
+
+        # Quality level row – visible only in Dynamic mode
+        self._quality_row_lbl = QLabel("Quality Level:")
+        self.quality_level_combo = QComboBox()
+        self.quality_level_combo.addItems(["Max", "High", "Medium", "Low"])
+        vf.addRow(self._quality_row_lbl, self.quality_level_combo)
+
+        # Target bitrate row – visible only in Constant mode
+        self._bitrate_row_lbl = QLabel("Target Bitrate (Mbps):")
+        self.target_bitrate_combo = QComboBox()
+        self.target_bitrate_combo.addItems([
+            "1", "2.5", "4", "5", "7.5", "8", "12", "16", "24", "40", "60", "120", "180"
+        ])
+        self.target_bitrate_combo.setCurrentText("8")
+        vf.addRow(self._bitrate_row_lbl, self.target_bitrate_combo)
+
+        # Wire up dynamic visibility; initialise to Dynamic mode
+        self.bitrate_mode_combo.currentTextChanged.connect(self._on_bitrate_mode_changed)
+        self._on_bitrate_mode_changed(self.bitrate_mode_combo.currentText())
+
+        self.video_backend_combo = QComboBox()
+        self.video_backend_combo.addItems(["ffmpeg", "opencv"])
+        self.video_backend_combo.setToolTip(
+            "ffmpeg: high-quality encoding via FFmpeg (recommended)\n"
+            "opencv: fallback OpenCV VideoWriter (mp4/avi only, no 10-bit)"
+        )
+        vf.addRow("Video Backend:", self.video_backend_combo)
+        codec_layout.addWidget(self._video_export_group)
+
+        # ── Image sequence group (visible when Image Sequence Mode is active) ─
+        self._image_export_group, imgf = _make_group("Image Sequence Export")
+        self.image_sequence_format_combo = QComboBox()
+        self.image_sequence_format_combo.addItems(list(IMAGE_SEQUENCE_PROFILES.keys()))
+        imgf.addRow("Format:", self.image_sequence_format_combo)
+        self._image_export_group.setVisible(False)
+        codec_layout.addWidget(self._image_export_group)
+
+        # ── Common output options (always visible) ──────────────────────
+        g, f = _make_group("Output Options")
+        self.use_10bit_check = QCheckBox()
+        f.addRow("10-bit Output:", self.use_10bit_check)
+
+        self.color_correction_combo = QComboBox()
+        self.color_correction_combo.addItems(["lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none"])
+        f.addRow("Color Correction:", self.color_correction_combo)
+        codec_layout.addWidget(g)
+        codec_layout.addStretch(1)
+
+        # Pack both panes into the scroll host
+        _host_layout.addWidget(self._adj_pane)
+        _host_layout.addWidget(self._codec_pane)
+
+        # Constrain input widgets: comboboxes are capped at 180 px (~20 chars) so
+        # they never push past the right border of the panel.  Spinboxes are capped
+        # at 80 px.  Checkboxes are kept at a compact indicator-only width.
+        for _cw in _host.findChildren(QComboBox):
+            _cw.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            _cw.setMaximumWidth(180)
+        for _cw in _host.findChildren(QSpinBox):
+            _cw.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+            _cw.setMaximumWidth(80)
+        for _cw in _host.findChildren(QDoubleSpinBox):
+            _cw.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+            _cw.setMaximumWidth(80)
+        for _cw in _host.findChildren(QCheckBox):
+            _cw.setMaximumWidth(18)
+            _cw.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+
+        # Per-widget width overrides (applied after the global loop above).
+        # DiT Model: closed button ≈ 30 chars (~240 px); popup auto-fits full names.
+        self.dit_model_combo.setMaximumWidth(240)
+        self.dit_model_combo.view().setMinimumWidth(460)
+        self.dit_model_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        # Pre-Downscale: compact ≈ 10 chars (~80 px).
+        self.pre_downscale_combo.setMaximumWidth(80)
+        self.pre_downscale_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToContents
+        )
+        # Resolution container and Batch stepper: cap to 280 px so they stay compact.
+        _res_mode_container.setMaximumWidth(280)
+        self._batch_stepper_widget.setMaximumWidth(280)
+
+        scroll.setWidget(_host)
+        outer_layout.addWidget(scroll, stretch=1)
+
+        # Preview and Export buttons are added to the left panel (under viewer) in _build_left_panel.
+        # Create them here as instance attributes so they exist before left panel is built.
+        self.preview_btn = QPushButton("⚡ Preview")
+        self.preview_btn.setMinimumWidth(90)
+        self.preview_btn.setToolTip(
+            "Capture the current frame from the timeline, upscale it as a single PNG,\n"
+            "and display original vs upscaled side-by-side in Split View."
+        )
+        self.preview_btn.clicked.connect(self._preview_run)
+
+        self.run_btn = QPushButton("▶  Export")
+        self.run_btn.setObjectName("primary_button")
+        self.run_btn.setMinimumWidth(110)
+        self.run_btn.clicked.connect(self._run)
+
+        return outer
+
+    def _switch_right_tab(self, idx: int) -> None:
+        """Show the Adjustments pane (idx=0) or Codec settings pane (idx=1)."""
+        self._adj_pane.setVisible(idx == 0)
+        self._codec_pane.setVisible(idx == 1)
+
+    def _on_bitrate_mode_changed(self, mode: str) -> None:
+        """Toggle Quality Level / Target Bitrate rows based on selected Bitrate Mode."""
+        is_dynamic = "Dynamic" in mode
+        self._quality_row_lbl.setVisible(is_dynamic)
+        self.quality_level_combo.setVisible(is_dynamic)
+        self._bitrate_row_lbl.setVisible(not is_dynamic)
+        self.target_bitrate_combo.setVisible(not is_dynamic)
+
+    _FILE_FORMAT_TO_IMAGE_SEQ: dict = {
+        "PNG Sequence": "PNG (8-bit)",
+        "TIFF Sequence": "TIFF (8-bit)",
+        "DPX Sequence": "DPX (10-bit)",
+        "EXR Sequence": "EXR",
+    }
+    _IMAGE_SEQ_TO_FILE_FORMAT: dict = {
+        "PNG (8-bit)": "PNG Sequence", "PNG (16-bit)": "PNG Sequence",
+        "TIFF (8-bit)": "TIFF Sequence", "TIFF (16-bit)": "TIFF Sequence",
+        "DPX (10-bit)": "DPX Sequence", "DPX (12-bit)": "DPX Sequence",
+        "EXR": "EXR Sequence",
+    }
+
+    def _on_file_format_changed(self, fmt: str) -> None:
+        """Handle File Format dropdown changes, coupling codec group and backing state."""
+        if getattr(self, "_updating_output_mode", False):
+            return
+        self._updating_output_mode = True
+        try:
+            if fmt in self._FILE_FORMAT_TO_IMAGE_SEQ:
+                # Image sequence format selected
+                self.export_image_sequence_check.setChecked(True)
+                img_key = self._FILE_FORMAT_TO_IMAGE_SEQ[fmt]
+                idx = self.image_sequence_format_combo.findText(img_key)
+                if idx >= 0:
+                    self.image_sequence_format_combo.setCurrentIndex(idx)
+                self._video_export_group.setVisible(False)
+                self._image_export_group.setVisible(True)
+            else:
+                # Video format selected
+                self.export_image_sequence_check.setChecked(False)
+                cidx = self.container_combo.findText(fmt)
+                if cidx >= 0:
+                    self.container_combo.setCurrentIndex(cidx)
+                self._video_export_group.setVisible(True)
+                self._image_export_group.setVisible(False)
+        finally:
+            self._updating_output_mode = False
+        self._update_export_controls()
+
+    def _update_output_mode(self, idx: int) -> None:
+        """Switch between Video Mode (idx=0) and Image Sequence Mode (idx=1).
+
+        Drives the invisible ``export_image_sequence_check`` backing widget that
+        all downstream code (``_build_args``, ``_selected_export_extension``, etc.)
+        reads.  Uses a guard flag so the ``_on_image_sequence_toggled`` callback
+        does not create a cycle.
+        """
+        is_image_seq = (idx == 1)
+        self._updating_output_mode = True
+        try:
+            self.export_image_sequence_check.setChecked(is_image_seq)
+            if hasattr(self, "file_format_combo"):
+                self.file_format_combo.blockSignals(True)
+                if is_image_seq:
+                    img_fmt = self.image_sequence_format_combo.currentText()
+                    ff_text = self._IMAGE_SEQ_TO_FILE_FORMAT.get(img_fmt, "PNG Sequence")
+                    fidx = self.file_format_combo.findText(ff_text)
+                    if fidx >= 0:
+                        self.file_format_combo.setCurrentIndex(fidx)
+                else:
+                    container = self.container_combo.currentText()
+                    fidx = self.file_format_combo.findText(container)
+                    if fidx >= 0:
+                        self.file_format_combo.setCurrentIndex(fidx)
+                self.file_format_combo.blockSignals(False)
+        finally:
+            self._updating_output_mode = False
+        self._video_export_group.setVisible(not is_image_seq)
+        self._image_export_group.setVisible(is_image_seq)
+        self._update_export_controls()
+
+    def _on_image_sequence_toggled(self, is_seq: bool) -> None:
+        """Sync the file_format_combo when the backing checkbox is set externally.
+
+        This is called when preset load/save restores ``export_image_sequence_check``
+        (via the persistable widget map) so the file format combo stays in sync
+        even without user interaction.
+        """
+        if getattr(self, "_updating_output_mode", False):
+            return
+        # Sync file_format_combo
+        if hasattr(self, "file_format_combo"):
+            self.file_format_combo.blockSignals(True)
+            if is_seq:
+                img_fmt = self.image_sequence_format_combo.currentText()
+                ff_text = getattr(self, "_IMAGE_SEQ_TO_FILE_FORMAT", {}).get(img_fmt, "PNG Sequence")
+                fidx = self.file_format_combo.findText(ff_text)
+                if fidx >= 0:
+                    self.file_format_combo.setCurrentIndex(fidx)
+            else:
+                container = self.container_combo.currentText()
+                fidx = self.file_format_combo.findText(container)
+                if fidx >= 0:
+                    self.file_format_combo.setCurrentIndex(fidx)
+            self.file_format_combo.blockSignals(False)
+        # Sync group visibility
+        self._video_export_group.setVisible(not is_seq)
+        self._image_export_group.setVisible(is_seq)
+
 
     # ── Bottom bar ─────────────────────────────────────────────────────
 
@@ -1260,37 +1853,13 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 4, 0, 0)
         layout.setSpacing(4)
 
-        # Progress bars (outer: global frame/chunk, inner: batch step)
-        self.global_progress = QProgressBar()
-        self.global_progress.setRange(0, 100)
-        self.global_progress.setValue(0)
-        self.global_progress.setFormat("Total Progress: idle")
-        layout.addWidget(self.global_progress)
-
-        self.batch_progress = QProgressBar()
-        self.batch_progress.setRange(0, 100)
-        self.batch_progress.setValue(0)
-        self.batch_progress.setFormat("Batch Progress: idle")
-        layout.addWidget(self.batch_progress)
-
-        # Status + primary actions
-        btn_row = QHBoxLayout()
+        # Status row
+        status_row = QHBoxLayout()
         self.status_label = QLabel("Ready")
         self.status_label.setMinimumWidth(200)
-        self.fps_label = QLabel("0.0 fps")
-        self.fps_label.setMinimumWidth(80)
-        self.run_btn = QPushButton("▶  Export Video")
-        self.run_btn.setObjectName("primary_button")
-        self.run_btn.clicked.connect(self._run)
+        self.status_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
-        self.preview_btn = QPushButton("⚡ Preview")
-        self.preview_btn.setToolTip(
-            "Upscale the current video frame as a single-image preview.\n"
-            "Batch size will be set to 1 automatically."
-        )
-        self.preview_btn.clicked.connect(self._preview_run)
-
-        self.abort_btn = QPushButton("⏹  Abort")
+        self.abort_btn = QPushButton("Abort")
         self.abort_btn.setObjectName("danger_button")
         self.abort_btn.clicked.connect(self._abort)
 
@@ -1302,32 +1871,77 @@ class MainWindow(QMainWindow):
         self.clear_log_btn.clicked.connect(lambda: self.console.clear())
 
         self.open_output_folder_btn = QPushButton("Open Output Folder")
-        self.open_output_folder_btn.setEnabled(False)
+        self.open_output_folder_btn.setEnabled(True)
         self.open_output_folder_btn.clicked.connect(self._open_output_folder)
 
-        btn_row.addWidget(self.status_label)
-        btn_row.addWidget(self.fps_label)
-        btn_row.addStretch(1)
-        btn_row.addWidget(self.run_btn)
-        btn_row.addWidget(self.preview_btn)
-        btn_row.addWidget(self.abort_btn)
-        layout.addLayout(btn_row)
+        status_row.addWidget(self.status_label)
+        status_row.addStretch(1)
+        layout.addLayout(status_row)
 
-        util_row = QHBoxLayout()
-        util_row.addStretch(1)
-        util_row.addWidget(self.open_output_folder_btn)
-        util_row.addWidget(self.copy_log_btn)
-        util_row.addWidget(self.clear_log_btn)
-        layout.addLayout(util_row)
+        self.run_btn.setText("Export")
 
-        # Row 4 – Console
+        # Minimal progress panel
+        self.progress_panel = QFrame()
+        self.progress_panel.setObjectName("progress_panel")
+        self.progress_panel.setStyleSheet(
+            "QFrame#progress_panel {"
+            "background:#1A1D21;"
+            "border:1px solid #2E3338;"
+            "border-radius:8px;"
+            "padding:2px;"
+            "}"
+        )
+        panel_layout = QVBoxLayout(self.progress_panel)
+        panel_layout.setContentsMargins(8, 4, 8, 4)
+        panel_layout.setSpacing(3)
+
+        self.batch_progress_circle = _NoOpProgressIndicator()
+        self.phase_progress_circle = _NoOpProgressIndicator()
+        self.eta_progress_circle = _NoOpProgressIndicator()
+        self.queue_progress_circle = _NoOpProgressIndicator()
+        self.elapsed_progress_circle = _NoOpProgressIndicator()
+
+        self.current_file_progress_label = QLabel("Current File: -")
+        self.batch_progress_label = QLabel("Overall Batch Progress | Completed: 0/0")
+        self.video_proc_time_label = QLabel("Video Processing Time: 00:00")
+        panel_layout.addWidget(self.current_file_progress_label)
+        panel_layout.addWidget(self.batch_progress_label)
+        panel_layout.addWidget(self.video_proc_time_label)
+        layout.addWidget(self.progress_panel)
+
+        # Console + controls (70/30 split)
         self.console = QTextEdit()
         self.console.setReadOnly(True)
-        self.console.setMinimumHeight(120)
+        self.console.setMinimumHeight(96)
         mono = QFont("Consolas")
         mono.setStyleHint(QFont.StyleHint.Monospace)
         self.console.setFont(mono)
-        layout.addWidget(self.console)
+
+        controls_widget = QWidget()
+        controls_widget.setFixedWidth(170)
+        controls_layout = QVBoxLayout(controls_widget)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setSpacing(6)
+        for btn in (
+            self.open_output_folder_btn,
+            self.copy_log_btn,
+            self.clear_log_btn,
+            self.run_btn,
+            self.abort_btn,
+        ):
+            btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            controls_layout.addWidget(btn)
+        controls_layout.addStretch(1)
+
+        log_row = QHBoxLayout()
+        log_row.setContentsMargins(0, 0, 0, 0)
+        log_row.setSpacing(8)
+        log_row.addWidget(self.console, 7)
+        log_row.addWidget(controls_widget)
+        layout.addLayout(log_row, 1)
+        layout.setStretch(0, 0)
+        layout.setStretch(1, 0)
+        layout.setStretch(2, 1)
 
         return bar
 
@@ -1341,8 +1955,61 @@ class MainWindow(QMainWindow):
         self._settings_win.raise_()
         self._settings_win.activateWindow()
 
+    def _toggle_advanced_mode(self, checked: bool) -> None:
+        self._advanced_mode_enabled = checked
+        self._apply_mode_visibility()
+
+    def _apply_mode_visibility(self) -> None:
+        advanced = bool(self._advanced_mode_enabled)
+        self.advanced_mode_btn.setText("Advanced Mode" if advanced else "Simple Mode")
+
+        if not advanced:
+            self.pre_downscale_combo.setCurrentText(str(self._simple_defaults["pre_downscale"]))
+            self.resolution_mode_combo.setCurrentText(str(self._simple_defaults["resolution_mode"]))
+            self.resolution_spin.setValue(int(self._simple_defaults["resolution"]))
+            self.batch_size_spin.setValue(int(self._simple_defaults["batch_size"]))
+            self.enable_video_chunking_check.setChecked(bool(self._simple_defaults["enable_video_chunking"]))
+            self.split_size_minutes_spin.setValue(int(self._simple_defaults["split_minutes"]))
+            self.vae_encode_tiled_check.setChecked(bool(self._simple_defaults["vae_tiling"]))
+            self.vae_decode_tiled_check.setChecked(bool(self._simple_defaults["vae_tiling"]))
+            self.debug_check.setChecked(bool(self._simple_defaults["debug"]))
+
+        # Simple mode: show Processing Settings, VAE Tiling, Debug; hide Memory, Performance, Model Cache.
+        # Advanced mode: show everything.
+        self._preview_processing_group.setVisible(advanced)
+        self._memory_blockswap_group.setVisible(advanced)
+        self._performance_group.setVisible(advanced)
+        self._quality_control_group.setVisible(advanced)
+        self._model_cache_group.setVisible(advanced)
+        # These are always visible (simple or advanced):
+        # _processing_settings_group, _vae_tiling_group, _debug_group
+
+    def _update_chunking_visibility(self, enabled: bool) -> None:
+        self.chunk_duration_minutes_label.setVisible(enabled)
+        self.split_size_minutes_spin.setVisible(enabled)
+
+    # ------------------------------------------------------------------
+    # In/Out point keyboard shortcuts
+    # ------------------------------------------------------------------
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        """Handle global hotkeys: [ sets In-Point, ] sets Out-Point."""
+        key = event.key()
+        if key == Qt.Key.Key_BracketLeft:
+            self._set_in_point()
+            return
+        if key == Qt.Key.Key_BracketRight:
+            self._set_out_point()
+            return
+        super().keyPressEvent(event)
+
     def _build_menu_bar(self) -> None:
-        help_menu = self.menuBar().addMenu("Help")
+        settings_menu = self.menuBar().addMenu("Settings")
+        open_settings_action = QAction("Open Settings", self)
+        open_settings_action.triggered.connect(self._open_settings)
+        settings_menu.addAction(open_settings_action)
+
+        help_menu = self.menuBar().addMenu("About")
         about_action = QAction("About SeedVR2 GUI", self)
         about_action.triggered.connect(self._show_about_dialog)
         help_menu.addAction(about_action)
@@ -1361,51 +2028,13 @@ class MainWindow(QMainWindow):
             "About SeedVR2 GUI",
             (
                 "<b>SeedVR2.5 GUI by HB2k</b><br>"
-                "Version: v1.4 beta<br><br>"
+                "Version: v1.6b<br><br>"
                 "Topaz-style wrapper for SeedVR2 inference_cli.py.<br>"
                 "License: Apache-2.0<br><br>"
                 '<a href="https://github.com/naxci1/ComfyUI-SeedVR2.5_new">'
                 "GitHub Repository</a>"
             ),
         )
-
-    def _setup_system_tray(self) -> None:
-        if not QSystemTrayIcon.isSystemTrayAvailable():
-            self._tray_icon = None
-            return
-
-        icon = self.windowIcon()
-        if icon.isNull():
-            path = Path(get_resource_path("assets/icon.ico"))
-            if not path.exists():
-                path = Path(get_resource_path("icon.ico"))
-            icon = QIcon(str(path))
-        self._tray_icon = QSystemTrayIcon(icon, self)
-        self._tray_icon.setToolTip("SeedVR2.5 GUI")
-        self._tray_icon.activated.connect(self._on_tray_activated)
-
-        tray_menu = QMenu()
-        show_action = tray_menu.addAction("Show")
-        show_action.triggered.connect(self._restore_from_tray)
-        exit_action = tray_menu.addAction("Exit")
-        exit_action.triggered.connect(self._exit_from_tray)
-        self._tray_icon.setContextMenu(tray_menu)
-        self._tray_icon.show()
-
-    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
-        if reason in (
-            QSystemTrayIcon.ActivationReason.Trigger,
-            QSystemTrayIcon.ActivationReason.DoubleClick,
-        ):
-            self._restore_from_tray()
-
-    def _restore_from_tray(self) -> None:
-        self.show()
-        self.raise_()
-        self.activateWindow()
-
-    def _exit_from_tray(self) -> None:
-        self._force_shutdown()
 
     def _build_persistable_widget_map(self) -> dict[str, QWidget]:
         return {
@@ -1416,17 +2045,25 @@ class MainWindow(QMainWindow):
             "image_sequence_format_combo": self.image_sequence_format_combo,
             "audio_mode_combo": self.audio_mode_combo,
             "video_backend_combo": self.video_backend_combo,
+            "bitrate_mode_combo": self.bitrate_mode_combo,
+            "quality_level_combo": self.quality_level_combo,
+            "target_bitrate_combo": self.target_bitrate_combo,
             "use_10bit_check": self.use_10bit_check,
             "color_correction_combo": self.color_correction_combo,
+            "pre_downscale_combo": self.pre_downscale_combo,
+            "resolution_mode_combo": self.resolution_mode_combo,
+            "resolution_times_combo": self.resolution_times_combo,
+            "resolution_standard_combo": self.resolution_standard_combo,
             "resolution_spin": self.resolution_spin,
             "max_resolution_spin": self.max_resolution_spin,
             "batch_size_spin": self.batch_size_spin,
             "uniform_batch_check": self.uniform_batch_check,
             "temporal_overlap_spin": self.temporal_overlap_spin,
             "prepend_frames_spin": self.prepend_frames_spin,
-            "seed_spin": self.seed_spin,
             "skip_first_frames_spin": self.skip_first_frames_spin,
             "load_cap_spin": self.load_cap_spin,
+            "only_frames_spin": self.only_frames_spin,
+            "enable_video_chunking_check": self.enable_video_chunking_check,
             "chunk_size_spin": self.chunk_size_spin,
             "gpu_device_combo": self.gpu_device_combo,
             "dit_offload_combo": self.dit_offload_combo,
@@ -1442,17 +2079,14 @@ class MainWindow(QMainWindow):
             "vae_decode_tile_overlap_spin": self.vae_decode_tile_overlap_spin,
             "tile_debug_combo": self.tile_debug_combo,
             "attention_mode_combo": self.attention_mode_combo,
-            "compile_dit_check": self.compile_dit_check,
-            "compile_vae_check": self.compile_vae_check,
-            "compile_backend_combo": self.compile_backend_combo,
-            "compile_mode_combo": self.compile_mode_combo,
-            "compile_fullgraph_check": self.compile_fullgraph_check,
-            "compile_dynamic_check": self.compile_dynamic_check,
-            "dynamo_cache_spin": self.dynamo_cache_spin,
-            "dynamo_recompile_spin": self.dynamo_recompile_spin,
+            "input_noise_scale_spin": self.input_noise_scale_spin,
+            "latent_noise_scale_spin": self.latent_noise_scale_spin,
             "cache_dit_check": self.cache_dit_check,
             "cache_vae_check": self.cache_vae_check,
+            "auto_safeguard_check": self.auto_safeguard_check,
             "debug_check": self.debug_check,
+            "enable_audio_notifications_check": self.enable_audio_notifications_check,
+            "file_format_combo": self.file_format_combo,
         }
 
     # Codecs that have fixed/required container associations (codec name → required container key)
@@ -1464,7 +2098,6 @@ class MainWindow(QMainWindow):
         "ProRes 4444 XQ": "MOV",
         "QuickTime Animation (Alpha)": "MOV",
         "Uncompressed RGB (R210)": "MOV",
-        "Uncompressed YUV (V210)": "MKV",
         "FFV1 (Lossless 8/10/12-bit)": "MKV",
     }
 
@@ -1477,6 +2110,16 @@ class MainWindow(QMainWindow):
         keep_idx = self.video_codec_combo.findText(prev_codec)
         self.video_codec_combo.setCurrentIndex(keep_idx if keep_idx >= 0 else 0)
         self.video_codec_combo.blockSignals(False)
+
+        # Keep file_format_combo in sync when container changes directly
+        if hasattr(self, "file_format_combo") and not getattr(self, "_updating_output_mode", False):
+            exporting_sequence = self.export_image_sequence_check.isChecked()
+            if not exporting_sequence:
+                self.file_format_combo.blockSignals(True)
+                fidx = self.file_format_combo.findText(container)
+                if fidx >= 0:
+                    self.file_format_combo.setCurrentIndex(fidx)
+                self.file_format_combo.blockSignals(False)
 
         exporting_sequence = self.export_image_sequence_check.isChecked()
         self.video_codec_combo.setEnabled(not exporting_sequence)
@@ -1505,6 +2148,69 @@ class MainWindow(QMainWindow):
         container = self.container_combo.currentText().strip().lower()
         return "." + container if container else ".mp4"
 
+    @staticmethod
+    def _extract_encoder_from_args(ffmpeg_args: list[str], codec_fallback: str = "") -> str:
+        encoder = ""
+        for i, tok in enumerate(ffmpeg_args):
+            if tok == "-c:v" and i + 1 < len(ffmpeg_args):
+                encoder = str(ffmpeg_args[i + 1]).strip()
+                break
+        if not encoder:
+            encoder = codec_fallback.strip().lower().replace(" ", "_")
+        return encoder or "libx264"
+
+    @staticmethod
+    def _strip_quality_flags(ffmpeg_args: list[str]) -> list[str]:
+        flags_with_value = {
+            "-preset",
+            "-crf",
+            "-cq",
+            "-qp",
+            "-q:v",
+            "-qscale:v",
+            "-global_quality",
+            "-profile:v",
+            "-b:v",
+            "-maxrate",
+            "-bufsize",
+        }
+        stripped: list[str] = []
+        skip_next = False
+        for tok in ffmpeg_args:
+            if skip_next:
+                skip_next = False
+                continue
+            if tok in flags_with_value:
+                skip_next = True
+                continue
+            stripped.append(tok)
+        return stripped
+
+    def _ui_selected_bitrate(self) -> str:
+        mode = self.bitrate_mode_combo.currentText()
+        if "Constant" in mode:
+            return f"{self.target_bitrate_combo.currentText()}M"
+        dynamic_quality = self.quality_level_combo.currentText()
+        dynamic_map = {
+            "Max": "120M",
+            "High": "40M",
+            "Medium": "20M",
+            "Low": "8M",
+        }
+        return dynamic_map.get(dynamic_quality, "20M")
+
+    def _max_quality_flags_for_encoder(self, encoder: str, bitrate: str) -> list[str]:
+        enc = encoder.lower()
+        # Family detection is capability-based, not per-codec hardcoding.
+        if "nvenc" in enc:
+            return ["-preset", "p7", "-cq", "16", "-b:v", bitrate]
+        if "prores" in enc:
+            return ["-profile:v", "3"]
+        # Generic software/other encoders: apply aggressive quality-first defaults.
+        if "libx26" in enc or "libaom" in enc or "svt" in enc or "rav1e" in enc or "vpx" in enc:
+            return ["-preset", "veryslow", "-crf", "12", "-b:v", bitrate]
+        return ["-crf", "12", "-b:v", bitrate]
+
     def _selected_export_profile_to_ffmpeg_args(self) -> dict[str, Any]:
         """Return a backend mapping of current export choices to FFmpeg arguments."""
         if self.export_image_sequence_check.isChecked():
@@ -1523,11 +2229,23 @@ class MainWindow(QMainWindow):
         codec_profile = EXPORT_CODEC_PROFILES.get(container, {}).get(codec, {})
         audio = self.audio_mode_combo.currentText()
         audio_args = AUDIO_PROFILES.get(audio, AUDIO_PROFILES["Copy Audio"])
+
+        # Codec-agnostic render argument negotiation:
+        # encoder from UI profile -> family detection -> universal max-quality flags.
+        base_video_args = list(codec_profile.get("ffmpeg", []))
+        encoder = self._extract_encoder_from_args(base_video_args, codec_fallback=codec)
+        sanitized_video_args = self._strip_quality_flags(base_video_args)
+        bitrate = self._ui_selected_bitrate()
+        quality_flags = self._max_quality_flags_for_encoder(encoder, bitrate)
+        if "-c:v" not in sanitized_video_args:
+            sanitized_video_args = ["-c:v", encoder] + sanitized_video_args
+        base_video_args = sanitized_video_args + quality_flags
+
         return {
             "mode": "video",
             "container": container,
             "codec": codec,
-            "video_args": codec_profile.get("ffmpeg", []),
+            "video_args": base_video_args,
             "audio_mode": audio,
             "audio_args": audio_args,
         }
@@ -1576,14 +2294,40 @@ class MainWindow(QMainWindow):
                 return candidate
             counter += 1
 
+    @staticmethod
+    def _seedvr_prefixed_stem(stem: str) -> str:
+        clean_stem = stem.strip()
+        return clean_stem if clean_stem.startswith("seedvr2_") else f"seedvr2_{clean_stem}"
+
+    @classmethod
+    def _generate_export_output_path(cls, ext: str, output_dir: Path, part_idx: int = 1) -> Path:
+        """Return a unique output path using padded numerical indexing.
+
+        Format: ``seedvr_output_part_NNN_MMMMM<ext>``.
+        *part_idx* is the chunk/part number (1-based); the file counter increments
+        until a non-existing path is found.
+        """
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for file_idx in range(1, 100_000):
+            stem = cls._seedvr_prefixed_stem(f"output_part_{part_idx:03d}_{file_idx:05d}")
+            candidate = output_dir / f"{stem}{ext}"
+            if not candidate.exists():
+                return candidate
+        return output_dir / f"{cls._seedvr_prefixed_stem(f'output_part_{part_idx:03d}_99999')}{ext}"
+
     def _serialize_model_settings(self) -> dict[str, Any]:
         data: dict[str, Any] = {}
         for key, widget in self._persistable_widgets.items():
             if isinstance(widget, CheckableComboBox):
                 data[key] = widget.checkedTexts()
             elif isinstance(widget, QComboBox):
-                data[key] = widget.currentText()
+                # Prefer item data (full value) over display text for combos using addItem(display, data)
+                item_data = widget.currentData()
+                data[key] = item_data if item_data is not None else widget.currentText()
             elif isinstance(widget, QSpinBox):
+                data[key] = widget.value()
+            elif isinstance(widget, QDoubleSpinBox):
                 data[key] = widget.value()
             elif isinstance(widget, QCheckBox):
                 data[key] = widget.isChecked()
@@ -1597,12 +2341,20 @@ class MainWindow(QMainWindow):
             if isinstance(widget, CheckableComboBox) and isinstance(value, list):
                 widget.setCheckedTexts([str(v) for v in value])
             elif isinstance(widget, QComboBox):
-                idx = widget.findText(str(value))
+                # Try matching by item data (full value) first, then by display text
+                idx = widget.findData(str(value))
+                if idx < 0:
+                    idx = widget.findText(str(value))
                 if idx >= 0:
                     widget.setCurrentIndex(idx)
             elif isinstance(widget, QSpinBox):
                 try:
                     widget.setValue(int(value))
+                except (TypeError, ValueError):
+                    continue
+            elif isinstance(widget, QDoubleSpinBox):
+                try:
+                    widget.setValue(float(value))
                 except (TypeError, ValueError):
                     continue
             elif isinstance(widget, QCheckBox):
@@ -1794,8 +2546,6 @@ class MainWindow(QMainWindow):
         suffix = Path(path).suffix.lower()
         if suffix in _IMAGE_SUFFIXES:
             self._current_input_is_image = True
-            # Auto-set batch size to 1 for single image inputs
-            self.batch_size_spin.setValue(1)
             # Dimensions via QImageReader (no full decode needed)
             reader = QImageReader(path)
             size = reader.size()
@@ -1819,6 +2569,14 @@ class MainWindow(QMainWindow):
         else:
             self._current_input_is_image = False
             self._meta_label.setText("Loading…")
+            # Reset trim markers whenever a new video source is loaded
+            self._in_point_ms = None
+            self._out_point_ms = None
+            self._current_fps = 0.0
+            if hasattr(self, "_seek_slider"):
+                self._seek_slider.set_trim_fractions(None, None)
+            # Extract and display the first frame immediately for instant preview
+            self._try_extract_first_frame(path)
             self._load_input_video(path)
             self._viewer_stack.setCurrentIndex(0)
 
@@ -1832,29 +2590,42 @@ class MainWindow(QMainWindow):
             return
         if self._current_input_is_image:
             return  # image meta already set in _load_preview
-        parts: list[str] = []
+        self._update_input_frame_counter_label(self._input_player.position())
+
+    def _update_input_frame_counter_label(self, position_ms: Optional[int] = None) -> None:
+        """Update input metadata as: Input: <file> | <current>/<total> frame."""
+        if not _MULTIMEDIA_AVAILABLE or not self._input_player or self._current_input_is_image:
+            return
+        input_path = self._settings_win.input_edit.text().strip()
+        if not input_path:
+            return
+        if position_ms is None:
+            position_ms = self._input_player.position()
+
+        fps_val: Optional[float] = None
         try:
             meta = self._input_player.metaData()
-            res = meta.value(QMediaMetaData.Key.Resolution)
-            if res is not None:
-                parts.append(f"{res.width()}×{res.height()} px")
             fps = meta.value(QMediaMetaData.Key.VideoFrameRate)
             if fps is not None:
-                try:
-                    parts.append(f"{float(fps):.0f} fps")
-                except (TypeError, ValueError):
-                    pass
+                fps_val = float(fps)
         except Exception:
-            pass
-        dur_ms = self._input_player.duration()
-        if dur_ms > 0:
-            secs = dur_ms // 1000
-            parts.append(f"{secs // 60:02d}:{secs % 60:02d} min")
-        if parts:
-            self._input_meta_text = "Input: " + ", ".join(parts)
-            self._meta_label.setText(self._input_meta_text)
-        elif self._meta_label.text() == "Loading…":
-            pass  # keep "Loading…" until metadata arrives
+            fps_val = None
+
+        # Cache FPS for In/Out point calculations
+        if fps_val is not None and fps_val > 0:
+            self._current_fps = fps_val
+
+        duration_ms = self._input_player.duration()
+        total_frames = 0
+        current_frame = 0
+        if fps_val is not None and fps_val > 0 and duration_ms > 0:
+            total_frames = max(1, int(round((duration_ms / 1000.0) * fps_val)))
+            current_frame = max(1, int((max(0, position_ms) / 1000.0) * fps_val) + 1)
+            current_frame = min(current_frame, total_frames)
+
+        filename = Path(input_path).name
+        self._input_meta_text = f"Input: {filename} | {current_frame}/{total_frames} frame"
+        self._meta_label.setText(self._input_meta_text)
 
     def _on_output_meta_changed(self) -> None:
         """Update the metadata label with output video info (combined with input)."""
@@ -1888,20 +2659,55 @@ class MainWindow(QMainWindow):
 
         # positional input
         inp = self._settings_win.input_edit.text().strip()
+        input_mode = self._settings_win.input_mode_combo.currentText()
+        input_is_directory = (
+            not self._is_preview_run
+            and (
+                input_mode == "Folder"
+                or (inp and Path(inp).is_dir())
+            )
+        )
         args.append(inp)
 
         # output
         out = self._settings_win.output_edit.text().strip()
         if self._is_preview_run:
-            # Preview must write to an explicit PNG file in the selected export directory.
             export_dir = self._resolve_export_output_dir()
-            preview_out = self._ensure_unique_file_path(
-                export_dir / "preview_upscaled_frame_001.png"
-            )
+            if self._is_preview_video_mode:
+                # Video-mode preview: short clip in the selected container.
+                container_ext = self._selected_export_extension()
+                preview_out = self._generate_export_output_path(container_ext, export_dir)
+            else:
+                # Image-mode preview: single PNG frame.
+                preview_out = self._generate_export_output_path(".png", export_dir)
             self._settings_win.output_edit.setText(str(preview_out))
             args += ["--output", str(preview_out)]
+        elif input_is_directory:
+            # Directory-mode should mirror native CLI usage:
+            #   python inference_cli.py <folder> --output <directory>
+            if out:
+                args += ["--output", out]
+            else:
+                args += ["--output", str(self._resolve_export_output_dir())]
         elif out:
-            args += ["--output", out]
+            out_path = Path(out)
+            if out_path.suffix:
+                args += ["--output", str(self._ensure_unique_file_path(out_path))]
+            else:
+                args += ["--output", out]
+        else:
+            # No output path set: derive from input filename when processing a single file,
+            # otherwise fall back to padded numerical naming convention.
+            export_dir = self._resolve_export_output_dir()
+            auto_ext = self._selected_export_extension()
+            inp_path = Path(inp) if inp else None
+            if inp_path and inp_path.is_file():
+                # Use seedvr2_<original_stem> as the output name, deduplicating as needed.
+                auto_stem = f"seedvr2_{inp_path.stem}"
+                auto_out = self._ensure_unique_file_path(export_dir / f"{auto_stem}{auto_ext}")
+            else:
+                auto_out = self._generate_export_output_path(auto_ext, export_dir)
+            args += ["--output", str(auto_out)]
 
         # model dir
         md = self._settings_win.model_dir_edit.text().strip()
@@ -1909,22 +2715,34 @@ class MainWindow(QMainWindow):
             args += ["--model_dir", md]
 
         # output format mapping for SeedVR2 CLI:
-        # - image sequence modes map to CLI output_format=png
-        # - video export modes map to the selected container name (mov, mkv, webm, mp4)
-        if self.export_image_sequence_check.isChecked():
+        # - image-mode preview ALWAYS maps to png (single frame) — highest priority
+        # - image sequence modes map to CLI output_format=<actual ext without dot>
+        # - normal video export maps to the selected container
+        _is_png_preview = self._is_preview_run and not self._is_preview_video_mode
+        if _is_png_preview:
+            # Image-mode preview: always a single PNG regardless of any export settings.
+            # This must take priority over the image-sequence checkbox so that the CLI
+            # never interprets the single-frame capture as a video pipeline run.
             args += ["--output_format", "png"]
-        elif self._is_preview_run:
-            # Preview always produces a single PNG image regardless of export settings
-            args += ["--output_format", "png"]
+        elif self.export_image_sequence_check.isChecked():
+            # Pass the real extension so the CLI writes TIFF/DPX/EXR/JPEG correctly,
+            # not always PNG.  Use the profile ext but strip the leading dot.
+            img_fmt = self.image_sequence_format_combo.currentText()
+            img_ext = IMAGE_SEQUENCE_PROFILES.get(img_fmt, {}).get("ext", ".png")
+            # The CLI treats "png" as an image sequence trigger; for other formats
+            # we pass the bare extension name (e.g. "tiff", "jpg", "dpx", "exr").
+            cli_fmt = img_ext.lstrip(".") if img_ext else "png"
+            args += ["--output_format", cli_fmt]
         else:
             container = self.container_combo.currentText().lower()
             args += ["--output_format", container or "mp4"]
 
-        # video backend (FFmpeg-only)
-        args += ["--video_backend", "ffmpeg"]
-        # Emit ffmpeg_video_args when a custom (non-default) video codec is selected and we
-        # are running an actual export (not a preview PNG run).
-        if not self._is_preview_run and not self.export_image_sequence_check.isChecked():
+        # video backend – user-selectable (ffmpeg or opencv)
+        video_backend = self.video_backend_combo.currentText() or "ffmpeg"
+        args += ["--video_backend", video_backend]
+        # Emit ffmpeg_video_args only when ffmpeg backend is selected.
+        # Skip for image-mode preview PNG runs and image sequence exports.
+        if not _is_png_preview and not self.export_image_sequence_check.isChecked() and video_backend == "ffmpeg":
             profile = self._selected_export_profile_to_ffmpeg_args()
             video_codec_args = profile.get("video_args", [])
             if video_codec_args:
@@ -1936,38 +2754,86 @@ class MainWindow(QMainWindow):
             args.append("--10bit")
 
         # dit model
-        args += ["--dit_model", self.dit_model_combo.currentText()]
+        _dit_model_val = self.dit_model_combo.currentData()
+        args += ["--dit_model", _dit_model_val if _dit_model_val is not None else self.dit_model_combo.currentText()]
 
-        # resolution – always emit so the CLI uses the GUI value regardless of its own default
-        res = self.resolution_spin.value()
-        args += ["--resolution", str(res)]
+        # pre-downscale (preprocessing factor before upscaling)
+        pre_ds_text = (
+            str(self._simple_defaults["pre_downscale"])
+            if not self._advanced_mode_enabled
+            else self.pre_downscale_combo.currentText()
+        )  # "1:1", "2:1", "3:1"
+        pre_ds_factor = int(pre_ds_text.split(":")[0])  # 1, 2, or 3
+        if pre_ds_factor > 1:
+            args += ["--pre_downscale", str(pre_ds_factor)]
+
+        # resolution – compute final target from mode + pre-downscale factor
+        res_mode = (
+            str(self._simple_defaults["resolution_mode"])
+            if not self._advanced_mode_enabled
+            else self.resolution_mode_combo.currentText()
+        )  # "Pixel", "X Times", or "Standard"
+        if res_mode == "X Times":
+            # Multiplier applied to the (already pre-downscaled) input height.
+            # We don't know the actual input dimension at arg-build time, so we
+            # pass a special combined flag that the CLI interprets: negative value
+            # signals "X times" mode.  We encode as --resolution_mode xtimes
+            # and --resolution_scale <N> for the CLI to interpret.
+            times_text = self.resolution_times_combo.currentText()  # "1x".."5x"
+            times_val = int(times_text.rstrip("x"))
+            args += ["--resolution_mode", "xtimes", "--resolution_scale", str(times_val)]
+        elif res_mode == "Standard":
+            # Standard presets: extract the leading numeric value ("720 (HD)" → 720)
+            std_text = self.resolution_standard_combo.currentText()
+            std_val = int(std_text.split()[0])
+            args += ["--resolution", str(std_val)]
+        else:
+            # Pixel mode: direct target resolution
+            res = int(self._simple_defaults["resolution"]) if not self._advanced_mode_enabled else self.resolution_spin.value()
+            args += ["--resolution", str(res)]
 
         max_res = self.max_resolution_spin.value()
         if max_res != 0:
             args += ["--max_resolution", str(max_res)]
 
-        batch = self.batch_size_spin.value()
-        if batch != 81:
-            args += ["--batch_size", str(batch)]
+        batch = int(self._simple_defaults["batch_size"]) if not self._advanced_mode_enabled else self.batch_size_spin.value()
+        args += ["--batch_size", str(batch)]
 
         if self.uniform_batch_check.isChecked():
             args.append("--uniform_batch_size")
 
-        # seed – always emit so the CLI uses the GUI value regardless of its own default
-        seed = self.seed_spin.value()
-        args += ["--seed", str(seed)]
+        # seed – always hardcoded so the CLI uses a fixed deterministic value
+        args += ["--seed", "313"]
 
         skip = self.skip_first_frames_spin.value()
         if skip:
             args += ["--skip_first_frames", str(skip)]
 
-        load_cap = self.load_cap_spin.value()
-        if load_cap:
-            args += ["--load_cap", str(load_cap)]
+        # For preview runs, hard-cap to 1 frame so the CLI never feeds more than one
+        # frame through the pipeline (prevents accidental video-pipeline activation).
+        if _is_png_preview:
+            args += ["--load_cap", "1"]
+        else:
+            load_cap = self.load_cap_spin.value()
+            if load_cap:
+                args += ["--load_cap", str(load_cap)]
 
-        chunk = self.chunk_size_spin.value()
-        if chunk:
-            args += ["--chunk_size", str(chunk)]
+        only_frames = self.only_frames_spin.value()
+        if only_frames:
+            args += ["--only_frames", str(only_frames)]
+
+        chunking_enabled = (
+            bool(self._simple_defaults["enable_video_chunking"])
+            if not self._advanced_mode_enabled
+            else self.enable_video_chunking_check.isChecked()
+        )
+        if chunking_enabled:
+            split_minutes = (
+                int(self._simple_defaults["split_minutes"])
+                if not self._advanced_mode_enabled
+                else self.split_size_minutes_spin.value()
+            )
+            args += ["--chunk_duration_minutes", str(split_minutes)]
 
         prepend = self.prepend_frames_spin.value()
         if prepend:
@@ -2026,7 +2892,7 @@ class MainWindow(QMainWindow):
             args.append("--swap_io_components")
 
         # vae tiling
-        if self.vae_encode_tiled_check.isChecked():
+        if self._advanced_mode_enabled and self.vae_encode_tiled_check.isChecked():
             args.append("--vae_encode_tiled")
             enc_sz = self.vae_encode_tile_size_spin.value()
             if enc_sz != 1024:
@@ -2035,7 +2901,7 @@ class MainWindow(QMainWindow):
             if enc_ov != 128:
                 args += ["--vae_encode_tile_overlap", str(enc_ov)]
 
-        if self.vae_decode_tiled_check.isChecked():
+        if self._advanced_mode_enabled and self.vae_decode_tiled_check.isChecked():
             args.append("--vae_decode_tiled")
             dec_sz = self.vae_decode_tile_size_spin.value()
             if dec_sz != 1024:
@@ -2045,7 +2911,7 @@ class MainWindow(QMainWindow):
                 args += ["--vae_decode_tile_overlap", str(dec_ov)]
 
         tile_dbg = self.tile_debug_combo.currentText()
-        if tile_dbg != "false":
+        if self._advanced_mode_enabled and tile_dbg != "false":
             args += ["--tile_debug", tile_dbg]
 
         # performance
@@ -2053,33 +2919,14 @@ class MainWindow(QMainWindow):
         if attn != "sdpa":
             args += ["--attention_mode", attn]
 
-        if self.compile_dit_check.isChecked():
-            args.append("--compile_dit")
-
-        if self.compile_vae_check.isChecked():
-            args.append("--compile_vae")
-
-        cb = self.compile_backend_combo.currentText()
-        if cb != "inductor":
-            args += ["--compile_backend", cb]
-
-        cm = self.compile_mode_combo.currentText()
-        if cm != "default":
-            args += ["--compile_mode", cm]
-
-        if self.compile_fullgraph_check.isChecked():
-            args.append("--compile_fullgraph")
-
-        if self.compile_dynamic_check.isChecked():
-            args.append("--compile_dynamic")
-
-        dc = self.dynamo_cache_spin.value()
-        if dc != 64:
-            args += ["--compile_dynamo_cache_size_limit", str(dc)]
-
-        dr = self.dynamo_recompile_spin.value()
-        if dr != 128:
-            args += ["--compile_dynamo_recompile_limit", str(dr)]
+        # quality control – noise injection scales (advanced only; pass when > 0)
+        if self._advanced_mode_enabled:
+            input_noise = self.input_noise_scale_spin.value()
+            if input_noise > 0.0:
+                args += ["--input_noise_scale", f"{input_noise:.2f}"]
+            latent_noise = self.latent_noise_scale_spin.value()
+            if latent_noise > 0.0:
+                args += ["--latent_noise_scale", f"{latent_noise:.2f}"]
 
         # cache
         if self.cache_dit_check.isChecked():
@@ -2088,8 +2935,12 @@ class MainWindow(QMainWindow):
         if self.cache_vae_check.isChecked():
             args.append("--cache_vae")
 
+        # auto safeguard
+        if self.auto_safeguard_check.isChecked():
+            args.append("--auto_safeguard")
+
         # debug
-        if self.debug_check.isChecked():
+        if self._advanced_mode_enabled and self.debug_check.isChecked():
             args.append("--debug")
 
         return args
@@ -2102,6 +2953,13 @@ class MainWindow(QMainWindow):
         inp = self._settings_win.input_edit.text().strip()
         if not inp:
             self._on_log("❌  Please specify an input file or directory (⚙ Settings).")
+            return
+        if (
+            not self._is_preview_run
+            and self._settings_win.input_mode_combo.currentText() == "Folder"
+            and not Path(inp).is_dir()
+        ):
+            self._on_log(f"❌  Folder mode requires a directory path, got: {inp}")
             return
         if not self._is_preview_run:
             self._preview_compare_active = False
@@ -2137,15 +2995,32 @@ class MainWindow(QMainWindow):
         ffmpeg_profile = self._selected_export_profile_to_ffmpeg_args()
         self._on_log(f"🎬  Export Profile: {json.dumps(ffmpeg_profile, ensure_ascii=False)}")
 
-        self._thread, self._worker = create_worker_thread(cli_script, args, python_exe)
+        bitrate_mode_text = self.bitrate_mode_combo.currentText()
+        if "Constant" in bitrate_mode_text:
+            bitrate_text = self.target_bitrate_combo.currentText().strip() or "8"
+        else:
+            dynamic_map = {"Max": "80", "High": "40", "Medium": "20", "Low": "8"}
+            bitrate_text = dynamic_map.get(self.quality_level_combo.currentText(), "20")
+        worker_env = {"SEEDVR2_DEFAULT_BITRATE": f"{bitrate_text}M"}
+
+        self._thread, self._worker = create_worker_thread(cli_script, args, python_exe, env=worker_env)
         self._worker.log_line.connect(self._on_log)
         self._worker.progress_update.connect(self._on_global_progress)
         self._worker.batch_progress_update.connect(self._on_batch_progress)
+        self._worker.queue_status_update.connect(self._on_queue_status_update)
         self._worker.finished.connect(self._on_finished)
         self._worker.started_signal.connect(lambda: self._set_running(True))
 
-        self._run_started_at = time.time()
         self._reset_progress_bars()
+        # Reset timer state for new export; video_proc_time_label shows 00:00 until first tick
+        self._frozen_elapsed_seconds = None
+        self.video_proc_time_label.setText("Video Processing Time: 00:00")
+        self._run_started_at = time.time()
+        self._elapsed_timer.start()
+        self._prepare_queue_progress_context()
+        self._update_current_file_progress_ui()
+        self._update_batch_progress_ui()
+        self._update_elapsed_progress_ui()
         self._set_running(True)
         self.status_label.setText("Starting…")
         self._thread.start()
@@ -2214,18 +3089,28 @@ class MainWindow(QMainWindow):
             pass
         self._pause_playback()
         self._release_cuda_resources()
-        if getattr(self, "_tray_icon", None) is not None:
-            self._tray_icon.hide()
-            self._tray_icon.deleteLater()
         app = QApplication.instance()
         if app is not None:
             app.quit()
-        raise SystemExit(0)
+        sys.exit(0)
 
     def _preview_run(self) -> None:
-        """Capture the currently displayed video frame, save to a temp PNG,
-        set batch size=1 and input to that file, then start an upscale run."""
-        frame_img = None
+        """Run a short preview of the current input.
+
+        Video input + video export mode (BUG 1 fix)
+        ─────────────────────────────────────────────
+        Do NOT capture a single PNG frame.  Instead run the real pipeline on
+        the first 81 frames of the source video, outputting a short clip in
+        the selected container/codec.  The resulting video is shown in Split
+        View so the user can compare original vs upscaled.  Clicking Play
+        afterwards resumes the full original video (BUG 2 fix).
+
+        Image input or image-sequence export mode (legacy)
+        ───────────────────────────────────────────────────
+        Capture the currently displayed frame as a PNG, upscale it as a
+        single image, and display the result in Split View.
+        """
+        # Save the caller's state so _on_finished can restore it.
         self._preview_original_input_path = self._settings_win.input_edit.text().strip()
         self._preview_original_input_mode = self._settings_win.input_mode_combo.currentText()
         self._preview_original_output_path = self._settings_win.output_edit.text().strip()
@@ -2234,6 +3119,10 @@ class MainWindow(QMainWindow):
             self._preview_original_position = self._input_player.position()
         self._preview_compare_active = False
 
+        # ── Always use single-frame PNG capture (never trigger video pipeline) ──
+        self._is_preview_video_mode = False
+
+        frame_img = None
         if _MULTIMEDIA_AVAILABLE and self._input_player is not None:
             # Step 1: pause the video so the frame buffer is stable
             self._input_player.pause()
@@ -2308,8 +3197,14 @@ class MainWindow(QMainWindow):
         # Also set an explicit output PNG path so the CLI never tries to create a video from
         # a single-image input (which caused the cv2.imwrite crash on .mp4 extension).
         self._settings_win.input_edit.setText(self._preview_temp_path)
+        # Derive preview output name from the original input filename.
+        _orig_for_preview = Path(self._preview_original_input_path) if self._preview_original_input_path else None
+        if _orig_for_preview and _orig_for_preview.stem:
+            _preview_out_stem = f"seedvr2_{_orig_for_preview.stem}"
+        else:
+            _preview_out_stem = "seedvr2_preview_frame"
         preview_out_png = str(
-            self._ensure_unique_file_path(export_dir / "preview_upscaled_frame_001.png")
+            self._ensure_unique_file_path(export_dir / f"{_preview_out_stem}.png")
         )
         self._settings_win.output_edit.setText(preview_out_png)
         self.batch_size_spin.setValue(1)
@@ -2378,8 +3273,13 @@ class MainWindow(QMainWindow):
             self._split_toggle.setChecked(True)
             self._split_toggle.blockSignals(False)
             if self._preview_compare_active:
+                # Output player always shows the preview clip on the right side.
                 if self._output_player is not None:
                     self._output_player.setVideoOutput(self._split_view.output_sink)
+                # BUG 2 fix: for video-mode preview also route the input player to the
+                # split view so the left side shows the original video for comparison.
+                if self._is_preview_video_mode and self._input_player is not None:
+                    self._input_player.setVideoOutput(self._split_view.input_sink)
             elif self._current_input_is_image:
                 # Image input: feed directly into SplitViewWidget; no video sink needed.
                 inp_path = self._settings_win.input_edit.text().strip()
@@ -2505,6 +3405,8 @@ class MainWindow(QMainWindow):
         if not self._seek_slider.isSliderDown():
             self._seek_slider.setValue(position)
         self._update_time_label()
+        self._update_input_frame_counter_label(position)
+        self._update_timecode_label(position)
 
     def _on_player_state(self, state) -> None:
         playing = state == QMediaPlayer.PlaybackState.PlayingState
@@ -2514,6 +3416,88 @@ class MainWindow(QMainWindow):
         """Slave the input player's position strictly to the output player (master)."""
         if self._input_player and abs(self._input_player.position() - pos) > 200:
             self._input_player.setPosition(pos)
+
+    @staticmethod
+    def _ms_to_hhmmss(ms: int) -> str:
+        """Format *ms* milliseconds as HH:MM:SS."""
+        s = ms // 1000
+        h = s // 3600
+        m = (s % 3600) // 60
+        sec = s % 60
+        return f"{h:02d}:{m:02d}:{sec:02d}"
+
+    def _ms_to_frame(self, ms: int) -> int:
+        """Convert *ms* milliseconds to a 0-based frame index using the cached FPS."""
+        if self._current_fps > 0:
+            return max(0, int(ms / 1000.0 * self._current_fps))
+        return 0
+
+    def _update_timecode_label(self, position_ms: Optional[int] = None) -> None:
+        """Refresh the HH:MM:SS | F:N timecode label next to the seek slider."""
+        if not hasattr(self, "_timecode_lbl"):
+            return
+        p = self._active_player()
+        if p is None:
+            return
+        pos = position_ms if position_ms is not None else p.position()
+        frame = self._ms_to_frame(pos)
+        self._timecode_lbl.setText(f"{self._ms_to_hhmmss(pos)} | F:{frame}")
+
+    def _update_trim_slider(self) -> None:
+        """Refresh the In/Out fraction overlays on the seek slider."""
+        p = self._active_player()
+        dur = p.duration() if p else 0
+        if dur <= 0:
+            self._seek_slider.set_trim_fractions(None, None)
+            return
+        in_frac = (self._in_point_ms / dur) if self._in_point_ms is not None else None
+        out_frac = (self._out_point_ms / dur) if self._out_point_ms is not None else None
+        self._seek_slider.set_trim_fractions(in_frac, out_frac)
+
+    def _set_in_point(self) -> None:
+        """Set the In-Point to the current playback position and update the spinbox."""
+        p = self._active_player()
+        if not p:
+            return
+        pos_ms = p.position()
+        self._in_point_ms = pos_ms
+        in_frame = self._ms_to_frame(pos_ms)
+        self.skip_first_frames_spin.setValue(in_frame)
+        # Recompute load_cap if out-point is already set
+        if self._out_point_ms is not None and self._out_point_ms >= pos_ms:
+            out_frame = self._ms_to_frame(self._out_point_ms)
+            self.load_cap_spin.setValue(max(1, out_frame - in_frame + 1))
+        self._update_trim_slider()
+        self._on_log(
+            f"[  In-Point set → frame {in_frame} ({self._ms_to_hhmmss(pos_ms)}) "
+            f"→ Skip First Frames: {in_frame}"
+        )
+
+    def _set_out_point(self) -> None:
+        """Set the Out-Point to the current playback position and update the spinbox."""
+        p = self._active_player()
+        if not p:
+            return
+        pos_ms = p.position()
+        self._out_point_ms = pos_ms
+        out_frame = self._ms_to_frame(pos_ms)
+        in_frame = self._ms_to_frame(self._in_point_ms) if self._in_point_ms is not None else 0
+        total = max(1, out_frame - in_frame + 1)
+        self.load_cap_spin.setValue(total)
+        self._update_trim_slider()
+        self._on_log(
+            f"]  Out-Point set → frame {out_frame} ({self._ms_to_hhmmss(pos_ms)}) "
+            f"→ Load Cap: {total} frames"
+        )
+
+    def _clear_trim_range(self) -> None:
+        """Clear In/Out markers, remove the blue timeline highlight, and reset spinboxes."""
+        self._in_point_ms = None
+        self._out_point_ms = None
+        self._seek_slider.set_trim_fractions(None, None)
+        self.skip_first_frames_spin.setValue(0)
+        self.load_cap_spin.setValue(0)
+        self._on_log("✕  Trim range cleared → Skip First Frames and Load Cap reset to 0")
 
     def _update_time_label(self) -> None:
         p = self._active_player()
@@ -2546,9 +3530,51 @@ class MainWindow(QMainWindow):
     # Video source loading
     # ------------------------------------------------------------------
 
+    def _try_extract_first_frame(self, video_path: str) -> None:
+        """Extract the first frame from *video_path* via ffmpeg and display it immediately.
+
+        Falls back silently if ffmpeg is unavailable or extraction fails.
+        The static frame is also loaded into the SplitViewWidget input side so
+        Split View mode has an immediate preview without waiting for the player.
+        """
+        import tempfile
+        try:
+            fd, tmp_path = tempfile.mkstemp(suffix="_frame0.png", prefix="seedvr2_preview_")
+            import os as _os
+            _os.close(fd)  # close fd so ffmpeg can write to the path
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-i", video_path,
+                    "-vframes", "1",
+                    "-an",
+                    tmp_path,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=8,
+                creationflags=_CREATE_NO_WINDOW,
+            )
+            if result.returncode == 0 and Path(tmp_path).is_file():
+                pix = QPixmap(tmp_path)
+                if not pix.isNull():
+                    self._image_view.set_pixmap(pix)
+                    if _MULTIMEDIA_AVAILABLE and self._split_view is not None:
+                        self._split_view.set_input_image(pix.toImage())
+                try:
+                    Path(tmp_path).unlink()
+                except Exception:
+                    pass
+        except Exception:
+            pass  # ffmpeg unavailable or extraction failed – normal video loading continues
+
     def _load_input_video(self, path: str) -> None:
         if self._input_player:
             self._input_player.setSource(QUrl.fromLocalFile(path))
+            # Force the decoder to render the first frame immediately so the
+            # viewer shows a static preview instead of a black rectangle.
+            self._input_player.play()
+            QTimer.singleShot(150, self._input_player.pause)
 
     def _load_output_video(self, path: str) -> None:
         if self._output_player:
@@ -2670,7 +3696,10 @@ class MainWindow(QMainWindow):
                 key=lambda f: f.stat().st_mtime,
                 reverse=True,
             )
-            preferred_videos = [f for f in video_candidates if f.stem.startswith(inp_stem)]
+            preferred_videos = [
+                f for f in video_candidates
+                if f.stem.startswith(inp_stem) or f.stem.startswith(self._seedvr_prefixed_stem(inp_stem))
+            ]
             selected_video = preferred_videos[0] if preferred_videos else (video_candidates[0] if video_candidates else None)
             if selected_video is not None:
                 self._load_output_video(str(selected_video))
@@ -2759,6 +3788,7 @@ class MainWindow(QMainWindow):
         row.addWidget(minus_btn)
         row.addWidget(self.batch_size_spin, stretch=1)
         row.addWidget(plus_btn)
+        self._batch_stepper_widget = wrapper
         return wrapper
 
     def _snap_batch_size(self, val: int) -> None:
@@ -2790,61 +3820,238 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_log(self, line: str) -> None:
+        if line.startswith("__GUI_FATAL__|"):
+            self._show_execution_error_modal("Execution Crash", line.split("|", 1)[1])
+            return
         ts = datetime.now().strftime("%H:%M:%S")
         self.console.append(f"[{ts}] {line}")
 
     def _reset_progress_bars(self) -> None:
-        self.global_progress.setRange(0, 100)
-        self.global_progress.setValue(0)
-        self.global_progress.setFormat("Total Progress: idle")
-        self.batch_progress.setRange(0, 100)
-        self.batch_progress.setValue(0)
-        self.batch_progress.setFormat("Batch Progress: idle")
-        self.fps_label.setText("0.0 fps")
+        self._active_file_status = ""
+        self._progress_status = ""
+        self._batch_status = ""
+        self._current_file_path = ""
+        self._current_file_total_frames = 0
+        self._current_file_processed_frames = 0
+        self._queue_files_total = 0
+        self._queue_files_completed = 0
+        self._queue_file_frame_counts = {}
+        self._queue_ordered_files = []
+        self._active_queue_index = -1
+        self.status_label.setToolTip("")
+        self.status_label.setText("Ready")
+        self.current_file_progress_label.setText("Current File: -")
+        self.batch_progress_label.setText("Overall Batch Progress | Completed: 0/0")
+        self._last_batch_cur = 0
+        self._last_batch_tot = 0
+        self.batch_progress_circle.set_progress(0.0)
+        self.batch_progress_circle.set_text("0/0")
+        self.phase_progress_circle.set_progress(0.0)
+        self.phase_progress_circle.set_text("1/4")
+        self.eta_progress_circle.set_progress(0.0)
+        self.eta_progress_circle.set_text("00:00:00")
+        self.queue_progress_circle.set_progress(0.0)
+        self.queue_progress_circle.set_text("0/0")
+        self.elapsed_progress_circle.set_progress(0.0)
+        self.elapsed_progress_circle.set_text("00:00:00")
+        self._elapsed_timer.stop()
 
     def _format_seconds(self, seconds: float) -> str:
         total = max(0, int(seconds))
-        return f"{total // 60}:{total % 60:02d}"
+        hours = total // 3600
+        minutes = (total % 3600) // 60
+        secs = total % 60
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+    def _format_mmss(self, seconds: float) -> str:
+        """Format elapsed seconds as MM:SS for the Video Processing Time label."""
+        total = max(0, int(seconds))
+        minutes = total // 60
+        secs = total % 60
+        return f"{minutes:02d}:{secs:02d}"
+
+    def _estimated_processing_fps(self) -> float:
+        return 1.8
+
+    def _count_frames_for_file(self, path: Path) -> int:
+        suffix = path.suffix.lower()
+        if suffix in SUPPORTED_IMAGE_EXTS:
+            return 1
+        if suffix not in SUPPORTED_VIDEO_EXTS or cv2 is None:
+            return 0
+        cap = cv2.VideoCapture(str(path))
+        try:
+            if not cap.isOpened():
+                return 0
+            frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            return max(0, frames)
+        except Exception:
+            return 0
+        finally:
+            cap.release()
+
+    def _collect_input_files_for_estimation(self) -> list[Path]:
+        inp = self._settings_win.input_edit.text().strip()
+        if not inp:
+            return []
+        input_path = Path(inp)
+        if self._settings_win.input_mode_combo.currentText() == "Folder" and input_path.is_dir():
+            try:
+                files = [
+                    p for p in sorted(input_path.iterdir(), key=lambda x: x.name.lower())
+                    if p.is_file() and p.suffix.lower() in (SUPPORTED_VIDEO_EXTS | SUPPORTED_IMAGE_EXTS)
+                ]
+                return files
+            except OSError:
+                return []
+        if input_path.is_file():
+            return [input_path]
+        return []
+
+    def _prepare_queue_progress_context(self) -> None:
+        input_files = self._collect_input_files_for_estimation()
+        self._queue_ordered_files = [str(p.resolve()) for p in input_files]
+        self._queue_file_frame_counts = {
+            str(p.resolve()): self._count_frames_for_file(p) for p in input_files
+        }
+        self._queue_files_total = len(self._queue_ordered_files)
+        self._queue_files_completed = 0
+        self._active_queue_index = 0 if self._queue_files_total > 0 else -1
+        if self._queue_ordered_files:
+            self._current_file_path = self._queue_ordered_files[0]
+            self._current_file_total_frames = max(
+                0, self._queue_file_frame_counts.get(self._current_file_path, 0)
+            )
+        else:
+            self._current_file_path = ""
+            self._current_file_total_frames = 0
+        self._current_file_processed_frames = 0
+
+    def _update_current_file_progress_ui(self) -> None:
+        total_frames = max(0, self._current_file_total_frames)
+        current_frames = max(0, min(self._current_file_processed_frames, total_frames)) if total_frames > 0 else max(0, self._current_file_processed_frames)
+        file_name = Path(self._current_file_path).name if self._current_file_path else "-"
+        self.current_file_progress_label.setText(
+            f"Current File: {file_name} | Batches: {current_frames}/{total_frames}"
+        )
+        ratio = (current_frames / total_frames) if total_frames > 0 else 0.0
+        self.eta_progress_circle.set_progress(max(0.0, min(1.0, ratio)))
+        phase = 1 if total_frames <= 0 else min(4, max(1, int(ratio * 4) + 1))
+        self.phase_progress_circle.set_progress(phase / 4.0)
+        self.phase_progress_circle.set_text(f"{phase}/4")
+
+    def _update_batch_progress_ui(self) -> None:
+        if self._queue_files_total <= 0:
+            self.batch_progress_label.setText(
+                "Overall Batch Progress | Completed: 0/0"
+            )
+            self.batch_progress_circle.set_progress(0.0)
+            self.batch_progress_circle.set_text("0/0")
+            self.queue_progress_circle.set_progress(0.0)
+            self.queue_progress_circle.set_text("0/0")
+            return
+
+        current_index = max(0, self._active_queue_index)
+
+        completed_files = min(self._queue_files_total, max(self._queue_files_completed, current_index))
+        self.batch_progress_label.setText(
+            f"Overall Batch Progress | Completed: {completed_files}/{self._queue_files_total}"
+        )
+
+        processed_current = max(0, min(self._current_file_processed_frames, self._current_file_total_frames))
+        processed_frames = processed_current
+        for idx in range(min(current_index, self._queue_files_total)):
+            processed_frames += max(0, self._queue_file_frame_counts.get(self._queue_ordered_files[idx], 0))
+        total_frames = sum(max(0, v) for v in self._queue_file_frame_counts.values())
+        ratio = (processed_frames / total_frames) if total_frames > 0 else (completed_files / self._queue_files_total)
+        pct = max(0.0, min(1.0, ratio))
+        self.batch_progress_circle.set_progress(pct)
+        self.batch_progress_circle.set_text(f"{self._last_batch_cur}/{self._last_batch_tot}" if self._last_batch_tot > 0 else f"{completed_files}/{self._queue_files_total}")
+        queue_ratio = completed_files / max(1, self._queue_files_total)
+        self.queue_progress_circle.set_progress(max(0.0, min(1.0, queue_ratio)))
+        self.queue_progress_circle.set_text(f"{completed_files}/{self._queue_files_total}")
+
+    def _update_elapsed_progress_ui(self) -> None:
+        if self._run_started_at is None:
+            self.elapsed_progress_circle.set_progress(0.0)
+            self.elapsed_progress_circle.set_text("00:00:00")
+            # Show frozen elapsed time if available; do not reset to 00:00
+            if self._frozen_elapsed_seconds is not None:
+                self.video_proc_time_label.setText(
+                    f"Video Processing Time: {self._format_mmss(self._frozen_elapsed_seconds)}"
+                )
+            return
+        elapsed = max(0.0, time.time() - self._run_started_at)
+        self._frozen_elapsed_seconds = elapsed
+        self.elapsed_progress_circle.set_text(self._format_seconds(elapsed))
+        self.video_proc_time_label.setText(f"Video Processing Time: {self._format_mmss(elapsed)}")
+        total_frames = sum(max(0, v) for v in self._queue_file_frame_counts.values())
+        if total_frames <= 0:
+            self.elapsed_progress_circle.set_progress(0.0)
+            return
+        processed_current = max(0, min(self._current_file_processed_frames, self._current_file_total_frames))
+        processed_frames = processed_current
+        current_index = max(0, self._active_queue_index)
+        for idx in range(min(current_index, self._queue_files_total)):
+            processed_frames += max(0, self._queue_file_frame_counts.get(self._queue_ordered_files[idx], 0))
+        self.elapsed_progress_circle.set_progress(max(0.0, min(1.0, processed_frames / total_frames)))
 
     def _on_global_progress(self, cur: int, tot: int) -> None:
         if tot <= 0:
             return
-        self.global_progress.setRange(0, tot)
-        self.global_progress.setValue(max(0, min(cur, tot)))
-        self.global_progress.setFormat(f"Total Progress: {cur}/{tot}")
-
-        elapsed = 0.0 if self._run_started_at is None else (time.time() - self._run_started_at)
-        eta_text = "estimating…"
-        fps_text = "0.0 fps"
-        if cur > 0:
-            remaining = (elapsed / cur) * max(0, tot - cur)
-            eta_text = f"≈ {self._format_seconds(remaining)} remaining"
-            if elapsed > 0:
-                fps_text = f"{(cur / elapsed):.1f} fps"
-        self.fps_label.setText(fps_text)
-        self.status_label.setText(
-            f"Processing {cur}/{tot}  |  {self._format_seconds(elapsed)} elapsed  |  {eta_text}"
-        )
+        self._current_file_processed_frames = max(0, cur)
+        self._current_file_total_frames = max(0, tot)
+        self._update_current_file_progress_ui()
+        self._update_batch_progress_ui()
+        self.status_label.setText("Processing…")
 
     def _on_batch_progress(self, cur: int, tot: int) -> None:
         if tot <= 0:
             return
-        self.batch_progress.setRange(0, tot)
-        self.batch_progress.setValue(max(0, min(cur, tot)))
-        self.batch_progress.setFormat(f"Batch Progress: {cur}/{tot}")
+        self._last_batch_cur = max(0, cur)
+        self._last_batch_tot = max(0, tot)
+        self._batch_status = f"Batch {cur}/{tot}"
+        self.batch_progress_circle.set_text(self._batch_status.replace("Batch ", ""))
+        self.status_label.setToolTip(self._batch_status)
+
+    def _on_queue_status_update(
+        self, file_path: str, current: int, total: int, done: int, remaining: int
+    ) -> None:
+        if total > 0 and file_path:
+            resolved = str(Path(file_path).resolve())
+            self._active_file_status = f"Processing: {resolved}"
+            self._queue_files_total = total
+            self._queue_files_completed = done
+            self._current_file_path = resolved
+            self._active_queue_index = max(0, current - 1)
+            if resolved in self._queue_file_frame_counts:
+                self._current_file_total_frames = max(0, self._queue_file_frame_counts[resolved])
+            elif self._current_file_total_frames <= 0:
+                self._current_file_total_frames = 0
+        else:
+            self._active_file_status = ""
+        self._progress_status = ""
+        self._update_current_file_progress_ui()
+        self._update_batch_progress_ui()
+        self.status_label.setText("Processing…")
+        self.status_label.setToolTip(self._active_file_status if self._active_file_status else "")
 
     def _set_latest_output_path(self, path: Optional[Path]) -> None:
         self._latest_output_path = path
-        self.open_output_folder_btn.setEnabled(path is not None)
+        # Button stays enabled at all times so the user can always open the output folder.
 
     def _open_output_folder(self) -> None:
-        if self._latest_output_path is None:
-            return
-        folder = (
-            self._latest_output_path
-            if self._latest_output_path.is_dir()
-            else self._latest_output_path.parent
-        )
+        # Prefer the most-recently produced output path; fall back to the configured dir.
+        if self._latest_output_path is not None:
+            folder = (
+                self._latest_output_path
+                if self._latest_output_path.is_dir()
+                else self._latest_output_path.parent
+            )
+        else:
+            # No output produced yet — open the configured output directory.
+            folder = self._resolve_export_output_dir()
+
         if not folder.exists():
             self._on_log(f"⚠  Output folder does not exist: {folder}")
             return
@@ -2858,16 +4065,69 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._on_log(f"❌  Failed to open output folder: {exc}")
 
+    def _show_execution_error_modal(self, title: str, text: str) -> None:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Critical)
+        box.setWindowTitle(title)
+        box.setText("A processing error occurred. The application is still running.")
+        box.setDetailedText(text)
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        copy_btn = box.addButton("Copy to Clipboard", QMessageBox.ButtonRole.ActionRole)
+        box.exec()
+        if box.clickedButton() == copy_btn:
+            QApplication.clipboard().setText(text)
+
     def _on_finished(self, success: bool, msg: str) -> None:
         was_preview = self._is_preview_run
         self._set_running(False)
+        # Freeze the elapsed processing time before nulling run_started_at
+        if self._run_started_at is not None:
+            self._frozen_elapsed_seconds = max(0.0, time.time() - self._run_started_at)
+            self.video_proc_time_label.setText(
+                f"Video Processing Time: {self._format_mmss(self._frozen_elapsed_seconds)}"
+            )
+        self._elapsed_timer.stop()
         self._run_started_at = None
+        self._active_file_status = ""
+        self._progress_status = ""
+        self._batch_status = ""
         if success:
             self.status_label.setText(f"✅  {msg}")
+            self.status_label.setToolTip(msg)
             self._try_auto_load_output()
+            # Feed completed output path into the split tracking context so that
+            # multi-part chunk compilation can resolve input→output mappings.
+            if not was_preview and self._latest_output_path is not None:
+                inp_raw = self._settings_win.input_edit.text().strip()
+                if inp_raw:
+                    self._on_log(
+                        f"📂  Output: {self._latest_output_path.resolve()}"
+                    )
+            # Play success notification if enabled
+            if (
+                _WINSOUND_AVAILABLE
+                and _winsound is not None
+                and hasattr(self, "enable_audio_notifications_check")
+                and self.enable_audio_notifications_check.isChecked()
+            ):
+                try:
+                    _winsound.MessageBeep(_winsound.MB_ICONASTERISK)
+                except Exception:
+                    pass
             # After a Preview run, automatically switch to Split View for comparison
             if was_preview and _MULTIMEDIA_AVAILABLE:
                 self._preview_compare_active = self._latest_output_path is not None
+                # For image-mode preview: load the captured input frame into the left
+                # side of the split view BEFORE restoring the input_edit path so the
+                # viewer shows original-vs-upscaled rather than blank-vs-upscaled.
+                preview_temp = getattr(self, "_preview_temp_path", None)
+                if preview_temp and self._split_view is not None and not self._is_preview_video_mode:
+                    try:
+                        pix = QPixmap(preview_temp)
+                        if not pix.isNull():
+                            self._split_view.set_input_image(pix.toImage())
+                    except Exception:
+                        pass
                 if self._preview_original_input_path:
                     self._settings_win.input_mode_combo.setCurrentText(self._preview_original_input_mode)
                     self._settings_win.input_edit.setText(self._preview_original_input_path)
@@ -2875,20 +4135,33 @@ class MainWindow(QMainWindow):
                 self._on_mode_button(2, True)
         else:
             self.status_label.setText(f"⚠  {msg}")
-        if self.batch_progress.maximum() == self.batch_progress.value():
-            self.batch_progress.setFormat("Batch Progress: complete")
-        if self.global_progress.maximum() == self.global_progress.value():
-            self.global_progress.setFormat("Total Progress: complete")
-        if getattr(self, "_tray_icon", None) is not None:
-            self._tray_icon.showMessage(
-                "SeedVR2 GUI",
-                f"Processing finished: {msg}",
-                QSystemTrayIcon.MessageIcon.Information if success else QSystemTrayIcon.MessageIcon.Warning,
-                4000,
-            )
+            self.status_label.setToolTip(msg)
+            # Play error notification if enabled
+            if (
+                _WINSOUND_AVAILABLE
+                and _winsound is not None
+                and hasattr(self, "enable_audio_notifications_check")
+                and self.enable_audio_notifications_check.isChecked()
+            ):
+                try:
+                    _winsound.MessageBeep(_winsound.MB_ICONHAND)
+                except Exception:
+                    pass
+            console_text = self.console.toPlainText()
+            tail = console_text[-12000:] if len(console_text) > 12000 else console_text
+            if "out of memory" in tail.lower() or "cuda out of memory" in tail.lower():
+                self._show_execution_error_modal("Out of Memory", tail or msg)
+            else:
+                self._show_execution_error_modal("Execution Error", tail or msg)
         self._is_preview_run = False
+        # Reset video-mode preview flag AFTER _on_mode_button has had a chance to read it.
+        self._is_preview_video_mode = False
         if was_preview and self.batch_size_spin.value() == 1 and self._preview_saved_batch_size:
             self.batch_size_spin.setValue(self._preview_saved_batch_size)
+        # Restore load_cap that was temporarily set to 81 during video-mode preview.
+        if was_preview and self._preview_saved_load_cap is not None:
+            self.load_cap_spin.setValue(self._preview_saved_load_cap)
+            self._preview_saved_load_cap = None
         # Restore output path that was overridden during preview (but keep the input field
         # pointing at the original path so the user still sees the correct input displayed).
         if was_preview and hasattr(self, "_preview_original_output_path"):
