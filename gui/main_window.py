@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from PyQt6.QtCore import Qt, QRectF, QSettings, QUrl, QEvent, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QPoint, QRectF, QSettings, QUrl, QEvent, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QColor,
@@ -32,6 +32,7 @@ from PyQt6.QtGui import (
     QPixmap,
     QPainter,
     QPen,
+    QPolygon,
     QStandardItem,
     QStandardItemModel,
     QWheelEvent,
@@ -416,6 +417,75 @@ class _StyledSplitter(QSplitter):
 
 
 # ---------------------------------------------------------------------------
+# Trim-aware timeline slider
+# ---------------------------------------------------------------------------
+
+class _TrimSlider(QSlider):
+    """QSlider subclass that draws a coloured In/Out region and triangle markers."""
+
+    def __init__(self, orientation=Qt.Orientation.Horizontal, parent=None) -> None:
+        super().__init__(orientation, parent)
+        self._in_frac: Optional[float] = None   # [0, 1] fraction of total range
+        self._out_frac: Optional[float] = None
+
+    def set_trim_fractions(self, in_frac: Optional[float], out_frac: Optional[float]) -> None:
+        self._in_frac = in_frac
+        self._out_frac = out_frac
+        self.update()
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        super().paintEvent(event)
+        if self._in_frac is None and self._out_frac is None:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w = self.width()
+        h = self.height()
+        # Small inset so markers align with the actual track groove
+        pad = 8
+        track_w = w - 2 * pad
+        track_cy = h // 2
+
+        in_frac = self._in_frac if self._in_frac is not None else 0.0
+        out_frac = self._out_frac if self._out_frac is not None else 1.0
+        in_x = pad + int(in_frac * track_w)
+        out_x = pad + int(out_frac * track_w)
+
+        # Highlight selected range
+        region_color = QColor("#11abda")
+        region_color.setAlpha(60)
+        painter.fillRect(in_x, track_cy - 3, max(1, out_x - in_x), 6, region_color)
+
+        marker_top = track_cy - 11
+
+        # In-point: green downward triangle ▼
+        if self._in_frac is not None:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#00cc66"))
+            painter.drawPolygon(
+                QPolygon([
+                    QPoint(in_x - 4, marker_top),
+                    QPoint(in_x + 4, marker_top),
+                    QPoint(in_x, track_cy - 2),
+                ])
+            )
+
+        # Out-point: red downward triangle ▼
+        if self._out_frac is not None:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#ff4444"))
+            painter.drawPolygon(
+                QPolygon([
+                    QPoint(out_x - 4, marker_top),
+                    QPoint(out_x + 4, marker_top),
+                    QPoint(out_x, track_cy - 2),
+                ])
+            )
+
+        painter.end()
+
+
+# ---------------------------------------------------------------------------
 # Group-box / form-layout factory
 # ---------------------------------------------------------------------------
 
@@ -746,6 +816,10 @@ class MainWindow(QMainWindow):
         self._frozen_elapsed_seconds: Optional[float] = None
         self._elapsed_timer = QTimer(self)
         self._elapsed_timer.timeout.connect(self._update_elapsed_progress_ui)
+        # In/Out trim point state (milliseconds in the media timeline)
+        self._in_point_ms: Optional[int] = None
+        self._out_point_ms: Optional[int] = None
+        self._current_fps: float = 0.0  # cached from QMediaPlayer metadata
         self._simple_defaults: dict[str, Any] = {
             "pre_downscale": "1:1",
             "resolution_mode": "Pixel",
@@ -1051,7 +1125,16 @@ class MainWindow(QMainWindow):
         self._time_lbl.setMinimumWidth(72)
         self._time_lbl.setStyleSheet("color:#aaa; font-size:10px; padding: 0 2px;")
 
-        self._seek_slider = QSlider(Qt.Orientation.Horizontal)
+        # Detailed timecode label: "HH:MM:SS | F:N" — updated on every position change
+        self._timecode_lbl = QLabel("00:00:00 | F:0")
+        self._timecode_lbl.setToolTip(
+            "Current position: HH:MM:SS | Frame index\n"
+            "Press [ to set In-Point, ] to set Out-Point"
+        )
+        self._timecode_lbl.setStyleSheet("color:#11abda; font-size:10px; padding: 0 2px;")
+        self._timecode_lbl.setEnabled(_MULTIMEDIA_AVAILABLE)
+
+        self._seek_slider = _TrimSlider(Qt.Orientation.Horizontal)
         self._seek_slider.setRange(0, 0)
         self._seek_slider.setEnabled(_MULTIMEDIA_AVAILABLE)
         self._seek_slider.sliderMoved.connect(self._on_seek)
@@ -1074,6 +1157,7 @@ class MainWindow(QMainWindow):
         under_row.addWidget(self._pause_btn)
         under_row.addWidget(self._frame_forward_btn)
         under_row.addWidget(self._time_lbl)
+        under_row.addWidget(self._timecode_lbl)
         under_row.addWidget(self._seek_slider, stretch=1)
         under_row.addWidget(self.preview_btn)
         under_row.addWidget(self._split_toggle)
@@ -1408,6 +1492,31 @@ class MainWindow(QMainWindow):
             self.attention_mode_combo.setCurrentIndex(_attn_idx)
         f.addRow("Attention Mode:", self.attention_mode_combo)
 
+        adj_layout.addWidget(g)
+
+        # Quality Control (noise injection — advanced only)
+        g, f = _make_group("Quality Control")
+        self._quality_control_group = g
+
+        self.input_noise_scale_spin = QDoubleSpinBox()
+        self.input_noise_scale_spin.setRange(0.0, 1.0)
+        self.input_noise_scale_spin.setValue(0.0)
+        self.input_noise_scale_spin.setSingleStep(0.05)
+        self.input_noise_scale_spin.setDecimals(2)
+        self.input_noise_scale_spin.setToolTip(
+            "Input noise injection scale. Reduces artifacts at high resolutions."
+        )
+        f.addRow("Input Noise Scale:", self.input_noise_scale_spin)
+
+        self.latent_noise_scale_spin = QDoubleSpinBox()
+        self.latent_noise_scale_spin.setRange(0.0, 1.0)
+        self.latent_noise_scale_spin.setValue(0.0)
+        self.latent_noise_scale_spin.setSingleStep(0.05)
+        self.latent_noise_scale_spin.setDecimals(2)
+        self.latent_noise_scale_spin.setToolTip(
+            "Latent space noise scale. Softens details if needed."
+        )
+        f.addRow("Latent Noise Scale:", self.latent_noise_scale_spin)
         adj_layout.addWidget(g)
 
         # Model Cache
@@ -1829,6 +1938,7 @@ class MainWindow(QMainWindow):
         self._preview_processing_group.setVisible(advanced)
         self._memory_blockswap_group.setVisible(advanced)
         self._performance_group.setVisible(advanced)
+        self._quality_control_group.setVisible(advanced)
         self._model_cache_group.setVisible(advanced)
         # These are always visible (simple or advanced):
         # _processing_settings_group, _vae_tiling_group, _debug_group
@@ -1836,6 +1946,21 @@ class MainWindow(QMainWindow):
     def _update_chunking_visibility(self, enabled: bool) -> None:
         self.chunk_duration_minutes_label.setVisible(enabled)
         self.split_size_minutes_spin.setVisible(enabled)
+
+    # ------------------------------------------------------------------
+    # In/Out point keyboard shortcuts
+    # ------------------------------------------------------------------
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        """Handle global hotkeys: [ sets In-Point, ] sets Out-Point."""
+        key = event.key()
+        if key == Qt.Key.Key_BracketLeft:
+            self._set_in_point()
+            return
+        if key == Qt.Key.Key_BracketRight:
+            self._set_out_point()
+            return
+        super().keyPressEvent(event)
 
     def _build_menu_bar(self) -> None:
         settings_menu = self.menuBar().addMenu("Settings")
@@ -1913,6 +2038,8 @@ class MainWindow(QMainWindow):
             "vae_decode_tile_overlap_spin": self.vae_decode_tile_overlap_spin,
             "tile_debug_combo": self.tile_debug_combo,
             "attention_mode_combo": self.attention_mode_combo,
+            "input_noise_scale_spin": self.input_noise_scale_spin,
+            "latent_noise_scale_spin": self.latent_noise_scale_spin,
             "cache_dit_check": self.cache_dit_check,
             "cache_vae_check": self.cache_vae_check,
             "auto_safeguard_check": self.auto_safeguard_check,
@@ -2400,6 +2527,12 @@ class MainWindow(QMainWindow):
         else:
             self._current_input_is_image = False
             self._meta_label.setText("Loading…")
+            # Reset trim markers whenever a new video source is loaded
+            self._in_point_ms = None
+            self._out_point_ms = None
+            self._current_fps = 0.0
+            if hasattr(self, "_seek_slider"):
+                self._seek_slider.set_trim_fractions(None, None)
             # Extract and display the first frame immediately for instant preview
             self._try_extract_first_frame(path)
             self._load_input_video(path)
@@ -2435,6 +2568,10 @@ class MainWindow(QMainWindow):
                 fps_val = float(fps)
         except Exception:
             fps_val = None
+
+        # Cache FPS for In/Out point calculations
+        if fps_val is not None and fps_val > 0:
+            self._current_fps = fps_val
 
         duration_ms = self._input_player.duration()
         total_frames = 0
@@ -2739,6 +2876,15 @@ class MainWindow(QMainWindow):
         attn = self.attention_mode_combo.currentText()
         if attn != "sdpa":
             args += ["--attention_mode", attn]
+
+        # quality control – noise injection scales (advanced only; pass when > 0)
+        if self._advanced_mode_enabled:
+            input_noise = self.input_noise_scale_spin.value()
+            if input_noise > 0.0:
+                args += ["--input_noise_scale", f"{input_noise:.2f}"]
+            latent_noise = self.latent_noise_scale_spin.value()
+            if latent_noise > 0.0:
+                args += ["--latent_noise_scale", f"{latent_noise:.2f}"]
 
         # cache
         if self.cache_dit_check.isChecked():
@@ -3212,6 +3358,7 @@ class MainWindow(QMainWindow):
             self._seek_slider.setValue(position)
         self._update_time_label()
         self._update_input_frame_counter_label(position)
+        self._update_timecode_label(position)
 
     def _on_player_state(self, state) -> None:
         playing = state == QMediaPlayer.PlaybackState.PlayingState
@@ -3221,6 +3368,79 @@ class MainWindow(QMainWindow):
         """Slave the input player's position strictly to the output player (master)."""
         if self._input_player and abs(self._input_player.position() - pos) > 200:
             self._input_player.setPosition(pos)
+
+    @staticmethod
+    def _ms_to_hhmmss(ms: int) -> str:
+        """Format *ms* milliseconds as HH:MM:SS."""
+        s = ms // 1000
+        h = s // 3600
+        m = (s % 3600) // 60
+        sec = s % 60
+        return f"{h:02d}:{m:02d}:{sec:02d}"
+
+    def _ms_to_frame(self, ms: int) -> int:
+        """Convert *ms* milliseconds to a 0-based frame index using the cached FPS."""
+        if self._current_fps > 0:
+            return max(0, int(ms / 1000.0 * self._current_fps))
+        return 0
+
+    def _update_timecode_label(self, position_ms: Optional[int] = None) -> None:
+        """Refresh the HH:MM:SS | F:N timecode label next to the seek slider."""
+        if not hasattr(self, "_timecode_lbl"):
+            return
+        p = self._active_player()
+        if p is None:
+            return
+        pos = position_ms if position_ms is not None else p.position()
+        frame = self._ms_to_frame(pos)
+        self._timecode_lbl.setText(f"{self._ms_to_hhmmss(pos)} | F:{frame}")
+
+    def _update_trim_slider(self) -> None:
+        """Refresh the In/Out fraction overlays on the seek slider."""
+        p = self._active_player()
+        dur = p.duration() if p else 0
+        if dur <= 0:
+            self._seek_slider.set_trim_fractions(None, None)
+            return
+        in_frac = (self._in_point_ms / dur) if self._in_point_ms is not None else None
+        out_frac = (self._out_point_ms / dur) if self._out_point_ms is not None else None
+        self._seek_slider.set_trim_fractions(in_frac, out_frac)
+
+    def _set_in_point(self) -> None:
+        """Set the In-Point to the current playback position and update the spinbox."""
+        p = self._active_player()
+        if not p:
+            return
+        pos_ms = p.position()
+        self._in_point_ms = pos_ms
+        in_frame = self._ms_to_frame(pos_ms)
+        self.skip_first_frames_spin.setValue(in_frame)
+        # Recompute load_cap if out-point is already set
+        if self._out_point_ms is not None and self._out_point_ms >= pos_ms:
+            out_frame = self._ms_to_frame(self._out_point_ms)
+            self.load_cap_spin.setValue(max(1, out_frame - in_frame + 1))
+        self._update_trim_slider()
+        self._on_log(
+            f"[  In-Point set → frame {in_frame} ({self._ms_to_hhmmss(pos_ms)}) "
+            f"→ Skip First Frames: {in_frame}"
+        )
+
+    def _set_out_point(self) -> None:
+        """Set the Out-Point to the current playback position and update the spinbox."""
+        p = self._active_player()
+        if not p:
+            return
+        pos_ms = p.position()
+        self._out_point_ms = pos_ms
+        out_frame = self._ms_to_frame(pos_ms)
+        in_frame = self._ms_to_frame(self._in_point_ms) if self._in_point_ms is not None else 0
+        total = max(1, out_frame - in_frame + 1)
+        self.load_cap_spin.setValue(total)
+        self._update_trim_slider()
+        self._on_log(
+            f"]  Out-Point set → frame {out_frame} ({self._ms_to_hhmmss(pos_ms)}) "
+            f"→ Load Cap: {total} frames"
+        )
 
     def _update_time_label(self) -> None:
         p = self._active_player()
