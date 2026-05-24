@@ -8,6 +8,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import re
 import time
 import traceback
 
@@ -1321,6 +1322,33 @@ class MainWindow(QMainWindow):
         f.addRow("DiT Model:", self.dit_model_combo)
         adj_layout.addWidget(g)
 
+        # Diffusion Controls
+        g, f = _make_group("Diffusion Controls")
+        self._diffusion_group = g
+        diffusion_defaults = self._read_diffusion_defaults()
+
+        self.sampler_combo = QComboBox()
+        self.sampler_combo.addItems(["euler", "dpmpp_2m"])
+        _sampler_idx = self.sampler_combo.findText(str(diffusion_defaults["sampler"]))
+        if _sampler_idx >= 0:
+            self.sampler_combo.setCurrentIndex(_sampler_idx)
+        f.addRow("Sampler:", self.sampler_combo)
+
+        self.scheduler_combo = QComboBox()
+        self.scheduler_combo.addItems(["normal", "karras", "exponential"])
+        _scheduler_idx = self.scheduler_combo.findText(str(diffusion_defaults["scheduler"]))
+        if _scheduler_idx >= 0:
+            self.scheduler_combo.setCurrentIndex(_scheduler_idx)
+        f.addRow("Scheduler:", self.scheduler_combo)
+
+        self.cfg_scale_spin = QDoubleSpinBox()
+        self.cfg_scale_spin.setRange(1.0, 10.0)
+        self.cfg_scale_spin.setSingleStep(0.1)
+        self.cfg_scale_spin.setDecimals(2)
+        self.cfg_scale_spin.setValue(float(diffusion_defaults["cfg_scale"]))
+        f.addRow("CFG Scale:", self.cfg_scale_spin)
+        adj_layout.addWidget(g)
+
         # Processing Settings
         g, f = _make_group("Processing Settings")
         self._processing_settings_group = g
@@ -1672,6 +1700,13 @@ class MainWindow(QMainWindow):
         self.color_correction_combo = QComboBox()
         self.color_correction_combo.addItems(["lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none"])
         f.addRow("Color Correction:", self.color_correction_combo)
+
+        self.video_stabilizer_check = QCheckBox()
+        self.video_stabilizer_check.setChecked(False)
+        self.video_stabilizer_check.setToolTip(
+            "Run FFmpeg vidstabdetect + vidstabtransform after successful export."
+        )
+        f.addRow("Video Stabilizer:", self.video_stabilizer_check)
         codec_layout.addWidget(g)
         codec_layout.addStretch(1)
 
@@ -2036,9 +2071,56 @@ class MainWindow(QMainWindow):
             ),
         )
 
+    def _read_diffusion_defaults(self) -> dict[str, Any]:
+        defaults: dict[str, Any] = {
+            "sampler": "euler",
+            "scheduler": "normal",
+            "cfg_scale": 7.5,
+        }
+        try:
+            model_name = str(self.dit_model_combo.currentData() or self.dit_model_combo.currentText()).lower()
+            cfg_name = "configs_7b/main.yaml" if "7b" in model_name else "configs_3b/main.yaml"
+            cfg_path = Path(__file__).resolve().parent.parent / cfg_name
+            if not cfg_path.exists():
+                return defaults
+            content = cfg_path.read_text(encoding="utf-8")
+
+            sampler_match = re.search(
+                r"(?ms)^\s*sampler:\s*?\n(?:\s+.*\n)*?\s*type:\s*([A-Za-z0-9_]+)",
+                content,
+            )
+            if sampler_match:
+                parsed_sampler = sampler_match.group(1).strip().lower()
+                if parsed_sampler in {"euler", "dpmpp_2m"}:
+                    defaults["sampler"] = parsed_sampler
+
+            schedule_match = re.search(
+                r"(?ms)^\s*schedule:\s*?\n(?:\s+.*\n)*?\s*type:\s*([A-Za-z0-9_]+)",
+                content,
+            )
+            if schedule_match:
+                schedule_type = schedule_match.group(1).strip().lower()
+                defaults["scheduler"] = "normal" if schedule_type == "lerp" else schedule_type
+                if defaults["scheduler"] not in {"normal", "karras", "exponential"}:
+                    defaults["scheduler"] = "normal"
+
+            cfg_match = re.search(
+                r"(?ms)^\s*cfg:\s*?\n(?:\s+.*\n)*?\s*scale:\s*([0-9]*\.?[0-9]+)",
+                content,
+            )
+            if cfg_match:
+                cfg_val = float(cfg_match.group(1))
+                defaults["cfg_scale"] = max(1.0, min(10.0, cfg_val))
+        except Exception:
+            return defaults
+        return defaults
+
     def _build_persistable_widget_map(self) -> dict[str, QWidget]:
         return {
             "dit_model_combo": self.dit_model_combo,
+            "sampler_combo": self.sampler_combo,
+            "scheduler_combo": self.scheduler_combo,
+            "cfg_scale_spin": self.cfg_scale_spin,
             "container_combo": self.container_combo,
             "video_codec_combo": self.video_codec_combo,
             "export_image_sequence_check": self.export_image_sequence_check,
@@ -2087,6 +2169,7 @@ class MainWindow(QMainWindow):
             "debug_check": self.debug_check,
             "enable_audio_notifications_check": self.enable_audio_notifications_check,
             "file_format_combo": self.file_format_combo,
+            "video_stabilizer_check": self.video_stabilizer_check,
         }
 
     # Codecs that have fixed/required container associations (codec name → required container key)
@@ -2792,6 +2875,10 @@ class MainWindow(QMainWindow):
             res = int(self._simple_defaults["resolution"]) if not self._advanced_mode_enabled else self.resolution_spin.value()
             args += ["--resolution", str(res)]
 
+        args += ["--sampler", self.sampler_combo.currentText()]
+        args += ["--scheduler", self.scheduler_combo.currentText()]
+        args += ["--cfg", f"{self.cfg_scale_spin.value():.2f}"]
+
         max_res = self.max_resolution_spin.value()
         if max_res != 0:
             args += ["--max_resolution", str(max_res)]
@@ -2945,6 +3032,35 @@ class MainWindow(QMainWindow):
 
         return args
 
+    @staticmethod
+    def _extract_arg_value(args: list[str], name: str) -> Optional[str]:
+        for idx in range(len(args) - 1):
+            if args[idx] == name:
+                return args[idx + 1]
+        return None
+
+    def _build_postprocess_config(self, args: list[str], ffmpeg_profile: dict[str, Any]) -> dict[str, Any]:
+        if not self.video_stabilizer_check.isChecked():
+            return {"enabled": False}
+        if self.export_image_sequence_check.isChecked():
+            return {"enabled": False}
+        output_format = (self._extract_arg_value(args, "--output_format") or "").lower()
+        if output_format in {"png", "jpg", "jpeg", "tif", "tiff", "dpx", "exr"}:
+            return {"enabled": False}
+        if self._settings_win.input_mode_combo.currentText() == "Folder" and not self._is_preview_run:
+            self._on_log("⚠  Video stabilizer is skipped for folder batch mode.")
+            return {"enabled": False}
+        output_path = self._extract_arg_value(args, "--output")
+        if not output_path:
+            return {"enabled": False}
+
+        return {
+            "enabled": True,
+            "output_path": output_path,
+            "video_args": list(ffmpeg_profile.get("video_args", [])),
+            "audio_args": list(ffmpeg_profile.get("audio_args", ["-c:a", "copy"])),
+        }
+
     # ------------------------------------------------------------------
     # Run / Abort
     # ------------------------------------------------------------------
@@ -2994,6 +3110,7 @@ class MainWindow(QMainWindow):
         args = self._build_args()
         ffmpeg_profile = self._selected_export_profile_to_ffmpeg_args()
         self._on_log(f"🎬  Export Profile: {json.dumps(ffmpeg_profile, ensure_ascii=False)}")
+        postprocess_config = self._build_postprocess_config(args, ffmpeg_profile)
 
         bitrate_mode_text = self.bitrate_mode_combo.currentText()
         if "Constant" in bitrate_mode_text:
@@ -3003,7 +3120,13 @@ class MainWindow(QMainWindow):
             bitrate_text = dynamic_map.get(self.quality_level_combo.currentText(), "20")
         worker_env = {"SEEDVR2_DEFAULT_BITRATE": f"{bitrate_text}M"}
 
-        self._thread, self._worker = create_worker_thread(cli_script, args, python_exe, env=worker_env)
+        self._thread, self._worker = create_worker_thread(
+            cli_script,
+            args,
+            python_exe,
+            env=worker_env,
+            postprocess_config=postprocess_config,
+        )
         self._worker.log_line.connect(self._on_log)
         self._worker.progress_update.connect(self._on_global_progress)
         self._worker.batch_progress_update.connect(self._on_batch_progress)

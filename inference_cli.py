@@ -1378,7 +1378,35 @@ def _process_frames_core(
         torch_compile_args_dit=torch_compile_args_dit,
         torch_compile_args_vae=torch_compile_args_vae
     )
-    
+
+    # Diffusion runtime controls from CLI/UI.
+    # Note: current backend natively supports Euler + linear schedule only.
+    # Keep non-native options non-fatal for GUI compatibility and stability.
+    requested_sampler = str(getattr(args, "sampler", "euler")).lower()
+    requested_scheduler = str(getattr(args, "scheduler", "normal")).lower()
+    requested_cfg = float(getattr(args, "cfg", 7.5))
+    if requested_sampler != "euler":
+        debug.log(
+            f"Sampler '{requested_sampler}' requested but not natively available; falling back to 'euler'.",
+            level="WARNING",
+            category="setup",
+            force=True,
+            indent_level=1,
+        )
+    if requested_scheduler != "normal":
+        debug.log(
+            f"Scheduler '{requested_scheduler}' requested but not natively available; falling back to 'normal'.",
+            level="WARNING",
+            category="setup",
+            force=True,
+            indent_level=1,
+        )
+    try:
+        runner.config.diffusion.cfg.scale = requested_cfg
+        runner.config.diffusion.cfg.rescale = 0.0
+    except Exception:
+        pass
+
     ctx['cache_context'] = cache_context
     if runner_cache is not None:
         runner_cache['runner'] = runner
@@ -1827,6 +1855,14 @@ Examples:
     process_group = parser.add_argument_group('Processing parameters')
     process_group.add_argument("--resolution", type=int, default=1080,
                         help="Target short-side resolution in pixels (default: 1080)")
+    process_group.add_argument("--sampler", type=str, default="euler", choices=["euler", "dpmpp_2m"],
+                        help="Diffusion sampler selection. Current backend supports 'euler' natively "
+                             "(default: euler).")
+    process_group.add_argument("--scheduler", type=str, default="normal", choices=["normal", "karras", "exponential"],
+                        help="Diffusion scheduler style. Current backend uses 'normal' natively "
+                             "(default: normal).")
+    process_group.add_argument("--cfg", type=float, default=7.5,
+                        help="Classifier-free guidance scale (default: 7.5)")
     process_group.add_argument("--max_resolution", type=int, default=0,
                         help="Maximum resolution for any edge. Scales down if exceeded. 0 = no limit (default: 0)")
     process_group.add_argument("--batch_size", type=int, default=81,
