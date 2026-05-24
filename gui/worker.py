@@ -163,6 +163,45 @@ class InferenceWorker(QObject):
                 return probe
             idx += 1
 
+    def _resolve_existing_output_asset(self, configured_output_path: Path) -> Optional[Path]:
+        """
+        Resolve the actual rendered video file path when CLI normalizes extensions.
+
+        Example mismatch:
+        - GUI arg:  ...\\preview_xxx.png
+        - CLI save: ...\\preview_xxx.mp4
+        """
+        if configured_output_path.exists():
+            return configured_output_path
+
+        # First-pass exact stem extension substitutions requested by bug report.
+        candidate_suffixes = [".mp4", ".mov"]
+        for suffix in candidate_suffixes:
+            candidate = configured_output_path.with_suffix(suffix)
+            if candidate.exists():
+                self.log_line.emit(
+                    "ℹ  Video stabilizer output path synchronized: "
+                    f"{configured_output_path} -> {candidate}\n"
+                )
+                return candidate
+
+        # Robust fallback: case-insensitive suffix match on same stem in directory.
+        parent = configured_output_path.parent
+        stem = configured_output_path.stem.lower()
+        if parent.exists():
+            for entry in parent.iterdir():
+                if not entry.is_file():
+                    continue
+                if entry.stem.lower() != stem:
+                    continue
+                if entry.suffix.lower() in {".mp4", ".mov"}:
+                    self.log_line.emit(
+                        "ℹ  Video stabilizer output path synchronized: "
+                        f"{configured_output_path} -> {entry}\n"
+                    )
+                    return entry
+        return None
+
     def _run_video_stabilizer(self, env: dict[str, str]) -> bool:
         if not self._postprocess_config.get("enabled", False):
             return True
@@ -170,9 +209,13 @@ class InferenceWorker(QObject):
         if not output_path_raw:
             self.log_line.emit("⚠  Video stabilizer skipped: output path missing.\n")
             return True
-        output_path = Path(output_path_raw)
-        if not output_path.exists():
-            self.log_line.emit(f"⚠  Video stabilizer skipped: output not found ({output_path}).\n")
+        configured_output_path = Path(output_path_raw)
+        output_path = self._resolve_existing_output_asset(configured_output_path)
+        if output_path is None:
+            self.log_line.emit(
+                "⚠  Video stabilizer skipped: output not found "
+                f"({configured_output_path}).\n"
+            )
             return True
 
         video_args = [str(x) for x in self._postprocess_config.get("video_args", [])]
@@ -231,6 +274,13 @@ class InferenceWorker(QObject):
                 *audio_args,
                 str(stabilized_path),
             ]
+            self.log_line.emit(
+                "ℹ  FFmpeg pass 2 command: "
+                f'ffmpeg -y -i "{output_path}" -vf '
+                f'"vidstabtransform=input={trf_name}:smoothing=30:optzoom=1" '
+                + " ".join(video_args + audio_args)
+                + f' "{stabilized_path}"\n'
+            )
             run2 = subprocess.run(
                 pass2,
                 cwd=tmp_dir,

@@ -1328,6 +1328,11 @@ class MainWindow(QMainWindow):
 
         self.sampler_combo = QComboBox()
         self.sampler_combo.addItems(["euler", "dpmpp_2m"])
+        self.sampler_combo.setToolTip(
+            "Sampler token.\n"
+            "• euler = native backend sampler\n"
+            "• dpmpp_2m = compatibility token (currently mapped to euler in runtime)"
+        )
         _sampler_idx = self.sampler_combo.findText(str(diffusion_defaults["sampler"]))
         if _sampler_idx >= 0:
             self.sampler_combo.setCurrentIndex(_sampler_idx)
@@ -1335,6 +1340,12 @@ class MainWindow(QMainWindow):
 
         self.scheduler_combo = QComboBox()
         self.scheduler_combo.addItems(["normal", "karras", "exponential"])
+        self.scheduler_combo.setToolTip(
+            "Scheduler token.\n"
+            "• normal = native backend scheduler\n"
+            "• karras / exponential = compatibility tokens "
+            "(currently mapped to normal in runtime)"
+        )
         _scheduler_idx = self.scheduler_combo.findText(str(diffusion_defaults["scheduler"]))
         if _scheduler_idx >= 0:
             self.scheduler_combo.setCurrentIndex(_scheduler_idx)
