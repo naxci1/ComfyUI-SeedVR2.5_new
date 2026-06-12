@@ -1371,24 +1371,37 @@ def process_single_file(input_path: str, args: "argparse.Namespace", device_list
 def _read_frames_from_cap(cap: cv2.VideoCapture, max_frames: int) -> Optional[torch.Tensor]:
     """
     Read up to max_frames from an already-open VideoCapture.
-    
+
+    This reads *only* ``max_frames`` frames (the current chunk size) and never
+    the whole video: the loop strictly stops after ``max_frames`` iterations and
+    ``np.stack`` is applied solely to the small chunk that was just read. This is
+    what keeps RAM usage bounded to a single chunk when streaming/chunking is
+    enabled, instead of materialising the entire decoded sequence at once.
+
     Args:
         cap: An already opened cv2.VideoCapture instance
-        max_frames: Maximum number of frames to read in this call
-    
+        max_frames: Maximum number of frames to read in this call (chunk size)
+
     Returns:
         Tensor [T, H, W, C] float32 [0,1], or None if no frames available
     """
+    # Guard against non-positive chunk sizes so we never spin or over-read.
+    if max_frames <= 0:
+        return None
+
     frames = []
+    # Strictly stop at max_frames: the loop runs at most chunk_size times.
     for _ in range(max_frames):
         ret, frame = cap.read()
         if not ret:
             break
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         frames.append(frame)
-    
+
     if not frames:
         return None
+    # np.stack runs only on this chunk's frames (len(frames) <= max_frames),
+    # never on the full video sequence.
     return torch.from_numpy(np.stack(frames)).to(torch.float32)
 
 
@@ -2436,6 +2449,24 @@ def main() -> None:
     """
     # Parse arguments
     args = parse_arguments()
+
+    # --- Mandatory entry-point output path/extension override (source of truth) ---
+    # When the caller supplies BOTH an explicit --output path and an explicit
+    # --output_format, the output extension is forced to match the requested
+    # format right here, before any other logic runs. This guarantees the user's
+    # chosen container is authoritative and is never silently replaced (e.g. with
+    # a stray ".png"). When --output_format is auto-detected (None) the canonical
+    # reconciliation later in main() resolves the final path instead.
+    if getattr(args, "output", None) and getattr(args, "output_format", None):
+        base_path = os.path.splitext(args.output)[0]
+        fmt = args.output_format.lower()
+        if fmt in _IMAGE_SEQUENCE_FORMATS:
+            # Image-sequence export writes a directory of frames, not a single
+            # file, so strip any extension and use the bare base path.
+            args.output = base_path
+        else:
+            ext = _VIDEO_CONTAINER_EXTS.get(fmt, f".{fmt}")
+            args.output = f"{base_path}{ext}"
 
     # Update debug instance with --debug flag
     debug.enabled = args.debug

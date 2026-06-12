@@ -1485,6 +1485,24 @@ class MainWindow(QMainWindow):
         self.prepend_frames_spin.setRange(0, 100)
         self.prepend_frames_spin.setValue(0)
         f.addRow("Prepend Frames:", self.prepend_frames_spin)
+
+        # --- Video Chunking ---
+        # Kept in the always-visible Processing Settings group so the control is
+        # available (visible and functional) in both Simple Mode and Advanced
+        # Mode. Enabling it bounds RAM usage to a single chunk during streaming.
+        self.enable_video_chunking_check = QCheckBox()
+        f.addRow("Enable Video Chunking:", self.enable_video_chunking_check)
+
+        self.chunk_duration_minutes_label = QLabel("Chunk Duration (Minutes):")
+        self.split_size_minutes_spin = QSpinBox()
+        self.split_size_minutes_spin.setRange(1, 120)
+        self.split_size_minutes_spin.setValue(3)
+        self.split_size_minutes_spin.setSuffix(" min")
+        self.split_size_minutes_spin.setToolTip("Chunk duration in minutes. Converted at runtime via minutes × 60 × source FPS.")
+        self.chunk_size_spin = self.split_size_minutes_spin  # backwards-compatible persistence key
+        f.addRow(self.chunk_duration_minutes_label, self.split_size_minutes_spin)
+        self.enable_video_chunking_check.toggled.connect(self._update_chunking_visibility)
+        self._update_chunking_visibility(self.enable_video_chunking_check.isChecked())
         adj_layout.addWidget(g)
 
         # Preview & Processing
@@ -1508,19 +1526,6 @@ class MainWindow(QMainWindow):
         self.only_frames_spin.setToolTip("0 = no limit; limits the maximum number of frames processed per VAE decode chunk to prevent OOM.")
         f.addRow("Only Frames:", self.only_frames_spin)
 
-        self.enable_video_chunking_check = QCheckBox()
-        f.addRow("Enable Video Chunking:", self.enable_video_chunking_check)
-
-        self.chunk_duration_minutes_label = QLabel("Chunk Duration (Minutes):")
-        self.split_size_minutes_spin = QSpinBox()
-        self.split_size_minutes_spin.setRange(1, 120)
-        self.split_size_minutes_spin.setValue(3)
-        self.split_size_minutes_spin.setSuffix(" min")
-        self.split_size_minutes_spin.setToolTip("Chunk duration in minutes. Converted at runtime via minutes × 60 × source FPS.")
-        self.chunk_size_spin = self.split_size_minutes_spin  # backwards-compatible persistence key
-        f.addRow(self.chunk_duration_minutes_label, self.split_size_minutes_spin)
-        self.enable_video_chunking_check.toggled.connect(self._update_chunking_visibility)
-        self._update_chunking_visibility(self.enable_video_chunking_check.isChecked())
         adj_layout.addWidget(g)
 
         # Device Management
