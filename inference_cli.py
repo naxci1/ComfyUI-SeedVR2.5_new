@@ -1394,8 +1394,8 @@ def _process_frames_core(
         if runner_cache is not None:
             runner_cache['ctx'] = ctx
 
-    # Propagate Auto Safeguard flag into ctx so generation phases can read it
-    ctx['auto_safeguard'] = getattr(args, 'auto_safeguard', False)
+    # Propagate Auto Tune flag into ctx so generation phases can read it
+    ctx['auto_tune'] = getattr(args, 'auto_tune', False)
 
     # Build torch compile args
     torch_compile_args_dit = None
@@ -2013,11 +2013,9 @@ Examples:
     
     # Debugging
     debug_group = parser.add_argument_group('Debugging')
-    debug_group.add_argument("--auto_safeguard", action="store_true",
-                        help="Enable automatic VRAM overflow safeguards: reduces VAE decode tile size from >512 "
-                             "to 512 for batches >16 frames and caps micro-chunk decode at 8 frames per pass. "
-                             "Useful on Windows where Shared System RAM spillover is silent. "
-                             "When disabled, user-defined tile sizes are always respected.")
+    debug_group.add_argument("--auto_tune", action="store_true",
+                        help="Enable Auto Tune: performs pre-flight VRAM detection, forces VAE tile overlap "
+                             "to 32, and automatically reduces batch size on OOM (up to 5 retries).")
     debug_group.add_argument("--debug", action="store_true",
                         help="Enable verbose debug logging")
     
@@ -2057,6 +2055,14 @@ def main() -> None:
 
     # Update debug instance with --debug flag
     debug.enabled = args.debug
+
+    # Auto Tune: force tile overlap to 32 for both encode and decode
+    if getattr(args, "auto_tune", False):
+        if hasattr(args, "vae_encode_tile_overlap"):
+            args.vae_encode_tile_overlap = 32
+        if hasattr(args, "vae_decode_tile_overlap"):
+            args.vae_decode_tile_overlap = 32
+        debug.log("Auto Tune active: VAE tile overlap forced to 32", category="setup", force=True)
 
     # print header
     debug.print_header(cli=True)
@@ -2216,11 +2222,32 @@ def main() -> None:
                                    input_type=get_input_type(file_path), from_directory=True)
                 
                 # Process with explicit output path and runner cache
-                frames = process_single_file(file_path, args, device_list, output_path, 
-                                            format_auto_detected=format_auto_detected,
-                                            runner_cache=runner_cache)
-                total_frames_processed += frames
-                _release_post_file_resources()
+                _auto_tune_attempts = 0
+                _auto_tune_max_attempts = 5
+                while True:
+                    try:
+                        frames = process_single_file(file_path, args, device_list, output_path,
+                                                    format_auto_detected=format_auto_detected,
+                                                    runner_cache=runner_cache)
+                        total_frames_processed += frames
+                        _release_post_file_resources()
+                        break
+                    except (torch.cuda.OutOfMemoryError, RuntimeError) as _oom_err:
+                        if not getattr(args, 'auto_tune', False) or _auto_tune_attempts >= _auto_tune_max_attempts:
+                            raise
+                        if 'out of memory' not in str(_oom_err).lower() and not isinstance(_oom_err, torch.cuda.OutOfMemoryError):
+                            raise
+                        _auto_tune_attempts += 1
+                        if hasattr(torch, 'cuda'):
+                            torch.cuda.empty_cache()
+                        gc.collect()
+                        old_bs = args.batch_size
+                        args.batch_size = max(1, args.batch_size - 4)
+                        debug.log(
+                            f"Auto Tune: OOM detected, reducing batch_size {old_bs}→{args.batch_size} "
+                            f"(attempt {_auto_tune_attempts}/{_auto_tune_max_attempts})",
+                            category="setup", force=True
+                        )
                 
                 # Restore original format
                 args.output_format = original_format
@@ -2263,10 +2290,31 @@ def main() -> None:
                         category="tip", force=True
                     )
             
-            frames = process_single_file(args.input, args, device_list, args.output,
-                                        format_auto_detected=format_auto_detected,
-                                        runner_cache=runner_cache)
-            total_frames_processed += frames
+            _auto_tune_attempts = 0
+            _auto_tune_max_attempts = 5
+            while True:
+                try:
+                    frames = process_single_file(args.input, args, device_list, args.output,
+                                                format_auto_detected=format_auto_detected,
+                                                runner_cache=runner_cache)
+                    total_frames_processed += frames
+                    break
+                except (torch.cuda.OutOfMemoryError, RuntimeError) as _oom_err:
+                    if not getattr(args, 'auto_tune', False) or _auto_tune_attempts >= _auto_tune_max_attempts:
+                        raise
+                    if 'out of memory' not in str(_oom_err).lower() and not isinstance(_oom_err, torch.cuda.OutOfMemoryError):
+                        raise
+                    _auto_tune_attempts += 1
+                    if hasattr(torch, 'cuda'):
+                        torch.cuda.empty_cache()
+                    gc.collect()
+                    old_bs = args.batch_size
+                    args.batch_size = max(1, args.batch_size - 4)
+                    debug.log(
+                        f"Auto Tune: OOM detected, reducing batch_size {old_bs}→{args.batch_size} "
+                        f"(attempt {_auto_tune_attempts}/{_auto_tune_max_attempts})",
+                        category="setup", force=True
+                    )
         
         else:
             debug.log(f"Unsupported input type: {args.input}", level="ERROR", category="file", force=True)

@@ -221,6 +221,34 @@ def _detect_gpus() -> list[str]:
     except Exception:
         pass  # best-effort; keep wmic result
 
+    # ── Intel XPU (torch.xpu) ─────────────────────────────────────────────
+    if not gpu_entries:
+        try:
+            import torch as _torch  # noqa: PLC0415
+            if hasattr(_torch, 'xpu') and _torch.xpu.is_available():
+                xpu_count = _torch.xpu.device_count()
+                gpu_entries = [f"GPU {i}: Intel XPU {i}" for i in range(xpu_count)]
+                if not _GPU_INIT_MSG.startswith("✅"):
+                    _GPU_INIT_MSG = f"✅  Detected {xpu_count} Intel XPU device(s) via torch.xpu."
+        except Exception:
+            pass
+
+    # ── AMD ROCm / HIP (torch.cuda with ROCm backend) ────────────────────
+    if not gpu_entries:
+        try:
+            import torch as _torch  # noqa: PLC0415
+            if hasattr(_torch.version, 'hip') and _torch.version.hip is not None:
+                count = _torch.cuda.device_count() if _torch.cuda.is_available() else 0
+                if count > 0:
+                    gpu_entries = [
+                        f"GPU {i}: AMD {_torch.cuda.get_device_name(i)}"
+                        for i in range(count)
+                    ]
+                    if not _GPU_INIT_MSG.startswith("✅"):
+                        _GPU_INIT_MSG = f"✅  Detected {count} AMD ROCm device(s)."
+        except Exception:
+            pass
+
     if not gpu_entries:
         _GPU_INIT_MSG = (
             "⚠  No CUDA-capable GPUs found – defaulting to Auto.  " + _GPU_INIT_MSG
@@ -326,32 +354,23 @@ IMAGE_BIT_DEPTHS: dict[str, list[dict[str, Any]]] = {
 # Each entry maps display name → {container, ffmpeg args, is_10bit}.
 # The container is automatically applied to the backing container_combo.
 UNIFIED_VIDEO_CODEC_PROFILES: dict[str, dict[str, Any]] = {
-    # ProRes family (MOV container)
-    "ProRes 422 Proxy":              {"container": "MOV", "ffmpeg": ["-c:v", "prores_ks", "-profile:v", "0", "-pix_fmt", "yuv422p10le"],  "is_10bit": True},
-    "ProRes 422 LT":                 {"container": "MOV", "ffmpeg": ["-c:v", "prores_ks", "-profile:v", "1", "-pix_fmt", "yuv422p10le"],  "is_10bit": True},
-    "ProRes 422 Standard":           {"container": "MOV", "ffmpeg": ["-c:v", "prores_ks", "-profile:v", "2", "-pix_fmt", "yuv422p10le"],  "is_10bit": True},
-    "ProRes 422 HQ":                 {"container": "MOV", "ffmpeg": ["-c:v", "prores_ks", "-profile:v", "3", "-pix_fmt", "yuv422p10le"],  "is_10bit": True},
-    "ProRes 4444 XQ":                {"container": "MOV", "ffmpeg": ["-c:v", "prores_ks", "-profile:v", "5", "-pix_fmt", "yuva444p12le"], "is_10bit": True},
-    # H.264 (MP4)
-    "H.264 High":                    {"container": "MP4", "ffmpeg": ["-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p"],     "is_10bit": False},
-    # H.265 / HEVC (MP4)
-    "H.265 High":                    {"container": "MP4", "ffmpeg": ["-c:v", "libx265", "-profile:v", "high", "-pix_fmt", "yuv420p"],     "is_10bit": False},
-    "H.265 Main":                    {"container": "MP4", "ffmpeg": ["-c:v", "libx265", "-profile:v", "main", "-pix_fmt", "yuv420p"],     "is_10bit": False},
-    "H.265 Main10":                  {"container": "MP4", "ffmpeg": ["-c:v", "libx265", "-profile:v", "main10", "-pix_fmt", "yuv420p10le"], "is_10bit": True},
-    # VP9 (WEBM)
-    "VP9 Good":                      {"container": "WEBM", "ffmpeg": ["-c:v", "libvpx-vp9", "-deadline", "good"],                         "is_10bit": False},
-    "VP9 Best":                      {"container": "WEBM", "ffmpeg": ["-c:v", "libvpx-vp9", "-deadline", "best"],                         "is_10bit": False},
-    # AV1 (MP4)
-    "AV1 8-bit":                     {"container": "MP4", "ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p", "-strict", "experimental", "-cpu-used", "4", "-row-mt", "1"], "is_10bit": False},
-    "AV1 10-bit":                    {"container": "MP4", "ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p10le", "-strict", "experimental", "-cpu-used", "4", "-row-mt", "1"], "is_10bit": True},
-    # FFV1 lossless (MKV)
-    "FFV1 4:2:0 (8-bit)":            {"container": "MKV", "ffmpeg": ["-c:v", "ffv1", "-level", "3", "-pix_fmt", "yuv420p"],               "is_10bit": False},
-    "FFV1 4:2:2 (10-bit)":           {"container": "MKV", "ffmpeg": ["-c:v", "ffv1", "-level", "3", "-pix_fmt", "yuv422p10le"],           "is_10bit": True},
-    "FFV1 4:4:4 (12-bit)":           {"container": "MKV", "ffmpeg": ["-c:v", "ffv1", "-level", "3", "-pix_fmt", "yuv444p12le"],           "is_10bit": True},
-    # Uncompressed (MOV)
-    "QuickTime V210 (10-bit 4:2:2)": {"container": "MOV", "ffmpeg": ["-c:v", "v210"],                                                     "is_10bit": True},
-    "R210 (RGB 10-bit)":             {"container": "MOV", "ffmpeg": ["-c:v", "r210"],                                                     "is_10bit": True},
-    "Animation (RGB 8-bit)":         {"container": "MOV", "ffmpeg": ["-c:v", "qtrle", "-pix_fmt", "argb"],                                "is_10bit": False},
+    # MOV container – ProRes family
+    "ProRes 422 HQ":  {"container": "MOV", "ffmpeg": ["-c:v", "prores_ks", "-profile:v", "3", "-pix_fmt", "yuv422p10le"],  "is_10bit": True},
+    "ProRes 4444 XQ": {"container": "MOV", "ffmpeg": ["-c:v", "prores_ks", "-profile:v", "5", "-pix_fmt", "yuva444p12le"], "is_10bit": True},
+    # MP4 container – H.264 / H.265 / AV1
+    "H.264 High":     {"container": "MP4", "ffmpeg": ["-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p"],     "is_10bit": False},
+    "H.265 Main":     {"container": "MP4", "ffmpeg": ["-c:v", "libx265", "-profile:v", "main", "-pix_fmt", "yuv420p"],     "is_10bit": False},
+    "H.265 Main10":   {"container": "MP4", "ffmpeg": ["-c:v", "libx265", "-profile:v", "main10", "-pix_fmt", "yuv420p10le"], "is_10bit": True},
+    "AV1":            {"container": "MP4", "ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p", "-strict", "experimental", "-cpu-used", "4", "-row-mt", "1"], "is_10bit": False},
+    # MKV container – VP9
+    "VP9":            {"container": "MKV", "ffmpeg": ["-c:v", "libvpx-vp9", "-deadline", "good"],                          "is_10bit": False},
+}
+
+# Codecs available per container for the UI filter
+CONTAINER_CODECS: dict[str, list[str]] = {
+    "MOV": ["ProRes 422 HQ", "ProRes 4444 XQ"],
+    "MP4": ["H.264 High", "H.265 Main", "H.265 Main10", "AV1"],
+    "MKV": ["VP9"],
 }
 
 AUDIO_PROFILES: dict[str, list[str]] = {
@@ -831,7 +850,7 @@ class MainWindow(QMainWindow):
             pass
 
         super().__init__()
-        self.setWindowTitle("SeedVR2.5 GUI by HB2k v1.6b")
+        self.setWindowTitle("1Click_SeedVR2.5 by Naxci1 version 1.7 beta")
         self.resize(1100, 900)
 
         # Create settings window first – it loads saved paths in its __init__
@@ -907,7 +926,7 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(QIcon(str(icon_path)))
         self._enable_global_drop_targets()
         self._persistable_widgets = self._build_persistable_widget_map()
-        self._update_export_controls()
+        self._on_container_changed()
         self._load_model_settings()
         self._prompt_load_last_preset()
         self._apply_mode_visibility()
@@ -1628,8 +1647,8 @@ class MainWindow(QMainWindow):
         # Debug
         g, f = _make_group("Debug")
         self._debug_group = g
-        self.auto_safeguard_check = QCheckBox()
-        f.addRow("Auto Safeguard:", self.auto_safeguard_check)
+        self.auto_tune_check = QCheckBox()
+        f.addRow("Auto Tune:", self.auto_tune_check)
         self.debug_check = QCheckBox()
         f.addRow("Verbose Debug:", self.debug_check)
         self.enable_audio_notifications_check = QCheckBox()
@@ -1672,13 +1691,15 @@ class MainWindow(QMainWindow):
 
         # ── Video export group (visible when Video Mode is active) ──────
         self._video_export_group, vf = _make_group("Video Export")
-        # container_combo is the backing store – auto-set from codec selection; not shown as a row
+        # Container selection drives the codec list
         self.container_combo = QComboBox()
-        self.container_combo.addItems(list(EXPORT_CODEC_PROFILES.keys()))
+        self.container_combo.addItems(list(CONTAINER_CODECS.keys()))
+        vf.addRow("Container:", self.container_combo)
 
         self.video_codec_combo = QComboBox()
         vf.addRow("Video Codec:", self.video_codec_combo)
-        # Codec change drives container auto-selection
+        # Container change filters codec list; codec change syncs container
+        self.container_combo.currentIndexChanged.connect(self._on_container_changed)
         self.video_codec_combo.currentIndexChanged.connect(self._update_export_controls)
 
         self.audio_mode_combo = QComboBox()
@@ -2023,7 +2044,6 @@ class MainWindow(QMainWindow):
         if not advanced:
             self.pre_downscale_combo.setCurrentText(str(self._simple_defaults["pre_downscale"]))
             self.resolution_mode_combo.setCurrentText(str(self._simple_defaults["resolution_mode"]))
-            self.resolution_spin.setValue(int(self._simple_defaults["resolution"]))
             self.batch_size_spin.setValue(int(self._simple_defaults["batch_size"]))
             self.enable_video_chunking_check.setChecked(bool(self._simple_defaults["enable_video_chunking"]))
             self.split_size_minutes_spin.setValue(int(self._simple_defaults["split_minutes"]))
@@ -2082,13 +2102,13 @@ class MainWindow(QMainWindow):
     def _show_about_dialog(self) -> None:
         QMessageBox.about(
             self,
-            "About SeedVR2 GUI",
+            "About 1Click_SeedVR2.5",
             (
-                "<b>SeedVR2.5 GUI by HB2k</b><br>"
-                "Version: v1.6b<br><br>"
-                "Topaz-style wrapper for SeedVR2 inference_cli.py.<br>"
+                "<b>1Click_SeedVR2.5 by Naxci1</b><br>"
+                "Version: v1.7 beta<br><br>"
+                "Professional video upscaler powered by SeedVR2.<br>"
                 "License: Apache-2.0<br><br>"
-                '<a href="https://github.com/naxci1/ComfyUI-SeedVR2.5_new">'
+                '<a href="https://github.com/naxci1/1Click_SeedVR2.5">'
                 "GitHub Repository</a>"
             ),
         )
@@ -2141,7 +2161,7 @@ class MainWindow(QMainWindow):
             "latent_noise_scale_spin": self.latent_noise_scale_spin,
             "cache_dit_check": self.cache_dit_check,
             "cache_vae_check": self.cache_vae_check,
-            "auto_safeguard_check": self.auto_safeguard_check,
+            "auto_tune_check": self.auto_tune_check,
             "debug_check": self.debug_check,
             "enable_audio_notifications_check": self.enable_audio_notifications_check,
             "file_format_combo": self.file_format_combo,
@@ -2159,6 +2179,19 @@ class MainWindow(QMainWindow):
         "FFV1 (Lossless 8/10/12-bit)": "MKV",
     }
 
+    def _on_container_changed(self, _index: int = 0) -> None:
+        """Repopulate the codec combo to show only codecs compatible with the selected container."""
+        container = self.container_combo.currentText()
+        codecs = CONTAINER_CODECS.get(container, [])
+        prev = self.video_codec_combo.currentText()
+        self.video_codec_combo.blockSignals(True)
+        self.video_codec_combo.clear()
+        self.video_codec_combo.addItems(codecs)
+        keep_idx = self.video_codec_combo.findText(prev)
+        self.video_codec_combo.setCurrentIndex(keep_idx if keep_idx >= 0 else 0)
+        self.video_codec_combo.blockSignals(False)
+        self._update_export_controls()
+
     def _update_export_controls(self, *_: object) -> None:
         exporting_sequence = self.export_image_sequence_check.isChecked()
         self.video_codec_combo.setEnabled(not exporting_sequence)
@@ -2167,24 +2200,18 @@ class MainWindow(QMainWindow):
         if exporting_sequence:
             return
 
-        # Populate unified video codec list (only when list is stale / uninitialized)
-        if self.video_codec_combo.count() != len(UNIFIED_VIDEO_CODEC_PROFILES):
+        # Ensure codec list is filtered for the current container (no-op if already correct)
+        container = self.container_combo.currentText()
+        expected_codecs = CONTAINER_CODECS.get(container, [])
+        current_codecs = [self.video_codec_combo.itemText(i) for i in range(self.video_codec_combo.count())]
+        if current_codecs != expected_codecs:
             prev_codec = self.video_codec_combo.currentText()
             self.video_codec_combo.blockSignals(True)
             self.video_codec_combo.clear()
-            self.video_codec_combo.addItems(list(UNIFIED_VIDEO_CODEC_PROFILES.keys()))
+            self.video_codec_combo.addItems(expected_codecs)
             keep_idx = self.video_codec_combo.findText(prev_codec)
             self.video_codec_combo.setCurrentIndex(keep_idx if keep_idx >= 0 else 0)
             self.video_codec_combo.blockSignals(False)
-
-        # Auto-set container from selected codec so CLI always gets the right format
-        selected_codec = self.video_codec_combo.currentText()
-        auto_container = UNIFIED_VIDEO_CODEC_PROFILES.get(selected_codec, {}).get("container", "MP4")
-        self.container_combo.blockSignals(True)
-        cidx = self.container_combo.findText(auto_container)
-        if cidx >= 0 and self.container_combo.currentIndex() != cidx:
-            self.container_combo.setCurrentIndex(cidx)
-        self.container_combo.blockSignals(False)
 
         # Keep file_format_combo showing "Video" when in video mode
         if hasattr(self, "file_format_combo") and not getattr(self, "_updating_output_mode", False):
@@ -3003,12 +3030,16 @@ class MainWindow(QMainWindow):
         if self.cache_vae_check.isChecked():
             args.append("--cache_vae")
 
-        # auto safeguard
-        if self.auto_safeguard_check.isChecked():
-            args.append("--auto_safeguard")
+        # auto tune
+        if self.auto_tune_check.isChecked():
+            args.append("--auto_tune")
+            # Force tile_overlap to 32 when Auto Tune is active
+            if self._advanced_mode_enabled:
+                self.vae_encode_tile_overlap_spin.setValue(32)
+                self.vae_decode_tile_overlap_spin.setValue(32)
 
-        # debug
-        if self._advanced_mode_enabled and self.debug_check.isChecked():
+        # debug – works in both simple and advanced mode
+        if self.debug_check.isChecked():
             args.append("--debug")
 
         return args
