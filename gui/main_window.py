@@ -28,7 +28,9 @@ from PyQt6.QtGui import (
     QDropEvent,
     QFont,
     QIcon,
+    QImage,
     QImageReader,
+    QImageWriter,
     QPixmap,
     QPainter,
     QPen,
@@ -2366,23 +2368,57 @@ class MainWindow(QMainWindow):
         profile = UNIFIED_VIDEO_CODEC_PROFILES.get(codec, {})
         return bool(profile.get("is_10bit", False))
 
+    @staticmethod
+    def _save_qimage_as_tiff16(image: "QImage", file_path: str) -> bool:
+        """Save *image* as an uncompressed 16-bit TIFF.
+
+        The source QImage is promoted to a 64-bit (16-bit-per-channel) format so
+        the on-disk TIFF carries 16-bit depth, avoiding the precision loss of
+        8-bit PNG for preview and intermediate frames. Returns True on success.
+        """
+        try:
+            img16 = image.convertToFormat(QImage.Format.Format_RGBX64)
+            if img16.isNull():
+                img16 = image
+            writer = QImageWriter(file_path, b"tiff")
+            # 0 = no compression (uncompressed TIFF).
+            writer.setCompression(0)
+            return bool(writer.write(img16))
+        except Exception:
+            # Fall back to Qt's default TIFF writer if 16-bit promotion fails.
+            try:
+                return bool(image.save(file_path, "TIFF"))
+            except Exception:
+                return False
+
     def _resolve_export_output_dir(self) -> Path:
-        """Return the export directory from Settings output path (file or directory)."""
-        out_raw = self._folders_dlg.output_edit.text().strip()
-        if out_raw:
-            out_path = Path(out_raw)
-            # Existing directory => use it.
-            if out_path.exists() and out_path.is_dir():
+        """Return the base output directory for all generated files.
+
+        The default for every operation (Preview, Upscale, Split) is the parent
+        directory of the input file, i.e. ``os.path.dirname(input_file)``. A
+        configured output path is only honored when the user *explicitly*
+        selected it (via Browse or manual typing); auto-derived or restored
+        values are ignored so outputs are never written to a stale/arbitrary
+        location.
+        """
+        if getattr(self._folders_dlg, "output_user_selected", False):
+            out_raw = self._folders_dlg.output_edit.text().strip()
+            if out_raw:
+                out_path = Path(out_raw)
+                # Existing directory => use it.
+                if out_path.exists() and out_path.is_dir():
+                    return out_path
+                # If user entered a file-like path, use its parent directory.
+                if out_path.suffix:
+                    return out_path.parent if str(out_path.parent) else Path.cwd()
+                # Non-existing path without suffix: treat as target directory.
                 return out_path
-            # If user entered a file-like path, use its parent directory.
-            if out_path.suffix:
-                return out_path.parent if str(out_path.parent) else Path.cwd()
-            # Non-existing path without suffix: treat as target directory.
-            return out_path
-        # Fallback: input parent directory.
+        # Default: the directory containing the input file.
         inp = self._folders_dlg.input_edit.text().strip()
         if inp:
-            return Path(inp).parent
+            inp_path = Path(inp)
+            # A directory input is itself the base; a file input uses its parent.
+            return inp_path if inp_path.is_dir() else inp_path.parent
         return Path.cwd()
 
     @staticmethod
@@ -2776,7 +2812,13 @@ class MainWindow(QMainWindow):
         args.append(inp)
 
         # output
+        # Only honor an explicit, user-selected output path. Auto-derived or
+        # restored values are ignored so that, by default, every output lands in
+        # the input file's parent directory (handled by the branches below and
+        # _resolve_export_output_dir).
         out = self._folders_dlg.output_edit.text().strip()
+        if not getattr(self._folders_dlg, "output_user_selected", False):
+            out = ""
         if self._is_preview_run:
             export_dir = self._resolve_export_output_dir()
             if self._is_preview_video_mode:
@@ -2784,8 +2826,8 @@ class MainWindow(QMainWindow):
                 container_ext = self._selected_export_extension()
                 preview_out = self._generate_export_output_path(container_ext, export_dir)
             else:
-                # Image-mode preview: single PNG frame.
-                preview_out = self._generate_export_output_path(".png", export_dir)
+                # Image-mode preview: single high-fidelity 16-bit TIFF frame.
+                preview_out = self._generate_export_output_path(".tiff", export_dir)
             self._folders_dlg.output_edit.setText(str(preview_out))
             args += ["--output", str(preview_out)]
         elif input_is_directory:
@@ -2830,15 +2872,16 @@ class MainWindow(QMainWindow):
             args += ["--model_dir", md]
 
         # output format mapping for SeedVR2 CLI:
-        # - image-mode preview ALWAYS maps to png (single frame) — highest priority
+        # - image-mode preview ALWAYS maps to 16-bit TIFF (single frame) — highest priority
         # - image sequence modes map to CLI output_format=<actual ext without dot>
         # - normal video export maps to the selected container
-        _is_png_preview = self._is_preview_run and not self._is_preview_video_mode
-        if _is_png_preview:
-            # Image-mode preview: always a single PNG regardless of any export settings.
-            # This must take priority over the image-sequence checkbox so that the CLI
-            # never interprets the single-frame capture as a video pipeline run.
-            args += ["--output_format", "png"]
+        _is_image_preview = self._is_preview_run and not self._is_preview_video_mode
+        if _is_image_preview:
+            # Image-mode preview: always a single high-fidelity 16-bit TIFF frame,
+            # regardless of any export settings.  This must take priority over the
+            # image-sequence checkbox so that the CLI never interprets the
+            # single-frame capture as a video pipeline run.
+            args += ["--output_format", "tiff"]
         elif self.export_image_sequence_check.isChecked():
             # Pass the real extension so the CLI writes TIFF/DPX/EXR/JPEG correctly,
             # not always PNG.  Use the profile ext but strip the leading dot.
@@ -2856,8 +2899,8 @@ class MainWindow(QMainWindow):
         video_backend = self.video_backend_combo.currentText() or "ffmpeg"
         args += ["--video_backend", video_backend]
         # Emit ffmpeg_video_args only when ffmpeg backend is selected.
-        # Skip for image-mode preview PNG runs and image sequence exports.
-        if not _is_png_preview and not self.export_image_sequence_check.isChecked() and video_backend == "ffmpeg":
+        # Skip for image-mode preview TIFF runs and image sequence exports.
+        if not _is_image_preview and not self.export_image_sequence_check.isChecked() and video_backend == "ffmpeg":
             profile = self._selected_export_profile_to_ffmpeg_args()
             video_codec_args = profile.get("video_args", [])
             if video_codec_args:
@@ -2916,7 +2959,7 @@ class MainWindow(QMainWindow):
 
         # For preview runs, hard-cap to 1 frame so the CLI never feeds more than one
         # frame through the pipeline (prevents accidental video-pipeline activation).
-        if _is_png_preview:
+        if _is_image_preview:
             args += ["--load_cap", "1"]
         else:
             load_cap = self.load_cap_spin.value()
@@ -3300,22 +3343,25 @@ class MainWindow(QMainWindow):
             self._on_log("⚠  Preview: no frame available – play or pause a video first.")
             return
 
-        # Save preview input frame directly inside the selected export directory.
+        # Save preview input frame directly inside the input file's directory as a
+        # 16-bit TIFF so the source and upscaled frames stay aligned at full
+        # fidelity for side-by-side comparison.
         export_dir = self._resolve_export_output_dir()
         export_dir.mkdir(parents=True, exist_ok=True)
         preview_input = self._ensure_unique_file_path(
-            export_dir / "preview_input_frame_001.png"
+            export_dir / "preview_input_frame_001.tiff"
         )
         self._preview_temp_path = str(preview_input)
-        if not frame_img.save(self._preview_temp_path, "PNG"):
+        if not self._save_qimage_as_tiff16(frame_img, self._preview_temp_path):
             self._on_log(f"⚠  Preview: could not save input frame to {self._preview_temp_path}")
             return
 
         self._on_log(f"ℹ  Preview: captured frame → {self._preview_temp_path}")
 
         # Point input to the temp file, set batch size to 1, mark as preview run.
-        # Also set an explicit output PNG path so the CLI never tries to create a video from
-        # a single-image input (which caused the cv2.imwrite crash on .mp4 extension).
+        # Also set an explicit 16-bit TIFF output path so the CLI never tries to
+        # create a video from a single-image input (which caused the cv2.imwrite
+        # crash on .mp4 extension).
         self._folders_dlg.input_edit.setText(self._preview_temp_path)
         # Derive preview output name from the original input filename.
         _orig_for_preview = Path(self._preview_original_input_path) if self._preview_original_input_path else None
@@ -3323,10 +3369,10 @@ class MainWindow(QMainWindow):
             _preview_out_stem = f"seedvr2_{_orig_for_preview.stem}"
         else:
             _preview_out_stem = "seedvr2_preview_frame"
-        preview_out_png = str(
-            self._ensure_unique_file_path(export_dir / f"{_preview_out_stem}.png")
+        preview_out_tiff = str(
+            self._ensure_unique_file_path(export_dir / f"{_preview_out_stem}.tiff")
         )
-        self._folders_dlg.output_edit.setText(preview_out_png)
+        self._folders_dlg.output_edit.setText(preview_out_tiff)
         self.batch_size_spin.setValue(1)
         self._is_preview_run = True
 

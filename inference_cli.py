@@ -492,9 +492,15 @@ def extract_frames_from_image(image_path: str) -> Tuple[torch.Tensor, float]:
         debug.log(f"Detected BGRA image, converted to RGB", category="file")
     else:
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    
-    # Convert to float32 and normalize
-    frame = frame.astype(np.float32) / 255.0
+
+    # Convert to float32 and normalize based on the source bit depth so that
+    # 16-bit inputs (e.g. 16-bit TIFF preview frames) preserve their full
+    # dynamic range instead of overflowing the [0,1] range.
+    if np.issubdtype(frame.dtype, np.integer):
+        max_val = float(np.iinfo(frame.dtype).max)
+    else:
+        max_val = 1.0 if frame.max() <= 1.0 else 255.0
+    frame = frame.astype(np.float32) / max_val
     
     # Convert to tensor [1, H, W, C]
     frames_tensor = torch.from_numpy(frame[None, ...]).to(torch.float16)
@@ -663,9 +669,13 @@ def generate_output_path(input_path: str, output_format: str, output_dir: Option
         # Single file mode: output to the same directory with a seedvr-prefixed filename.
         base_dir = input_path_obj.parent
     
-    # Image input always produces an image output regardless of the video format flag
+    # Image input always produces an image output regardless of the video format flag.
+    # Honor a requested image format (e.g. tiff) so high-fidelity outputs are kept;
+    # fall back to PNG for any non-image format.
     if input_type == "image":
-        output_path = base_dir / f"{input_name}.png"
+        fmt_lower = (output_format or "").lower()
+        img_ext = f".{fmt_lower}" if f".{fmt_lower}" in _IMAGE_OUTPUT_EXTS else ".png"
+        output_path = base_dir / f"{input_name}{img_ext}"
         return str(ensure_unique_output_path(output_path).resolve())
 
     # Generate output path based on format
@@ -1342,11 +1352,13 @@ def process_single_file(input_path: str, args: "argparse.Namespace", device_list
             result = _single_gpu_direct_processing(frames_tensor, args, device_list[0], runner_cache)
         debug.log(f"Processing time: {time.time() - processing_start:.2f}s", category="timing")
 
-        # Save single image
+        # Save single image. Pass the float result directly so 16-bit targets
+        # (e.g. TIFF previews) retain full precision; the saver picks the bit
+        # depth from the output extension.
         os.makedirs(Path(output_path).parent, exist_ok=True)
-        frame_np = (result[0].cpu().numpy() * 255.0).astype(np.uint8)
-        _save_image_bgr(frame_np, output_path)
-        del frame_np
+        frame_float = result[0].cpu().numpy()
+        _save_image_bgr(frame_float, output_path)
+        del frame_float
 
         debug.log(f"Output saved to: {output_path}", category="file", force=True)
         return 1
@@ -1513,19 +1525,45 @@ def _stream_video_chunks(
             clear_memory(debug=debug, deep=True, force=True, timer_name=cleanup_timer_name)
 
 
-def _save_image_bgr(frame_np: np.ndarray, file_path: str) -> None:
+def _save_image_bgr(frame: np.ndarray, file_path: str) -> None:
     """
-    Save a single RGB(A) uint8 frame to disk, converting to BGR(A) for OpenCV.
-    
+    Save a single RGB(A) frame to disk as BGR(A) for OpenCV.
+
+    Accepts either a Float32 array in range [0,1] or an integer array. TIFF
+    outputs are written as uncompressed 16-bit to preserve fidelity for previews
+    and intermediate frames; all other formats are written as 8-bit.
+
     Args:
-        frame_np: Frame as uint8 numpy array [H, W, C] where C is 3 (RGB) or 4 (RGBA)
-        file_path: Output file path
+        frame: Frame as numpy array [H, W, C] where C is 3 (RGB) or 4 (RGBA);
+            either float in [0,1] or an integer dtype.
+        file_path: Output file path (extension selects the format/bit depth)
     """
-    if frame_np.shape[2] == 4:
-        frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGBA2BGRA)
+    ext = os.path.splitext(file_path)[1].lower()
+    sixteen_bit = ext in (".tif", ".tiff")
+
+    # Normalize input to float [0,1] regardless of incoming dtype.
+    if np.issubdtype(frame.dtype, np.floating):
+        norm = np.clip(frame, 0.0, 1.0)
+    elif np.issubdtype(frame.dtype, np.integer):
+        norm = np.clip(frame.astype(np.float32) / float(np.iinfo(frame.dtype).max), 0.0, 1.0)
     else:
-        frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
-    cv2.imwrite(file_path, frame_bgr)
+        norm = np.clip(frame.astype(np.float32), 0.0, 1.0)
+
+    if sixteen_bit:
+        scaled = (norm * 65535.0 + 0.5).astype(np.uint16)
+    else:
+        scaled = (norm * 255.0 + 0.5).astype(np.uint8)
+
+    if scaled.shape[2] == 4:
+        out = cv2.cvtColor(scaled, cv2.COLOR_RGBA2BGRA)
+    else:
+        out = cv2.cvtColor(scaled, cv2.COLOR_RGB2BGR)
+
+    if sixteen_bit:
+        # IMWRITE_TIFF_COMPRESSION = 1 → no compression (uncompressed TIFF).
+        cv2.imwrite(file_path, out, [int(cv2.IMWRITE_TIFF_COMPRESSION), 1])
+    else:
+        cv2.imwrite(file_path, out)
 
 
 def _emit_gui_queue_status(file_path: str, current: int, total: int) -> None:
@@ -1679,7 +1717,8 @@ def save_frames_to_image(
     Save frames tensor as sequential image files in the chosen format.
 
     Each frame saved as ``{base_name}_{index:0Nd}{ext}`` with zero-padded indices.
-    Converts Float32 [0,1] to uint8 [0,255] and RGB(A) to BGR(A) for OpenCV.
+    Converts Float32 [0,1] to BGR(A) for OpenCV; TIFF frames are written as
+    uncompressed 16-bit, all other formats as 8-bit.
 
     Args:
         frames_tensor: Frames in format [T, H, W, C], Float32, range [0,1]
@@ -1704,7 +1743,10 @@ def save_frames_to_image(
 
     os.makedirs(output_dir, exist_ok=True)
 
-    frames_np = (frames_tensor.cpu().numpy() * 255.0).astype(np.uint8)
+    # Keep frames as Float32 [0,1] and let _save_image_bgr pick the bit depth
+    # from the extension (16-bit for TIFF, 8-bit otherwise) so high-fidelity
+    # formats are not down-converted to 8-bit.
+    frames_np = frames_tensor.cpu().numpy()
     total = frames_np.shape[0]
 
     if start_index == 0:

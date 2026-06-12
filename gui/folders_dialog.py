@@ -67,6 +67,11 @@ class FoldersDialog(QDialog):
         self.setWindowTitle("Input / Output Paths")
         self.setMinimumWidth(560)
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
+        # Tracks whether the current output path was *explicitly* chosen by the
+        # user (via Browse or manual typing) as opposed to being auto-derived or
+        # restored from a previous session. When False, callers default the
+        # output directory to the input file's parent folder.
+        self.output_user_selected: bool = False
         self._build_ui()
         self.load_io_paths()
 
@@ -113,7 +118,9 @@ class FoldersDialog(QDialog):
 
         # ── Output row ─────────────────────────────────────────────────
         self.output_edit = QLineEdit()
-        self.output_edit.setPlaceholderText("Optional – leave blank for auto")
+        self.output_edit.setPlaceholderText("Optional – leave blank to use the input file's folder")
+        # Manual typing into the field counts as an explicit user selection.
+        self.output_edit.textEdited.connect(self._on_output_edited)
 
         browse_out_btn = QPushButton("Browse…")
         browse_out_btn.clicked.connect(self._browse_output)
@@ -169,6 +176,15 @@ class FoldersDialog(QDialog):
         path = QFileDialog.getExistingDirectory(self, "Select Output Directory", start)
         if path:
             self.output_edit.setText(path)
+            self.output_user_selected = True
+
+    def _on_output_edited(self, text: str) -> None:
+        """Mark the output path as explicitly user-selected when typed manually.
+
+        An empty field clears the flag so the output reverts to the default
+        (the input file's parent directory).
+        """
+        self.output_user_selected = bool(text.strip())
 
     # ------------------------------------------------------------------
     # Accept / Cancel
@@ -195,6 +211,8 @@ class FoldersDialog(QDialog):
         cfg = load_config()
         self.input_edit.setText(cfg.get("input_path", ""))
         self.output_edit.setText(cfg.get("output_path", ""))
+        # Restore whether the saved output path was an explicit user selection.
+        self.output_user_selected = bool(cfg.get("output_user_selected", False))
         mode = cfg.get("input_mode", "File")
         idx = self.input_mode_combo.findText(mode)
         if idx >= 0:
@@ -205,5 +223,6 @@ class FoldersDialog(QDialog):
         cfg = load_config()
         cfg["input_path"] = self.input_edit.text().strip()
         cfg["output_path"] = self.output_edit.text().strip()
+        cfg["output_user_selected"] = bool(self.output_user_selected)
         cfg["input_mode"] = self.input_mode_combo.currentText()
         save_config(cfg)
