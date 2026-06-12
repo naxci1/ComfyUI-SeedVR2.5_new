@@ -57,6 +57,8 @@ from ..optimization.performance import (
     optimized_single_video_rearrange, 
     optimized_sample_to_image_format
 )
+from ..optimization.triton_kernels import fused_normalize_
+from ..optimization.sharding import plan_dit_sharding, initialize_sharding
 from ..utils.color_fix import (
     lab_color_transfer,
     wavelet_adaptive_color_correction,
@@ -599,6 +601,15 @@ def upscale_all_batches(
     debug.log("", category="none", force=True)
     debug.log("━━━━━━━━ Phase 2: DiT upscaling ━━━━━━━━", category="none", force=True)
     debug.start_timer("phase2_upscaling")
+    
+    # Resolve the multi-GPU DiT sharding plan. This is a no-op passthrough on a
+    # single GPU (the GGUF master source path is unchanged) but is ready to fan
+    # DiT inference out over a context-parallel cohort when launched under
+    # torchrun with WORLD_SIZE > 1. No threads/processes are spawned here.
+    if ctx.get('sharding_plan') is None:
+        sharding_plan = plan_dit_sharding(debug=debug)
+        initialize_sharding(sharding_plan, debug=debug)
+        ctx['sharding_plan'] = sharding_plan
     
     # Load text embeddings if not already loaded
     if ctx.get('text_embeds') is None:
@@ -1497,14 +1508,15 @@ def postprocess_all_batches(
                 rgb_channels = sample[..., :3]  # (T, H, W, 3)
                 alpha_channel = sample[..., 3:4]  # (T, H, W, 1)
                 
-                # Normalize only RGB from [-1, 1] to [0, 1]
-                rgb_channels.clamp_(-1, 1).mul_(0.5).add_(0.5)
+                # Normalize only RGB from [-1, 1] to [0, 1] using the fused
+                # GPU kernel (clamp+scale+shift in a single launch).
+                fused_normalize_(rgb_channels)
                 
                 # Merge back with unchanged Alpha
                 sample = torch.cat([rgb_channels, alpha_channel], dim=-1)
             else:
-                # RGB only: apply normalization as usual
-                sample.clamp_(-1, 1).mul_(0.5).add_(0.5)
+                # RGB only: apply fused normalization ([-1, 1] -> [0, 1]).
+                fused_normalize_(sample)
             
             # Draw tile boundaries for debugging (if tile info available)
             for phase, attr in [('encode', 'encode_tile_boundaries'), ('decode', 'decode_tile_boundaries')]:
