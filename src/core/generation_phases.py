@@ -933,6 +933,13 @@ def decode_all_batches(
             debug.log("Tile debug enabled: decode tile boundaries will be visualized", category="vae", force=True)
             debug.log("Remember to disable --tile_debug in production to remove overlay visualization", category="tip", indent_level=1, force=True)
         
+        # ── Explicit VRAM flush before decode loop ─────────────────────────────
+        # Clears the "reserved but unallocated" VRAM (fragmented segments that the
+        # CUDA allocator holds on to after the diffusion phase) so the full headroom
+        # is available for the contiguous blocks required by VAE decoding.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         # Process decoding
         for batch_idx, upscaled_latent in enumerate(ctx['all_upscaled_latents']):
             if upscaled_latent is None:

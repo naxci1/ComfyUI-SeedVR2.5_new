@@ -83,9 +83,10 @@ if platform.system() == "Darwin":
     os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
     os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.0")
 else:
-    # Force max_split_size_mb to prevent fragmentation during Phase 3 VAE decoding
-    # on platforms without expandable_segments (e.g. Windows with 10-bit ProRes/AV1).
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+    # expandable_segments lets the CUDA allocator grow/shrink segment sizes on demand,
+    # preventing the VRAM fragmentation that causes OOM during Phase 3 VAE decoding
+    # (10.87 GiB allocated, 1.56 GiB reserved-but-unallocated, 1.32 GiB contiguous block missing).
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     # Pre-parse arguments that must be handled before torch import
     _pre_parser = argparse.ArgumentParser(add_help=False)
@@ -2071,6 +2072,17 @@ def main() -> None:
     if args.vae_decode_tiled and args.vae_decode_tile_overlap >= args.vae_decode_tile_size:
         debug.log(f"VAE decode tile overlap ({args.vae_decode_tile_overlap}) must be smaller than tile size ({args.vae_decode_tile_size})", level="ERROR", category="vae", force=True)
         sys.exit(1)
+
+    # Hard upper limit: cap batch_size to 40 to guarantee VRAM stability on 16 GB cards.
+    # Larger values risk CUDA OOM during Phase 3 VAE decoding due to contiguous-block shortage.
+    _BATCH_SIZE_VRAM_LIMIT = 40
+    if args.batch_size > _BATCH_SIZE_VRAM_LIMIT:
+        debug.log(
+            f"batch_size {args.batch_size} exceeds the 16 GB VRAM safety limit; "
+            f"capping to {_BATCH_SIZE_VRAM_LIMIT} to prevent Phase 3 OOM.",
+            level="WARNING", category="setup", force=True
+        )
+        args.batch_size = _BATCH_SIZE_VRAM_LIMIT
     
     # Validate ffmpeg availability if selected or needed for custom video args
     if args.ffmpeg_video_args:
