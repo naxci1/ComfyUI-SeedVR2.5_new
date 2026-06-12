@@ -866,6 +866,7 @@ class MainWindow(QMainWindow):
         self._worker = None
         self._input_meta_text: str = ""   # last "Input: …" string for dual metadata
         self._preview_temp_path: Optional[str] = None  # preview input frame path
+        self._preview_output_path: Optional[str] = None  # tracked preview upscale output (TIFF) path
         self._is_preview_run: bool = False  # flag: switch to Split View on finish
         self._run_started_at: Optional[float] = None
         self._latest_output_path: Optional[Path] = None
@@ -2804,14 +2805,30 @@ class MainWindow(QMainWindow):
         # lands directly beside the input with no subfolders.
         out = ""
         if self._is_preview_run:
-            export_dir = self._resolve_export_output_dir()
             if self._is_preview_video_mode:
                 # Video-mode preview: short clip in the selected container.
+                export_dir = self._resolve_export_output_dir()
                 container_ext = self._selected_export_extension()
                 preview_out = self._generate_export_output_path(container_ext, export_dir)
             else:
-                # Image-mode preview: single high-fidelity 16-bit TIFF frame.
-                preview_out = self._generate_export_output_path(".tiff", export_dir)
+                # Image-mode preview: force the upscaled frame to a direct file
+                # path located strictly inside the original input file's parent
+                # directory, sitting right beside the original video. No
+                # automatic prefixing or folder-creation helpers are used so the
+                # output never lands in a nested subfolder.
+                orig = self._preview_original_input_path or inp
+                orig_path = Path(orig) if orig else None
+                if orig_path is not None and str(orig_path.parent) not in ("", "."):
+                    parent_dir = orig_path.parent
+                else:
+                    parent_dir = self._resolve_export_output_dir()
+                base_stem = orig_path.stem if (orig_path and orig_path.stem) else "preview"
+                preview_out = self._ensure_unique_file_path(
+                    parent_dir / f"{base_stem}_preview_upscaled.tiff"
+                )
+            # Track the exact output path so _on_finished can load it reliably
+            # from disk without depending on any UI text field.
+            self._preview_output_path = str(preview_out)
             self._folders_dlg.output_edit.setText(str(preview_out))
             args += ["--output", str(preview_out)]
         elif input_is_directory:
@@ -4284,15 +4301,20 @@ class MainWindow(QMainWindow):
             # two generated TIFF files: the captured preview input frame and the
             # upscaled output – both living directly in the input file's dir.
             if was_preview and _MULTIMEDIA_AVAILABLE and self._split_view is not None:
+                # Bypass the UI text fields entirely: load the raw captured input
+                # TIFF and the newly generated upscale output TIFF directly from
+                # their tracked file paths on disk.
                 preview_in = getattr(self, "_preview_temp_path", None)
-                preview_out = self._folders_dlg.output_edit.text().strip()
+                preview_out = getattr(self, "_preview_output_path", None)
+                loaded_in = False
                 loaded_out = False
                 # Left side: captured original frame (image-mode preview only).
-                if preview_in and not self._is_preview_video_mode:
+                if preview_in and not self._is_preview_video_mode and Path(preview_in).is_file():
                     try:
                         pix_in = QPixmap(preview_in)
                         if not pix_in.isNull():
                             self._split_view.set_input_image(pix_in.toImage())
+                            loaded_in = True
                     except Exception:
                         pass
                 # Right side: upscaled TIFF written by the CLI.
@@ -4305,14 +4327,15 @@ class MainWindow(QMainWindow):
                             loaded_out = True
                     except Exception:
                         pass
-                # Fallback to the heuristic loader (e.g. video-mode previews).
-                if not loaded_out:
+                # Fallback to the heuristic loader (e.g. video-mode previews or
+                # when a tracked file could not be loaded from disk).
+                if not loaded_out or (not self._is_preview_video_mode and not loaded_in):
                     self._try_auto_load_output()
                 self._preview_compare_active = self._latest_output_path is not None
                 if self._preview_original_input_path:
                     self._folders_dlg.input_mode_combo.setCurrentText(self._preview_original_input_mode)
                     self._folders_dlg.input_edit.setText(self._preview_original_input_path)
-                # Open the split-screen comparison view.
+                # Programmatically switch the UI to the split-screen view layout.
                 self._mode_split_btn.setChecked(True)
                 self._on_mode_button(2, True)
         else:
