@@ -699,6 +699,62 @@ def _normalize_output_path_for_target(
     return str(path)
 
 
+def resolve_canonical_output_path(
+    input_path: str,
+    output: Optional[str],
+    output_format: Optional[str],
+    input_type: str,
+    video_backend: str,
+    from_directory: bool = False,
+) -> str:
+    """
+    Produce the single canonical output path mandated by ``output_format``.
+
+    This is the *only* place the user-supplied ``--output`` string is reconciled
+    against the master ``--output_format``. It must run in ``main()`` before any
+    branching or writer initialization so that downstream consumers (including
+    :func:`process_single_file`, the ``is_png`` decision, and the writers) receive
+    a path whose extension/target-type already agrees with ``output_format``.
+
+    Args:
+        input_path: Source file path.
+        output: User-supplied ``--output`` value (may be ``None``).
+        output_format: Master format/container (already resolved to its final value).
+        input_type: "image", "video", or "directory".
+        video_backend: "ffmpeg" or "opencv".
+        from_directory: True when processing files discovered inside a directory.
+
+    Returns:
+        Absolute, unique output path reconciled with ``output_format``.
+    """
+    requested_format = (output_format or "").lower()
+    if from_directory:
+        # Batch mode always derives the per-file path; ``output`` is the optional
+        # destination directory and may be ``None``.
+        output_path = generate_output_path(
+            input_path, output_format, output_dir=output,
+            input_type=input_type, from_directory=True,
+        )
+    elif output is None:
+        output_path = generate_output_path(input_path, output_format, input_type=input_type)
+    elif not Path(output).suffix or (requested_format in _IMAGE_SEQUENCE_FORMATS and input_type != "image"):
+        # No extension or image-sequence export → treat ``output`` as a directory.
+        output_path = generate_output_path(
+            input_path, output_format, output_dir=output, input_type=input_type,
+        )
+    else:
+        output_path = str(Path(output).resolve())
+
+    # Master format dictates the extension/target type.
+    output_path = _normalize_output_path_for_target(
+        output_path=output_path,
+        output_format=output_format,
+        input_type=input_type,
+        video_backend=video_backend,
+    )
+    return str(ensure_unique_output_path(output_path).resolve())
+
+
 def ensure_unique_output_path(path: Path | str) -> Path:
     """Return a non-conflicting file or directory path by appending a numeric suffix."""
     candidate = Path(path)
@@ -841,25 +897,16 @@ def process_single_file(input_path: str, args: "argparse.Namespace", device_list
         
         debug.log(f"Processing {input_type}: {Path(input_path).name}", category="generation", force=True)
         
-        # Generate or validate output path
-        requested_format = (args.output_format or "").lower()
+        # The output path is reconciled against the master --output_format by the
+        # caller (main, via resolve_canonical_output_path) before this worker is
+        # ever invoked. Trust the path as given; only fall back to reconciliation
+        # here for defensive use when called without a pre-resolved path.
         if output_path is None:
-            output_path = generate_output_path(input_path, args.output_format, input_type=input_type)
-        elif not Path(output_path).suffix or (requested_format in _IMAGE_SEQUENCE_FORMATS and input_type != "image"):
-            # No extension or PNG sequence → treat as directory, generate filename
-            output_path = generate_output_path(input_path, args.output_format, 
-                                             output_dir=output_path, input_type=input_type)
+            output_path = resolve_canonical_output_path(
+                input_path, None, args.output_format, input_type, args.video_backend,
+            )
         else:
             output_path = str(Path(output_path).resolve())
-
-        # Normalize path/extension for selected output mode and backend.
-        output_path = _normalize_output_path_for_target(
-            output_path=output_path,
-            output_format=args.output_format,
-            input_type=input_type,
-            video_backend=args.video_backend,
-        )
-        output_path = str(ensure_unique_output_path(output_path).resolve())
     
         # Show format with auto-detection indicator
         format_prefix = "Auto-detected" if format_auto_detected else "Requested"
@@ -2302,9 +2349,13 @@ def main() -> None:
                 original_format = args.output_format
                 args.output_format = file_output_format
                 
-                # generate_output_path handles None gracefully with "outputs" default
-                output_path = generate_output_path(file_path, file_output_format, args.output, 
-                                   input_type=get_input_type(file_path), from_directory=True)
+                # Reconcile the path against the now-final per-file format before
+                # the worker is invoked. file_output_format is the master here.
+                output_path = resolve_canonical_output_path(
+                    file_path, args.output, file_output_format,
+                    input_type=get_input_type(file_path),
+                    video_backend=args.video_backend, from_directory=True,
+                )
                 
                 # Process with explicit output path and runner cache
                 _auto_tune_attempts = 0
@@ -2351,6 +2402,14 @@ def main() -> None:
                         debug.log(_warn, level="WARNING", category="setup", force=True)
                 else:
                     args.output_format = "png"
+            
+            # args.output_format is now final/authoritative. Reconcile args.output
+            # against it exactly once, before any worker call or writer init, so the
+            # master format mandates the path extension/target type.
+            args.output = resolve_canonical_output_path(
+                args.input, args.output, args.output_format,
+                input_type=input_type, video_backend=args.video_backend,
+            )
             
             # Caching: single-GPU streaming uses runner_cache, multi-GPU streaming workers cache internally
             runner_cache = None
