@@ -2073,17 +2073,6 @@ def main() -> None:
         debug.log(f"VAE decode tile overlap ({args.vae_decode_tile_overlap}) must be smaller than tile size ({args.vae_decode_tile_size})", level="ERROR", category="vae", force=True)
         sys.exit(1)
 
-    # Hard upper limit: cap batch_size to 40 to guarantee VRAM stability on 16 GB cards.
-    # Larger values risk CUDA OOM during Phase 3 VAE decoding due to contiguous-block shortage.
-    _BATCH_SIZE_VRAM_LIMIT = 40
-    if args.batch_size > _BATCH_SIZE_VRAM_LIMIT:
-        debug.log(
-            f"batch_size {args.batch_size} exceeds the 16 GB VRAM safety limit; "
-            f"capping to {_BATCH_SIZE_VRAM_LIMIT} to prevent Phase 3 OOM.",
-            level="WARNING", category="setup", force=True
-        )
-        args.batch_size = _BATCH_SIZE_VRAM_LIMIT
-    
     # Validate ffmpeg availability if selected or needed for custom video args
     if args.ffmpeg_video_args:
         try:

@@ -231,30 +231,36 @@ class InflatedCausalConv3d(Conv3d):
             # Update cache.
             cache = next_cache
 
-        # Pre-allocate a single contiguous output block before concatenating the
-        # split results.  This prevents the fragmentation pattern that causes OOM
-        # during Phase 3 VAE decoding on platforms without expandable_segments
-        # (e.g. Windows with 10-bit ProRes 422 HQ export).
-        try:
-            total_dim_size = sum(xi.size(split_dim) for xi in x)
-            out_shape = list(x[0].shape)
-            out_shape[split_dim] = total_dim_size
-            output = torch.empty(
-                out_shape,
-                dtype=x[0].dtype,
-                device=x[0].device,
-                memory_format=torch.contiguous_format,
-            )
-            torch.cat(x, dim=split_dim, out=output)
-        except (torch.cuda.OutOfMemoryError, RuntimeError) as _pre_alloc_err:
-            # Fall back to the standard retry path if pre-allocation itself OOMs.
-            output = retry_on_oom(
-                torch.cat,
-                x,
-                split_dim,
-                debug=getattr(self, 'debug', None),
-                operation_name="InflatedCausalConv3d.concat_splits"
-            )
+        # Flush PyTorch's reserved-but-unallocated VRAM pool back to CUDA before
+        # the large contiguous allocation.  On cudaMallocAsync platforms the pool
+        # can become fragmented so that a contiguous block cannot be found even
+        # though enough total memory is reserved.  empty_cache() returns those
+        # reserved segments to CUDA so the single pre-allocation below can
+        # satisfy the request from a fresh, unfragmented pool.
+        if x[0].is_cuda:
+            torch.cuda.empty_cache()
+
+        # Pre-allocate one contiguous output buffer and fill each split result
+        # into it via narrow+copy_, releasing each slice reference immediately
+        # after copying.  This replaces torch.cat, which would require both all
+        # N split tensors and the full output buffer to be live simultaneously.
+        # With this approach at most one split result is alive during the fill
+        # loop, keeping peak VRAM significantly lower.
+        total_dim_size = sum(xi.size(split_dim) for xi in x)
+        out_shape = list(x[0].shape)
+        out_shape[split_dim] = total_dim_size
+        output = torch.empty(
+            out_shape,
+            dtype=x[0].dtype,
+            device=x[0].device,
+            memory_format=torch.contiguous_format,
+        )
+        offset = 0
+        for i in range(len(x)):
+            sz = x[i].size(split_dim)
+            output.narrow(split_dim, offset, sz).copy_(x[i])
+            offset += sz
+            x[i] = None  # release reference so CUDA memory is reclaimed promptly
         return output
 
     def forward(
