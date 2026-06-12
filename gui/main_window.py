@@ -850,7 +850,7 @@ class MainWindow(QMainWindow):
             pass
 
         super().__init__()
-        self.setWindowTitle("1Click_SeedVR2.5 by Naxci1 version 1.7 beta")
+        self.setWindowTitle("1Click SeedVR2.5 ver. 1.7b (by Naxci1)")
         self.resize(1100, 900)
 
         # Create settings window first – it loads saved paths in its __init__
@@ -978,7 +978,7 @@ class MainWindow(QMainWindow):
         github_btn.setToolTip("Open project on GitHub")
         github_btn.setMinimumWidth(80)
         github_btn.clicked.connect(
-            lambda: QDesktopServices.openUrl(QUrl("https://github.com/naxci1/ComfyUI-SeedVR2.5_new"))
+            lambda: QDesktopServices.openUrl(QUrl("https://github.com/naxci1/1Click_SeedVR2.5"))
         )
 
         self.advanced_mode_btn = QPushButton("Simple Mode")
@@ -1467,7 +1467,8 @@ class MainWindow(QMainWindow):
         self.max_resolution_spin.setRange(0, 7680)
         self.max_resolution_spin.setValue(0)
         self.max_resolution_spin.setToolTip("0 = no limit")
-        f.addRow("Max Resolution:", self.max_resolution_spin)
+        self._max_resolution_label = QLabel("Max Resolution:")
+        f.addRow(self._max_resolution_label, self.max_resolution_spin)
 
         # Batch Size – custom ±4 stepper enforces strict 4k+1 values
         f.addRow("Batch Size:", self._build_batch_stepper())
@@ -2058,6 +2059,11 @@ class MainWindow(QMainWindow):
         self._performance_group.setVisible(advanced)
         self._quality_control_group.setVisible(advanced)
         self._model_cache_group.setVisible(advanced)
+        # Max Resolution is hidden in Simple Mode to avoid user confusion.
+        self._max_resolution_label.setVisible(advanced)
+        self.max_resolution_spin.setVisible(advanced)
+        if not advanced:
+            self.max_resolution_spin.setValue(0)
         # These are always visible (simple or advanced):
         # _processing_settings_group, _vae_tiling_group, _debug_group
 
@@ -2087,14 +2093,14 @@ class MainWindow(QMainWindow):
         settings_menu.addAction(open_settings_action)
 
         help_menu = self.menuBar().addMenu("About")
-        about_action = QAction("About SeedVR2 GUI", self)
+        about_action = QAction("About 1Click SeedVR2.5", self)
         about_action.triggered.connect(self._show_about_dialog)
         help_menu.addAction(about_action)
 
         github_action = QAction("Open GitHub", self)
         github_action.triggered.connect(
             lambda: QDesktopServices.openUrl(
-                QUrl("https://github.com/naxci1/ComfyUI-SeedVR2.5_new")
+                QUrl("https://github.com/naxci1/1Click_SeedVR2.5")
             )
         )
         help_menu.addAction(github_action)
@@ -2102,10 +2108,10 @@ class MainWindow(QMainWindow):
     def _show_about_dialog(self) -> None:
         QMessageBox.about(
             self,
-            "About 1Click_SeedVR2.5",
+            "About 1Click SeedVR2.5 ver. 1.7b (by Naxci1)",
             (
-                "<b>1Click_SeedVR2.5 by Naxci1</b><br>"
-                "Version: v1.7 beta<br><br>"
+                "<b>1Click SeedVR2.5 ver. 1.7b (by Naxci1)</b><br>"
+                "Version: v1.7b<br><br>"
                 "Professional video upscaler powered by SeedVR2.<br>"
                 "License: Apache-2.0<br><br>"
                 '<a href="https://github.com/naxci1/1Click_SeedVR2.5">'

@@ -41,7 +41,7 @@ def main() -> int:
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
-    app.setApplicationName("SeedVR2.5 Upscaler by HB2k")
+    app.setApplicationName("1Click SeedVR2.5 ver. 1.7b (by Naxci1)")
     app.setOrganizationName("SeedVR2")
     app.setStyleSheet(DARK_STYLESHEET)
 
