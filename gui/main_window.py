@@ -291,14 +291,45 @@ EXPORT_CODEC_PROFILES: dict[str, dict[str, dict[str, Any]]] = {
 }
 
 IMAGE_SEQUENCE_PROFILES: dict[str, dict[str, Any]] = {
-    "TIFF (8-bit)": {"ext": ".tiff", "ffmpeg": ["-f", "image2", "-pix_fmt", "rgb24"], "is_10bit": False},
-    "TIFF (16-bit)": {"ext": ".tiff", "ffmpeg": ["-f", "image2", "-pix_fmt", "rgb48le"], "is_10bit": True},
-    "PNG (8-bit)": {"ext": ".png", "ffmpeg": ["-f", "image2", "-pix_fmt", "rgb24"], "is_10bit": False},
-    "PNG (16-bit)": {"ext": ".png", "ffmpeg": ["-f", "image2", "-pix_fmt", "rgb48le"], "is_10bit": True},
-    "JPEG (8-bit)": {"ext": ".jpg", "ffmpeg": ["-f", "image2", "-pix_fmt", "yuvj420p"], "is_10bit": False},
-    "DPX (10-bit)": {"ext": ".dpx", "ffmpeg": ["-f", "image2", "-pix_fmt", "gbrp10le"], "is_10bit": True},
-    "DPX (12-bit)": {"ext": ".dpx", "ffmpeg": ["-f", "image2", "-pix_fmt", "gbrp12le"], "is_10bit": True},
-    "EXR": {"ext": ".exr", "ffmpeg": ["-f", "image2", "-pix_fmt", "gbrpf32le"], "is_10bit": True},
+    ".png":  {"ext": ".png",  "ffmpeg": ["-f", "image2", "-pix_fmt", "rgb24"],     "is_10bit": False},
+    ".tif":  {"ext": ".tif",  "ffmpeg": ["-f", "image2", "-pix_fmt", "rgb48le"],   "is_10bit": True},
+    ".tiff": {"ext": ".tiff", "ffmpeg": ["-f", "image2", "-pix_fmt", "rgb48le"],   "is_10bit": True},
+    ".jpg":  {"ext": ".jpg",  "ffmpeg": ["-f", "image2", "-pix_fmt", "yuvj420p"],  "is_10bit": False},
+    ".jpeg": {"ext": ".jpeg", "ffmpeg": ["-f", "image2", "-pix_fmt", "yuvj420p"],  "is_10bit": False},
+    ".dpx":  {"ext": ".dpx",  "ffmpeg": ["-f", "image2", "-pix_fmt", "gbrp10le"],  "is_10bit": True},
+    ".exr":  {"ext": ".exr",  "ffmpeg": ["-f", "image2", "-pix_fmt", "gbrpf32le"], "is_10bit": True},
+}
+
+# Unified flat codec list shown when Video export mode is active.
+# Each entry maps display name → {container, ffmpeg args, is_10bit}.
+# The container is automatically applied to the backing container_combo.
+UNIFIED_VIDEO_CODEC_PROFILES: dict[str, dict[str, Any]] = {
+    # ProRes family (MOV container)
+    "ProRes 422 Proxy":              {"container": "MOV", "ffmpeg": ["-c:v", "prores_ks", "-profile:v", "0", "-pix_fmt", "yuv422p10le"],  "is_10bit": True},
+    "ProRes 422 LT":                 {"container": "MOV", "ffmpeg": ["-c:v", "prores_ks", "-profile:v", "1", "-pix_fmt", "yuv422p10le"],  "is_10bit": True},
+    "ProRes 422 Standard":           {"container": "MOV", "ffmpeg": ["-c:v", "prores_ks", "-profile:v", "2", "-pix_fmt", "yuv422p10le"],  "is_10bit": True},
+    "ProRes 422 HQ":                 {"container": "MOV", "ffmpeg": ["-c:v", "prores_ks", "-profile:v", "3", "-pix_fmt", "yuv422p10le"],  "is_10bit": True},
+    "ProRes 4444 XQ":                {"container": "MOV", "ffmpeg": ["-c:v", "prores_ks", "-profile:v", "5", "-pix_fmt", "yuva444p12le"], "is_10bit": True},
+    # H.264 (MP4)
+    "H.264 High":                    {"container": "MP4", "ffmpeg": ["-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p"],     "is_10bit": False},
+    # H.265 / HEVC (MP4)
+    "H.265 High":                    {"container": "MP4", "ffmpeg": ["-c:v", "libx265", "-profile:v", "high", "-pix_fmt", "yuv420p"],     "is_10bit": False},
+    "H.265 Main":                    {"container": "MP4", "ffmpeg": ["-c:v", "libx265", "-profile:v", "main", "-pix_fmt", "yuv420p"],     "is_10bit": False},
+    "H.265 Main10":                  {"container": "MP4", "ffmpeg": ["-c:v", "libx265", "-profile:v", "main10", "-pix_fmt", "yuv420p10le"], "is_10bit": True},
+    # VP9 (WEBM)
+    "VP9 Good":                      {"container": "WEBM", "ffmpeg": ["-c:v", "libvpx-vp9", "-deadline", "good"],                         "is_10bit": False},
+    "VP9 Best":                      {"container": "WEBM", "ffmpeg": ["-c:v", "libvpx-vp9", "-deadline", "best"],                         "is_10bit": False},
+    # AV1 (MP4)
+    "AV1 8-bit":                     {"container": "MP4", "ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p", "-strict", "experimental", "-cpu-used", "4", "-row-mt", "1"], "is_10bit": False},
+    "AV1 10-bit":                    {"container": "MP4", "ffmpeg": ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p10le", "-strict", "experimental", "-cpu-used", "4", "-row-mt", "1"], "is_10bit": True},
+    # FFV1 lossless (MKV)
+    "FFV1 4:2:0 (8-bit)":            {"container": "MKV", "ffmpeg": ["-c:v", "ffv1", "-level", "3", "-pix_fmt", "yuv420p"],               "is_10bit": False},
+    "FFV1 4:2:2 (10-bit)":           {"container": "MKV", "ffmpeg": ["-c:v", "ffv1", "-level", "3", "-pix_fmt", "yuv422p10le"],           "is_10bit": True},
+    "FFV1 4:4:4 (12-bit)":           {"container": "MKV", "ffmpeg": ["-c:v", "ffv1", "-level", "3", "-pix_fmt", "yuv444p12le"],           "is_10bit": True},
+    # Uncompressed (MOV)
+    "QuickTime V210 (10-bit 4:2:2)": {"container": "MOV", "ffmpeg": ["-c:v", "v210"],                                                     "is_10bit": True},
+    "R210 (RGB 10-bit)":             {"container": "MOV", "ffmpeg": ["-c:v", "r210"],                                                     "is_10bit": True},
+    "Animation (RGB 8-bit)":         {"container": "MOV", "ffmpeg": ["-c:v", "qtrle", "-pix_fmt", "argb"],                                "is_10bit": False},
 }
 
 AUDIO_PROFILES: dict[str, list[str]] = {
@@ -1594,10 +1625,10 @@ class MainWindow(QMainWindow):
         _ff_row.addWidget(_ff_lbl)
         self.file_format_combo = QComboBox()
         self.file_format_combo.addItems([
-            "MP4", "MOV", "MKV", "WEBM",
-            "PNG Sequence", "TIFF Sequence", "DPX Sequence", "EXR Sequence",
+            "Video",
+            ".png", ".tif", ".tiff", ".jpg", ".jpeg", ".dpx", ".exr",
         ])
-        self.file_format_combo.setCurrentText("MP4")
+        self.file_format_combo.setCurrentText("Video")
         self.file_format_combo.currentTextChanged.connect(self._on_file_format_changed)
         _ff_row.addWidget(self.file_format_combo, stretch=1)
         codec_layout.addLayout(_ff_row)
@@ -1611,13 +1642,14 @@ class MainWindow(QMainWindow):
 
         # ── Video export group (visible when Video Mode is active) ──────
         self._video_export_group, vf = _make_group("Video Export")
-        # container_combo is the backing store – driven by file_format_combo; not shown as a row
+        # container_combo is the backing store – auto-set from codec selection; not shown as a row
         self.container_combo = QComboBox()
         self.container_combo.addItems(list(EXPORT_CODEC_PROFILES.keys()))
-        self.container_combo.currentTextChanged.connect(self._update_export_controls)
 
         self.video_codec_combo = QComboBox()
         vf.addRow("Video Codec:", self.video_codec_combo)
+        # Codec change drives container auto-selection
+        self.video_codec_combo.currentIndexChanged.connect(self._update_export_controls)
 
         self.audio_mode_combo = QComboBox()
         self.audio_mode_combo.addItems(list(AUDIO_PROFILES.keys()))
@@ -1745,16 +1777,10 @@ class MainWindow(QMainWindow):
         self.target_bitrate_combo.setVisible(not is_dynamic)
 
     _FILE_FORMAT_TO_IMAGE_SEQ: dict = {
-        "PNG Sequence": "PNG (8-bit)",
-        "TIFF Sequence": "TIFF (8-bit)",
-        "DPX Sequence": "DPX (10-bit)",
-        "EXR Sequence": "EXR",
+        ext: ext for ext in (".png", ".tif", ".tiff", ".jpg", ".jpeg", ".dpx", ".exr")
     }
     _IMAGE_SEQ_TO_FILE_FORMAT: dict = {
-        "PNG (8-bit)": "PNG Sequence", "PNG (16-bit)": "PNG Sequence",
-        "TIFF (8-bit)": "TIFF Sequence", "TIFF (16-bit)": "TIFF Sequence",
-        "DPX (10-bit)": "DPX Sequence", "DPX (12-bit)": "DPX Sequence",
-        "EXR": "EXR Sequence",
+        ext: ext for ext in (".png", ".tif", ".tiff", ".jpg", ".jpeg", ".dpx", ".exr")
     }
 
     def _on_file_format_changed(self, fmt: str) -> None:
@@ -1763,23 +1789,17 @@ class MainWindow(QMainWindow):
             return
         self._updating_output_mode = True
         try:
-            if fmt in self._FILE_FORMAT_TO_IMAGE_SEQ:
-                # Image sequence format selected
+            if fmt == "Video":
+                self.export_image_sequence_check.setChecked(False)
+                self._video_export_group.setVisible(True)
+                self._image_export_group.setVisible(False)
+            elif fmt in IMAGE_SEQUENCE_PROFILES:
                 self.export_image_sequence_check.setChecked(True)
-                img_key = self._FILE_FORMAT_TO_IMAGE_SEQ[fmt]
-                idx = self.image_sequence_format_combo.findText(img_key)
+                idx = self.image_sequence_format_combo.findText(fmt)
                 if idx >= 0:
                     self.image_sequence_format_combo.setCurrentIndex(idx)
                 self._video_export_group.setVisible(False)
                 self._image_export_group.setVisible(True)
-            else:
-                # Video format selected
-                self.export_image_sequence_check.setChecked(False)
-                cidx = self.container_combo.findText(fmt)
-                if cidx >= 0:
-                    self.container_combo.setCurrentIndex(cidx)
-                self._video_export_group.setVisible(True)
-                self._image_export_group.setVisible(False)
         finally:
             self._updating_output_mode = False
         self._update_export_controls()
@@ -1800,13 +1820,11 @@ class MainWindow(QMainWindow):
                 self.file_format_combo.blockSignals(True)
                 if is_image_seq:
                     img_fmt = self.image_sequence_format_combo.currentText()
-                    ff_text = self._IMAGE_SEQ_TO_FILE_FORMAT.get(img_fmt, "PNG Sequence")
-                    fidx = self.file_format_combo.findText(ff_text)
+                    fidx = self.file_format_combo.findText(img_fmt)
                     if fidx >= 0:
                         self.file_format_combo.setCurrentIndex(fidx)
                 else:
-                    container = self.container_combo.currentText()
-                    fidx = self.file_format_combo.findText(container)
+                    fidx = self.file_format_combo.findText("Video")
                     if fidx >= 0:
                         self.file_format_combo.setCurrentIndex(fidx)
                 self.file_format_combo.blockSignals(False)
@@ -1830,13 +1848,11 @@ class MainWindow(QMainWindow):
             self.file_format_combo.blockSignals(True)
             if is_seq:
                 img_fmt = self.image_sequence_format_combo.currentText()
-                ff_text = getattr(self, "_IMAGE_SEQ_TO_FILE_FORMAT", {}).get(img_fmt, "PNG Sequence")
-                fidx = self.file_format_combo.findText(ff_text)
+                fidx = self.file_format_combo.findText(img_fmt)
                 if fidx >= 0:
                     self.file_format_combo.setCurrentIndex(fidx)
             else:
-                container = self.container_combo.currentText()
-                fidx = self.file_format_combo.findText(container)
+                fidx = self.file_format_combo.findText("Video")
                 if fidx >= 0:
                     self.file_format_combo.setCurrentIndex(fidx)
             self.file_format_combo.blockSignals(False)
@@ -2102,51 +2118,49 @@ class MainWindow(QMainWindow):
     }
 
     def _update_export_controls(self, *_: object) -> None:
-        container = self.container_combo.currentText()
-        prev_codec = self.video_codec_combo.currentText()
-        self.video_codec_combo.blockSignals(True)
-        self.video_codec_combo.clear()
-        self.video_codec_combo.addItems(list(EXPORT_CODEC_PROFILES.get(container, {}).keys()))
-        keep_idx = self.video_codec_combo.findText(prev_codec)
-        self.video_codec_combo.setCurrentIndex(keep_idx if keep_idx >= 0 else 0)
-        self.video_codec_combo.blockSignals(False)
+        exporting_sequence = self.export_image_sequence_check.isChecked()
+        self.video_codec_combo.setEnabled(not exporting_sequence)
+        self.image_sequence_format_combo.setEnabled(exporting_sequence)
 
-        # Keep file_format_combo in sync when container changes directly
+        if exporting_sequence:
+            return
+
+        # Populate unified video codec list (only when list is stale / uninitialized)
+        if self.video_codec_combo.count() != len(UNIFIED_VIDEO_CODEC_PROFILES):
+            prev_codec = self.video_codec_combo.currentText()
+            self.video_codec_combo.blockSignals(True)
+            self.video_codec_combo.clear()
+            self.video_codec_combo.addItems(list(UNIFIED_VIDEO_CODEC_PROFILES.keys()))
+            keep_idx = self.video_codec_combo.findText(prev_codec)
+            self.video_codec_combo.setCurrentIndex(keep_idx if keep_idx >= 0 else 0)
+            self.video_codec_combo.blockSignals(False)
+
+        # Auto-set container from selected codec so CLI always gets the right format
+        selected_codec = self.video_codec_combo.currentText()
+        auto_container = UNIFIED_VIDEO_CODEC_PROFILES.get(selected_codec, {}).get("container", "MP4")
+        self.container_combo.blockSignals(True)
+        cidx = self.container_combo.findText(auto_container)
+        if cidx >= 0 and self.container_combo.currentIndex() != cidx:
+            self.container_combo.setCurrentIndex(cidx)
+        self.container_combo.blockSignals(False)
+
+        # Keep file_format_combo showing "Video" when in video mode
         if hasattr(self, "file_format_combo") and not getattr(self, "_updating_output_mode", False):
-            exporting_sequence = self.export_image_sequence_check.isChecked()
-            if not exporting_sequence:
+            if self.file_format_combo.currentText() != "Video":
                 self.file_format_combo.blockSignals(True)
-                fidx = self.file_format_combo.findText(container)
+                fidx = self.file_format_combo.findText("Video")
                 if fidx >= 0:
                     self.file_format_combo.setCurrentIndex(fidx)
                 self.file_format_combo.blockSignals(False)
-
-        exporting_sequence = self.export_image_sequence_check.isChecked()
-        self.video_codec_combo.setEnabled(not exporting_sequence)
-        self.container_combo.setEnabled(not exporting_sequence)
-        self.image_sequence_format_combo.setEnabled(exporting_sequence)
-
-        # Lock container if the currently selected codec requires one
-        selected_codec = self.video_codec_combo.currentText()
-        required_container = self._CODEC_LOCKED_CONTAINER.get(selected_codec)
-        if required_container and not exporting_sequence:
-            idx = self.container_combo.findText(required_container)
-            if idx >= 0 and self.container_combo.currentIndex() != idx:
-                self.container_combo.blockSignals(True)
-                self.container_combo.setCurrentIndex(idx)
-                self.container_combo.blockSignals(False)
-            # Prevent user from changing away from the required container
-            self.container_combo.setEnabled(False)
-        elif not exporting_sequence:
-            self.container_combo.setEnabled(True)
 
     def _selected_export_extension(self) -> str:
         if self.export_image_sequence_check.isChecked():
             fmt = self.image_sequence_format_combo.currentText()
             profile = IMAGE_SEQUENCE_PROFILES.get(fmt, {})
             return str(profile.get("ext", ".png"))
-        container = self.container_combo.currentText().strip().lower()
-        return "." + container if container else ".mp4"
+        codec = self.video_codec_combo.currentText()
+        container = UNIFIED_VIDEO_CODEC_PROFILES.get(codec, {}).get("container", "MP4")
+        return "." + container.lower() if container else ".mp4"
 
     @staticmethod
     def _extract_encoder_from_args(ffmpeg_args: list[str], codec_fallback: str = "") -> str:
@@ -2224,28 +2238,35 @@ class MainWindow(QMainWindow):
                 "audio_args": ["-an"],
             }
 
-        container = self.container_combo.currentText()
         codec = self.video_codec_combo.currentText()
-        codec_profile = EXPORT_CODEC_PROFILES.get(container, {}).get(codec, {})
+        codec_profile = UNIFIED_VIDEO_CODEC_PROFILES.get(codec, {})
+        container = codec_profile.get("container", "MP4")
         audio = self.audio_mode_combo.currentText()
         audio_args = AUDIO_PROFILES.get(audio, AUDIO_PROFILES["Copy Audio"])
 
-        # Codec-agnostic render argument negotiation:
-        # encoder from UI profile -> family detection -> universal max-quality flags.
         base_video_args = list(codec_profile.get("ffmpeg", []))
         encoder = self._extract_encoder_from_args(base_video_args, codec_fallback=codec)
-        sanitized_video_args = self._strip_quality_flags(base_video_args)
-        bitrate = self._ui_selected_bitrate()
-        quality_flags = self._max_quality_flags_for_encoder(encoder, bitrate)
-        if "-c:v" not in sanitized_video_args:
-            sanitized_video_args = ["-c:v", encoder] + sanitized_video_args
-        base_video_args = sanitized_video_args + quality_flags
+
+        if "prores" in encoder.lower():
+            # ProRes: -profile:v selects the codec variant (Proxy/LT/Standard/HQ/4444 XQ).
+            # Preserve the base args exactly — overriding -profile:v would silently change
+            # which ProRes tier gets encoded, causing unexpected quality/compatibility.
+            final_video_args = base_video_args
+        else:
+            # Generic path: strip per-codec quality settings, then re-apply universal
+            # max-quality flags appropriate for the encoder family.
+            sanitized_video_args = self._strip_quality_flags(base_video_args)
+            bitrate = self._ui_selected_bitrate()
+            quality_flags = self._max_quality_flags_for_encoder(encoder, bitrate)
+            if "-c:v" not in sanitized_video_args:
+                sanitized_video_args = ["-c:v", encoder] + sanitized_video_args
+            final_video_args = sanitized_video_args + quality_flags
 
         return {
             "mode": "video",
             "container": container,
             "codec": codec,
-            "video_args": base_video_args,
+            "video_args": final_video_args,
             "audio_mode": audio,
             "audio_args": audio_args,
         }
@@ -2255,9 +2276,8 @@ class MainWindow(QMainWindow):
             fmt = self.image_sequence_format_combo.currentText()
             profile = IMAGE_SEQUENCE_PROFILES.get(fmt, {})
             return bool(profile.get("is_10bit", False))
-        container = self.container_combo.currentText()
         codec = self.video_codec_combo.currentText()
-        profile = EXPORT_CODEC_PROFILES.get(container, {}).get(codec, {})
+        profile = UNIFIED_VIDEO_CODEC_PROFILES.get(codec, {})
         return bool(profile.get("is_10bit", False))
 
     def _resolve_export_output_dir(self) -> Path:
@@ -2758,21 +2778,13 @@ class MainWindow(QMainWindow):
         args += ["--dit_model", _dit_model_val if _dit_model_val is not None else self.dit_model_combo.currentText()]
 
         # pre-downscale (preprocessing factor before upscaling)
-        pre_ds_text = (
-            str(self._simple_defaults["pre_downscale"])
-            if not self._advanced_mode_enabled
-            else self.pre_downscale_combo.currentText()
-        )  # "1:1", "2:1", "3:1"
+        pre_ds_text = self.pre_downscale_combo.currentText()  # "1:1", "2:1", "3:1"
         pre_ds_factor = int(pre_ds_text.split(":")[0])  # 1, 2, or 3
         if pre_ds_factor > 1:
             args += ["--pre_downscale", str(pre_ds_factor)]
 
         # resolution – compute final target from mode + pre-downscale factor
-        res_mode = (
-            str(self._simple_defaults["resolution_mode"])
-            if not self._advanced_mode_enabled
-            else self.resolution_mode_combo.currentText()
-        )  # "Pixel", "X Times", or "Standard"
+        res_mode = self.resolution_mode_combo.currentText()  # "Pixel", "X Times", or "Standard"
         if res_mode == "X Times":
             # Multiplier applied to the (already pre-downscaled) input height.
             # We don't know the actual input dimension at arg-build time, so we
@@ -2788,16 +2800,14 @@ class MainWindow(QMainWindow):
             std_val = int(std_text.split()[0])
             args += ["--resolution", str(std_val)]
         else:
-            # Pixel mode: direct target resolution
-            res = int(self._simple_defaults["resolution"]) if not self._advanced_mode_enabled else self.resolution_spin.value()
-            args += ["--resolution", str(res)]
+            # Pixel mode: direct target resolution — always read from the widget
+            args += ["--resolution", str(self.resolution_spin.value())]
 
         max_res = self.max_resolution_spin.value()
         if max_res != 0:
             args += ["--max_resolution", str(max_res)]
 
-        batch = int(self._simple_defaults["batch_size"]) if not self._advanced_mode_enabled else self.batch_size_spin.value()
-        args += ["--batch_size", str(batch)]
+        args += ["--batch_size", str(self.batch_size_spin.value())]
 
         if self.uniform_batch_check.isChecked():
             args.append("--uniform_batch_size")
@@ -2822,18 +2832,28 @@ class MainWindow(QMainWindow):
         if only_frames:
             args += ["--only_frames", str(only_frames)]
 
-        chunking_enabled = (
-            bool(self._simple_defaults["enable_video_chunking"])
-            if not self._advanced_mode_enabled
-            else self.enable_video_chunking_check.isChecked()
-        )
+        chunking_enabled = self.enable_video_chunking_check.isChecked()
         if chunking_enabled:
-            split_minutes = (
-                int(self._simple_defaults["split_minutes"])
-                if not self._advanced_mode_enabled
-                else self.split_size_minutes_spin.value()
-            )
-            args += ["--chunk_duration_minutes", str(split_minutes)]
+            split_minutes = self.split_size_minutes_spin.value()
+            # Convert minutes → frames using input video FPS so --chunk_size receives
+            # the pre-calculated frame count, which is what the CLI expects.
+            # Fall back to --chunk_duration_minutes when FPS cannot be determined.
+            fps: float = self._current_fps
+            if fps <= 0 and cv2 is not None:
+                inp_path = self._settings_win.input_edit.text().strip()
+                if inp_path:
+                    try:
+                        cap = cv2.VideoCapture(inp_path)
+                        if cap.isOpened():
+                            fps = float(cap.get(cv2.CAP_PROP_FPS))
+                        cap.release()
+                    except Exception:
+                        fps = 0.0
+            if fps > 0:
+                chunk_frames = max(1, int(round(split_minutes * 60.0 * fps)))
+                args += ["--chunk_size", str(chunk_frames)]
+            else:
+                args += ["--chunk_duration_minutes", str(split_minutes)]
 
         prepend = self.prepend_frames_spin.value()
         if prepend:
