@@ -300,6 +300,23 @@ IMAGE_SEQUENCE_PROFILES: dict[str, dict[str, Any]] = {
     ".exr":  {"ext": ".exr",  "ffmpeg": ["-f", "image2", "-pix_fmt", "gbrpf32le"], "is_10bit": True},
 }
 
+# Per-format bit-depth options for image-sequence export.
+# Each entry is an ordered list of {label, pix_fmt, is_10bit} dicts.
+# The UI populates image_bit_depth_combo from this map whenever the file-type changes.
+IMAGE_BIT_DEPTHS: dict[str, list[dict[str, Any]]] = {
+    ".png":  [{"label": "8-bit",  "pix_fmt": "rgb24",     "is_10bit": False}],
+    ".tif":  [{"label": "8-bit",  "pix_fmt": "rgb24",     "is_10bit": False},
+              {"label": "16-bit", "pix_fmt": "rgb48le",   "is_10bit": True}],
+    ".tiff": [{"label": "8-bit",  "pix_fmt": "rgb24",     "is_10bit": False},
+              {"label": "16-bit", "pix_fmt": "rgb48le",   "is_10bit": True}],
+    ".jpg":  [{"label": "8-bit",  "pix_fmt": "yuvj420p",  "is_10bit": False}],
+    ".jpeg": [{"label": "8-bit",  "pix_fmt": "yuvj420p",  "is_10bit": False}],
+    ".dpx":  [{"label": "10-bit", "pix_fmt": "gbrp10le",  "is_10bit": True},
+              {"label": "12-bit", "pix_fmt": "gbrp12le",  "is_10bit": True}],
+    ".exr":  [{"label": "16-bit", "pix_fmt": "gbrpf16le", "is_10bit": True},
+              {"label": "32-bit", "pix_fmt": "gbrpf32le", "is_10bit": True}],
+}
+
 # Unified flat codec list shown when Video export mode is active.
 # Each entry maps display name → {container, ffmpeg args, is_10bit}.
 # The container is automatically applied to the backing container_combo.
@@ -1616,18 +1633,16 @@ class MainWindow(QMainWindow):
         codec_layout.setContentsMargins(10, 10, 15, 10)
         codec_layout.setSpacing(8)
 
-        # ── File Format selector (first item in Codec pane) ────────────
+        # ── Output Type toggle (first item in Codec pane) ──────────────
+        # "Video" → show video export group; "Image Seq." → show image sequence group.
         _ff_row = QHBoxLayout()
         _ff_row.setContentsMargins(0, 0, 0, 4)
         _ff_row.setSpacing(8)
-        _ff_lbl = QLabel("File Format:")
+        _ff_lbl = QLabel("Output Type:")
         _ff_lbl.setStyleSheet("color:#B0B3B8; font-size:12px;")
         _ff_row.addWidget(_ff_lbl)
         self.file_format_combo = QComboBox()
-        self.file_format_combo.addItems([
-            "Video",
-            ".png", ".tif", ".tiff", ".jpg", ".jpeg", ".dpx", ".exr",
-        ])
+        self.file_format_combo.addItems(["Video", "Image Seq."])
         self.file_format_combo.setCurrentText("Video")
         self.file_format_combo.currentTextChanged.connect(self._on_file_format_changed)
         _ff_row.addWidget(self.file_format_combo, stretch=1)
@@ -1692,7 +1707,16 @@ class MainWindow(QMainWindow):
         self._image_export_group, imgf = _make_group("Image Sequence Export")
         self.image_sequence_format_combo = QComboBox()
         self.image_sequence_format_combo.addItems(list(IMAGE_SEQUENCE_PROFILES.keys()))
-        imgf.addRow("Format:", self.image_sequence_format_combo)
+        imgf.addRow("File Type:", self.image_sequence_format_combo)
+
+        # Bit depth dropdown — options are populated dynamically by _on_image_format_changed
+        self.image_bit_depth_combo = QComboBox()
+        imgf.addRow("Bit Depth:", self.image_bit_depth_combo)
+
+        # Populate initial bit depth options from the default format
+        self.image_sequence_format_combo.currentTextChanged.connect(self._on_image_format_changed)
+        self._on_image_format_changed(self.image_sequence_format_combo.currentText())
+
         self._image_export_group.setVisible(False)
         codec_layout.addWidget(self._image_export_group)
 
@@ -1776,15 +1800,25 @@ class MainWindow(QMainWindow):
         self._bitrate_row_lbl.setVisible(not is_dynamic)
         self.target_bitrate_combo.setVisible(not is_dynamic)
 
-    _FILE_FORMAT_TO_IMAGE_SEQ: dict = {
-        ext: ext for ext in (".png", ".tif", ".tiff", ".jpg", ".jpeg", ".dpx", ".exr")
-    }
-    _IMAGE_SEQ_TO_FILE_FORMAT: dict = {
-        ext: ext for ext in (".png", ".tif", ".tiff", ".jpg", ".jpeg", ".dpx", ".exr")
-    }
+    def _on_image_format_changed(self, fmt: str) -> None:
+        """Repopulate image_bit_depth_combo when the file-type changes.
+
+        Looks up available bit-depth options from IMAGE_BIT_DEPTHS and
+        restores the previously selected label where possible.
+        """
+        if not hasattr(self, "image_bit_depth_combo"):
+            return
+        depths = IMAGE_BIT_DEPTHS.get(fmt, [{"label": "8-bit", "pix_fmt": "rgb24", "is_10bit": False}])
+        prev = self.image_bit_depth_combo.currentText()
+        self.image_bit_depth_combo.blockSignals(True)
+        self.image_bit_depth_combo.clear()
+        self.image_bit_depth_combo.addItems([d["label"] for d in depths])
+        keep = self.image_bit_depth_combo.findText(prev)
+        self.image_bit_depth_combo.setCurrentIndex(keep if keep >= 0 else 0)
+        self.image_bit_depth_combo.blockSignals(False)
 
     def _on_file_format_changed(self, fmt: str) -> None:
-        """Handle File Format dropdown changes, coupling codec group and backing state."""
+        """Handle Output Type dropdown changes, coupling codec group and backing state."""
         if getattr(self, "_updating_output_mode", False):
             return
         self._updating_output_mode = True
@@ -1793,11 +1827,8 @@ class MainWindow(QMainWindow):
                 self.export_image_sequence_check.setChecked(False)
                 self._video_export_group.setVisible(True)
                 self._image_export_group.setVisible(False)
-            elif fmt in IMAGE_SEQUENCE_PROFILES:
+            elif fmt == "Image Seq.":
                 self.export_image_sequence_check.setChecked(True)
-                idx = self.image_sequence_format_combo.findText(fmt)
-                if idx >= 0:
-                    self.image_sequence_format_combo.setCurrentIndex(idx)
                 self._video_export_group.setVisible(False)
                 self._image_export_group.setVisible(True)
         finally:
@@ -1818,15 +1849,10 @@ class MainWindow(QMainWindow):
             self.export_image_sequence_check.setChecked(is_image_seq)
             if hasattr(self, "file_format_combo"):
                 self.file_format_combo.blockSignals(True)
-                if is_image_seq:
-                    img_fmt = self.image_sequence_format_combo.currentText()
-                    fidx = self.file_format_combo.findText(img_fmt)
-                    if fidx >= 0:
-                        self.file_format_combo.setCurrentIndex(fidx)
-                else:
-                    fidx = self.file_format_combo.findText("Video")
-                    if fidx >= 0:
-                        self.file_format_combo.setCurrentIndex(fidx)
+                target = "Image Seq." if is_image_seq else "Video"
+                fidx = self.file_format_combo.findText(target)
+                if fidx >= 0:
+                    self.file_format_combo.setCurrentIndex(fidx)
                 self.file_format_combo.blockSignals(False)
         finally:
             self._updating_output_mode = False
@@ -1838,23 +1864,18 @@ class MainWindow(QMainWindow):
         """Sync the file_format_combo when the backing checkbox is set externally.
 
         This is called when preset load/save restores ``export_image_sequence_check``
-        (via the persistable widget map) so the file format combo stays in sync
+        (via the persistable widget map) so the Output Type combo stays in sync
         even without user interaction.
         """
         if getattr(self, "_updating_output_mode", False):
             return
-        # Sync file_format_combo
+        # Sync file_format_combo to "Image Seq." or "Video"
         if hasattr(self, "file_format_combo"):
             self.file_format_combo.blockSignals(True)
-            if is_seq:
-                img_fmt = self.image_sequence_format_combo.currentText()
-                fidx = self.file_format_combo.findText(img_fmt)
-                if fidx >= 0:
-                    self.file_format_combo.setCurrentIndex(fidx)
-            else:
-                fidx = self.file_format_combo.findText("Video")
-                if fidx >= 0:
-                    self.file_format_combo.setCurrentIndex(fidx)
+            target = "Image Seq." if is_seq else "Video"
+            fidx = self.file_format_combo.findText(target)
+            if fidx >= 0:
+                self.file_format_combo.setCurrentIndex(fidx)
             self.file_format_combo.blockSignals(False)
         # Sync group visibility
         self._video_export_group.setVisible(not is_seq)
@@ -2059,6 +2080,7 @@ class MainWindow(QMainWindow):
             "video_codec_combo": self.video_codec_combo,
             "export_image_sequence_check": self.export_image_sequence_check,
             "image_sequence_format_combo": self.image_sequence_format_combo,
+            "image_bit_depth_combo": self.image_bit_depth_combo,
             "audio_mode_combo": self.audio_mode_combo,
             "video_backend_combo": self.video_backend_combo,
             "bitrate_mode_combo": self.bitrate_mode_combo,
@@ -2225,16 +2247,24 @@ class MainWindow(QMainWindow):
             return ["-preset", "veryslow", "-crf", "12", "-b:v", bitrate]
         return ["-crf", "12", "-b:v", bitrate]
 
+    def _image_seq_bit_depth_info(self) -> dict[str, Any]:
+        """Return the {label, pix_fmt, is_10bit} dict for the currently selected image format + bit depth."""
+        fmt = self.image_sequence_format_combo.currentText()
+        depths = IMAGE_BIT_DEPTHS.get(fmt, [{"label": "8-bit", "pix_fmt": "rgb24", "is_10bit": False}])
+        label = self.image_bit_depth_combo.currentText() if hasattr(self, "image_bit_depth_combo") else ""
+        return next((d for d in depths if d["label"] == label), depths[0])
+
     def _selected_export_profile_to_ffmpeg_args(self) -> dict[str, Any]:
         """Return a backend mapping of current export choices to FFmpeg arguments."""
         if self.export_image_sequence_check.isChecked():
             image_fmt = self.image_sequence_format_combo.currentText()
-            image_profile = IMAGE_SEQUENCE_PROFILES.get(image_fmt, {})
+            depth_info = self._image_seq_bit_depth_info()
+            pix_fmt = depth_info["pix_fmt"]
             return {
                 "mode": "image_sequence",
                 "container": "image2",
                 "image_format": image_fmt,
-                "video_args": image_profile.get("ffmpeg", []),
+                "video_args": ["-f", "image2", "-pix_fmt", pix_fmt],
                 "audio_args": ["-an"],
             }
 
@@ -2273,9 +2303,7 @@ class MainWindow(QMainWindow):
 
     def _selected_profile_is_10bit(self) -> bool:
         if self.export_image_sequence_check.isChecked():
-            fmt = self.image_sequence_format_combo.currentText()
-            profile = IMAGE_SEQUENCE_PROFILES.get(fmt, {})
-            return bool(profile.get("is_10bit", False))
+            return bool(self._image_seq_bit_depth_info().get("is_10bit", False))
         codec = self.video_codec_combo.currentText()
         profile = UNIFIED_VIDEO_CODEC_PROFILES.get(codec, {})
         return bool(profile.get("is_10bit", False))
