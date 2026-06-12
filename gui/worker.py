@@ -31,10 +31,24 @@ _CREATE_NEW_PROCESS_GROUP: int = 0x00000200 if sys.platform == "win32" else 0
 # Python executable path
 # ---------------------------------------------------------------------------
 
-# Default to the ComfyUI embedded Python on Windows.
-# Note: ComfyUI historically ships its folder as "python_embeded" (single 'd') –
-# this path reflects the real on-disk name.  The user can override it in the GUI.
-DEFAULT_PYTHON_EXE = r"C:\ComfyUI-yeni\python_embeded\python.exe"
+# Resolved dynamically from config.json / ROOT_DIR so the application works
+# from any installation path.  The user can still override it in the GUI.
+try:
+    from gui.config_manager import load_config as _load_config, DEFAULT_PATHS as _DEFAULT_PATHS
+except ImportError:
+    from config_manager import load_config as _load_config, DEFAULT_PATHS as _DEFAULT_PATHS  # type: ignore[no-redef]
+
+try:
+    _cfg = _load_config()
+    DEFAULT_PYTHON_EXE: str = _cfg.get("python_exe", "") or _DEFAULT_PATHS.get("python_exe", sys.executable)
+except Exception:
+    DEFAULT_PYTHON_EXE = _DEFAULT_PATHS.get("python_exe", sys.executable)  # type: ignore[assignment]
+finally:
+    del _load_config, _DEFAULT_PATHS
+    try:
+        del _cfg
+    except NameError:
+        pass
 
 
 # ---------------------------------------------------------------------------

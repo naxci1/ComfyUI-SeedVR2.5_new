@@ -1,16 +1,23 @@
 """
 SeedVR2 GUI – Paths & Configuration Settings Window.
 
-A persistent (non-modal) QDialog that owns all path/directory fields.
-MainWindow opens it via the "⚙ Settings" button and reads the field values
-via the public widget attributes (python_exe_edit, seedvr2_folder_edit, etc.).
+A persistent (non-modal) QDialog that owns all *system-level* path fields
+(Python executable, SeedVR2 folder, FFmpeg, and Models directory).
+
+The dialog is reorganised into a "Directory Setup" tab so the user can see
+and browse all four paths at once, exactly as required by the workspace
+directive (Task 4 – Settings / Directory Setup tab).
+
+Input / Output paths have moved to the separate FoldersDialog, which is
+opened via the "📁 Folders" button on the main screen.
+
+Persistence is now handled by config.json (via config_manager) in addition
+to the legacy QSettings store, ensuring portability across folder moves.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-
-from PyQt6.QtCore import Qt, QSettings, QUrl, pyqtSignal
+from PyQt6.QtCore import Qt, QSettings, QUrl
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QDialog,
@@ -20,11 +27,16 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QComboBox,
     QPushButton,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
+
+try:
+    from gui.config_manager import load_config, save_config, DEFAULT_PATHS
+except ImportError:
+    from config_manager import load_config, save_config, DEFAULT_PATHS  # type: ignore[no-redef]
 
 try:
     from gui.worker import DEFAULT_PYTHON_EXE
@@ -37,7 +49,7 @@ _SETTINGS_APP = "SeedVR2_GUI"
 
 
 # ---------------------------------------------------------------------------
-# Helpers (local)
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _make_group(title: str) -> tuple[QGroupBox, QFormLayout]:
@@ -63,27 +75,21 @@ def _wrap(h_layout: QHBoxLayout) -> QWidget:
 # ---------------------------------------------------------------------------
 
 class SettingsWindow(QDialog):
-    """Persistent settings / paths dialog.
+    """Persistent system-paths / configuration dialog.
 
     Attributes exposed for MainWindow to read
     -----------------------------------------
-    python_exe_edit      QLineEdit
-    seedvr2_folder_edit  QLineEdit
-    input_mode_combo     QComboBox  ("File" / "Folder")
-    input_edit           QLineEdit
-    output_edit          QLineEdit
-    model_dir_edit       QLineEdit
+    python_exe_edit      QLineEdit   - Python interpreter path
+    seedvr2_folder_edit  QLineEdit   - Folder containing inference_cli.py
+    model_dir_edit       QLineEdit   - Models directory (SEEDVR2)
+    ffmpeg_path_edit     QLineEdit   - FFmpeg executable path
     """
-
-    # Emitted when the user picks an input FILE (not folder) via Browse.
-    # MainWindow connects this to its _load_preview() slot.
-    input_changed = pyqtSignal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Paths & Configuration")
-        self.setMinimumWidth(620)
-        # Persistent, non-modal – stays open alongside the main window
+        self.setMinimumWidth(660)
+        # Persistent, non-modal – stays open alongside the main window.
         self.setWindowFlags(
             Qt.WindowType.Window
             | Qt.WindowType.WindowCloseButtonHint
@@ -97,67 +103,62 @@ class SettingsWindow(QDialog):
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        layout = QVBoxLayout(self)
-        layout.setSpacing(10)
-        layout.setContentsMargins(12, 12, 12, 12)
+        root_layout = QVBoxLayout(self)
+        root_layout.setSpacing(10)
+        root_layout.setContentsMargins(12, 12, 12, 12)
 
-        # ── Environment ────────────────────────────────────────────────
-        g, f = _make_group("Environment")
+        # ── Tab widget ─────────────────────────────────────────────────
+        tabs = QTabWidget()
+        root_layout.addWidget(tabs)
 
+        # ── Tab 1: Directory Setup ─────────────────────────────────────
+        dir_tab = QWidget()
+        dir_layout = QVBoxLayout(dir_tab)
+        dir_layout.setSpacing(10)
+        dir_layout.setContentsMargins(8, 8, 8, 8)
+
+        g, f = _make_group("Directory Setup")
+
+        # Python Executable
         self.python_exe_edit = QLineEdit()
         self.python_exe_edit.setPlaceholderText(DEFAULT_PYTHON_EXE)
-        browse_py_btn = QPushButton("Browse…")
+        browse_py_btn = QPushButton("Browse...")
         browse_py_btn.clicked.connect(self._browse_python)
         py_row = QHBoxLayout()
         py_row.addWidget(self.python_exe_edit)
         py_row.addWidget(browse_py_btn)
         f.addRow("Python Executable:", _wrap(py_row))
 
+        # SeedVR2 Script Folder
         self.seedvr2_folder_edit = QLineEdit()
-        self.seedvr2_folder_edit.setPlaceholderText("Folder containing inference_cli.py…")
-        browse_sv_btn = QPushButton("Browse…")
+        self.seedvr2_folder_edit.setPlaceholderText(
+            "Folder containing inference_cli.py..."
+        )
+        browse_sv_btn = QPushButton("Browse...")
         browse_sv_btn.clicked.connect(self._browse_seedvr2_folder)
         sv_row = QHBoxLayout()
         sv_row.addWidget(self.seedvr2_folder_edit)
         sv_row.addWidget(browse_sv_btn)
-        f.addRow("SeedVR2 Folder:", _wrap(sv_row))
+        f.addRow("SeedVR2 Script Folder:", _wrap(sv_row))
 
-        layout.addWidget(g)
-
-        # ── Paths ──────────────────────────────────────────────────────
-        g2, f2 = _make_group("Paths")
-
-        self.input_mode_combo = QComboBox()
-        self.input_mode_combo.addItems(["File", "Folder"])
-        self.input_mode_combo.setMaximumWidth(72)
-        self.input_mode_combo.setToolTip(
-            "File: single video/image  |  Folder: batch-process all videos"
+        # FFmpeg Executable
+        self.ffmpeg_path_edit = QLineEdit()
+        self.ffmpeg_path_edit.setPlaceholderText(
+            DEFAULT_PATHS.get("ffmpeg_path", "Path to ffmpeg executable...")
         )
-        self.input_edit = QLineEdit()
-        self.input_edit.setPlaceholderText("Path to video, image, or directory…")
-        browse_input_btn = QPushButton("📂")
-        browse_input_btn.setFixedWidth(32)
-        browse_input_btn.setToolTip("Browse for input file or folder")
-        browse_input_btn.setAccessibleName("Browse input")
-        browse_input_btn.clicked.connect(self._browse_input)
-        input_row = QHBoxLayout()
-        input_row.addWidget(self.input_mode_combo)
-        input_row.addWidget(self.input_edit)
-        input_row.addWidget(browse_input_btn)
-        f2.addRow("Input:", _wrap(input_row))
+        browse_ff_btn = QPushButton("Browse...")
+        browse_ff_btn.clicked.connect(self._browse_ffmpeg)
+        ff_row = QHBoxLayout()
+        ff_row.addWidget(self.ffmpeg_path_edit)
+        ff_row.addWidget(browse_ff_btn)
+        f.addRow("FFmpeg Executable:", _wrap(ff_row))
 
-        self.output_edit = QLineEdit()
-        self.output_edit.setPlaceholderText("Optional – leave blank for auto")
-        browse_out_btn = QPushButton("Browse…")
-        browse_out_btn.clicked.connect(self._browse_output)
-        out_row = QHBoxLayout()
-        out_row.addWidget(self.output_edit)
-        out_row.addWidget(browse_out_btn)
-        f2.addRow("Output Path:", _wrap(out_row))
-
+        # Models Directory
         self.model_dir_edit = QLineEdit()
-        self.model_dir_edit.setPlaceholderText("Optional – defaults to models/SEEDVR2/")
-        browse_md_btn = QPushButton("Browse…")
+        self.model_dir_edit.setPlaceholderText(
+            DEFAULT_PATHS.get("models_dir", "models/SEEDVR2/")
+        )
+        browse_md_btn = QPushButton("Browse...")
         browse_md_btn.clicked.connect(self._browse_model_dir)
         fp8_btn = QPushButton("FP8/FP16")
         fp8_btn.setToolTip("Download FP8 / FP16 models from HuggingFace")
@@ -178,18 +179,37 @@ class SettingsWindow(QDialog):
         md_row.addWidget(browse_md_btn)
         md_row.addWidget(fp8_btn)
         md_row.addWidget(gguf_btn)
-        f2.addRow("Model Directory:", _wrap(md_row))
+        f.addRow("Models Directory:", _wrap(md_row))
 
-        layout.addWidget(g2)
+        dir_layout.addWidget(g)
+
+        # Root-dir info label
+        try:
+            from gui.config_manager import ROOT_DIR, CONFIG_PATH
+        except ImportError:
+            from config_manager import ROOT_DIR, CONFIG_PATH  # type: ignore[no-redef]
+
+        info = QLabel(
+            "<b>Installation root:</b> {}<br>"
+            "<b>config.json:</b> {}".format(ROOT_DIR, CONFIG_PATH)
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color:#888; font-size:10px; padding:4px 0;")
+        dir_layout.addWidget(info)
+        dir_layout.addStretch(1)
+
+        tabs.addTab(dir_tab, "Directory Setup")
 
         # ── Hint label ─────────────────────────────────────────────────
         hint = QLabel(
-            "These settings are saved automatically when you click "
-            "<b>Save &amp; Close</b>."
+            "Settings are saved to <b>config.json</b> when you click "
+            "<b>Save &amp; Close</b>.<br>"
+            "Input / Output paths are managed via the <b>Folders</b> button "
+            "on the main screen."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#666; font-size:11px;")
-        layout.addWidget(hint)
+        root_layout.addWidget(hint)
 
         # ── Button row ─────────────────────────────────────────────────
         btn_row = QHBoxLayout()
@@ -204,7 +224,7 @@ class SettingsWindow(QDialog):
 
         btn_row.addWidget(save_btn)
         btn_row.addWidget(cancel_btn)
-        layout.addLayout(btn_row)
+        root_layout.addLayout(btn_row)
 
     # ------------------------------------------------------------------
     # Button actions
@@ -228,81 +248,83 @@ class SettingsWindow(QDialog):
     # ------------------------------------------------------------------
 
     def _browse_python(self) -> None:
+        start = self.python_exe_edit.text().strip() or ""
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Select Python Executable",
-            "",
+            start,
             "Executables (*.exe python python3);;All Files (*)",
         )
         if path:
             self.python_exe_edit.setText(path)
 
     def _browse_seedvr2_folder(self) -> None:
+        start = self.seedvr2_folder_edit.text().strip() or ""
         path = QFileDialog.getExistingDirectory(
-            self, "Select SeedVR2 Folder (containing inference_cli.py)", ""
+            self, "Select SeedVR2 Folder (containing inference_cli.py)", start
         )
         if path:
             self.seedvr2_folder_edit.setText(path)
 
-    def _browse_input(self) -> None:
-        if self.input_mode_combo.currentText() == "Folder":
-            path = QFileDialog.getExistingDirectory(self, "Select Input Folder", "")
-            if path:
-                self.input_edit.setText(path)
-        else:
-            path, _ = QFileDialog.getOpenFileName(
-                self,
-                "Select Input File",
-                "",
-                "Supported Media "
-                "(*.mp4 *.mov *.mkv *.avi *.webm *.mpeg *.mpg *.m4v *.wmv *.flv *.mts *.m2ts "
-                "*.png *.tif *.tiff *.jpg *.jpeg *.dpx *.exr)"
-                ";;All Files (*)",
-            )
-            if path:
-                self.input_edit.setText(path)
-                self.input_changed.emit(path)
-
-    def _browse_output(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Select Output Directory", "")
+    def _browse_ffmpeg(self) -> None:
+        start = self.ffmpeg_path_edit.text().strip() or ""
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select FFmpeg Executable",
+            start,
+            "Executables (ffmpeg ffmpeg.exe *.exe);;All Files (*)",
+        )
         if path:
-            self.output_edit.setText(path)
+            self.ffmpeg_path_edit.setText(path)
 
     def _browse_model_dir(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Select Model Directory", "")
+        start = self.model_dir_edit.text().strip() or ""
+        path = QFileDialog.getExistingDirectory(
+            self, "Select Models Directory", start
+        )
         if path:
             self.model_dir_edit.setText(path)
 
     # ------------------------------------------------------------------
-    # Settings persistence
+    # Settings persistence (config.json + QSettings for back-compat)
     # ------------------------------------------------------------------
 
     def load_settings(self) -> None:
-        """Restore fields from persistent QSettings storage."""
+        """Restore fields from config.json (with QSettings fallback)."""
+        cfg = load_config()
         s = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
-        self.python_exe_edit.setText(s.value("python_exe", DEFAULT_PYTHON_EXE, type=str))
-        self.seedvr2_folder_edit.setText(s.value("seedvr2_folder", "", type=str))
-        self.input_edit.setText(s.value("input_path", "", type=str))
-        saved_mode: str = s.value("input_mode", "File", type=str)
-        idx = self.input_mode_combo.findText(saved_mode)
-        if idx >= 0:
-            self.input_mode_combo.setCurrentIndex(idx)
-        self.output_edit.setText(s.value("output_path", "", type=str))
-        saved_md: str = s.value("model_dir", "", type=str)
-        if saved_md:
-            self.model_dir_edit.setText(saved_md)
-        elif self.seedvr2_folder_edit.text():
-            default_md = str(
-                Path(self.seedvr2_folder_edit.text()) / "models" / "SEEDVR2"
-            )
-            self.model_dir_edit.setPlaceholderText(default_md)
+
+        def _get(cfg_key: str, qs_key: str, default: str = "") -> str:
+            v = cfg.get(cfg_key, "")
+            if not v:
+                v = s.value(qs_key, default, type=str)
+            return v
+
+        self.python_exe_edit.setText(
+            _get("python_exe", "python_exe", DEFAULT_PYTHON_EXE)
+        )
+        self.seedvr2_folder_edit.setText(
+            _get("seedvr2_folder", "seedvr2_folder", "")
+        )
+        self.ffmpeg_path_edit.setText(
+            _get("ffmpeg_path", "ffmpeg_path", "")
+        )
+        self.model_dir_edit.setText(
+            _get("models_dir", "model_dir", "")
+        )
 
     def save_settings(self) -> None:
-        """Write current field values to persistent QSettings storage."""
+        """Write current field values to config.json (and QSettings)."""
+        cfg = load_config()
+        cfg["python_exe"] = self.python_exe_edit.text().strip()
+        cfg["seedvr2_folder"] = self.seedvr2_folder_edit.text().strip()
+        cfg["ffmpeg_path"] = self.ffmpeg_path_edit.text().strip()
+        cfg["models_dir"] = self.model_dir_edit.text().strip()
+        save_config(cfg)
+
+        # Keep QSettings in sync for any code that still reads from it.
         s = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
-        s.setValue("python_exe", self.python_exe_edit.text().strip())
-        s.setValue("seedvr2_folder", self.seedvr2_folder_edit.text().strip())
-        s.setValue("input_path", self.input_edit.text().strip())
-        s.setValue("input_mode", self.input_mode_combo.currentText())
-        s.setValue("output_path", self.output_edit.text().strip())
-        s.setValue("model_dir", self.model_dir_edit.text().strip())
+        s.setValue("python_exe", cfg["python_exe"])
+        s.setValue("seedvr2_folder", cfg["seedvr2_folder"])
+        s.setValue("ffmpeg_path", cfg["ffmpeg_path"])
+        s.setValue("model_dir", cfg["models_dir"])

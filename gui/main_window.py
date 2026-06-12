@@ -103,6 +103,11 @@ try:
 except ImportError:
     from settings_window import SettingsWindow  # type: ignore[no-redef]
 
+try:
+    from gui.folders_dialog import FoldersDialog
+except ImportError:
+    from folders_dialog import FoldersDialog  # type: ignore[no-redef]
+
 # ---------------------------------------------------------------------------
 # Resource path helper (PyInstaller-compatible)
 # ---------------------------------------------------------------------------
@@ -831,7 +836,10 @@ class MainWindow(QMainWindow):
 
         # Create settings window first – it loads saved paths in its __init__
         self._settings_win = SettingsWindow(self)
-        self._settings_win.input_changed.connect(self._load_preview)
+
+        # Folders dialog manages Input / Output paths (separate from system paths)
+        self._folders_dlg = FoldersDialog(self)
+        self._folders_dlg.input_changed.connect(self._load_preview)
 
         self._thread = None
         self._worker = None
@@ -1036,6 +1044,13 @@ class MainWindow(QMainWindow):
         self._open_input_btn.setEnabled(_MULTIMEDIA_AVAILABLE)
         self._open_input_btn.clicked.connect(self._browse_input_for_player)
         mode_bar.addWidget(self._open_input_btn)
+
+        # "📁 Folders" – opens the Input/Output Folders dialog
+        self._folders_btn = QPushButton("📁 Folders")
+        self._folders_btn.setToolTip("Manage Input / Output folder paths")
+        self._folders_btn.setMinimumWidth(80)
+        self._folders_btn.clicked.connect(self._open_folders_dialog)
+        mode_bar.addWidget(self._folders_btn)
 
         # "Full Screen" – opens split view fullscreen
         self._fullscreen_btn = QPushButton("Full Screen")
@@ -1992,6 +2007,11 @@ class MainWindow(QMainWindow):
         self._settings_win.raise_()
         self._settings_win.activateWindow()
 
+    def _open_folders_dialog(self) -> None:
+        """Open the Input / Output Folders modal dialog."""
+        self._folders_dlg.load_io_paths()
+        self._folders_dlg.exec()
+
     def _toggle_advanced_mode(self, checked: bool) -> None:
         self._advanced_mode_enabled = checked
         self._apply_mode_visibility()
@@ -2310,7 +2330,7 @@ class MainWindow(QMainWindow):
 
     def _resolve_export_output_dir(self) -> Path:
         """Return the export directory from Settings output path (file or directory)."""
-        out_raw = self._settings_win.output_edit.text().strip()
+        out_raw = self._folders_dlg.output_edit.text().strip()
         if out_raw:
             out_path = Path(out_raw)
             # Existing directory => use it.
@@ -2322,7 +2342,7 @@ class MainWindow(QMainWindow):
             # Non-existing path without suffix: treat as target directory.
             return out_path
         # Fallback: input parent directory.
-        inp = self._settings_win.input_edit.text().strip()
+        inp = self._folders_dlg.input_edit.text().strip()
         if inp:
             return Path(inp).parent
         return Path.cwd()
@@ -2503,7 +2523,7 @@ class MainWindow(QMainWindow):
             self._load_preset_from_path(p, write_last_path=False)
 
     def _queue_add_current_job(self) -> None:
-        if not self._settings_win.input_edit.text().strip():
+        if not self._folders_dlg.input_edit.text().strip():
             self._on_log("⚠  Queue: set an input file/folder first.")
             return
         self._queue_entry_counter += 1
@@ -2512,9 +2532,9 @@ class MainWindow(QMainWindow):
             "paths": {
                 "python_exe": self._settings_win.python_exe_edit.text().strip(),
                 "seedvr2_folder": self._settings_win.seedvr2_folder_edit.text().strip(),
-                "input_mode": self._settings_win.input_mode_combo.currentText(),
-                "input_path": self._settings_win.input_edit.text().strip(),
-                "output_path": self._settings_win.output_edit.text().strip(),
+                "input_mode": self._folders_dlg.input_mode_combo.currentText(),
+                "input_path": self._folders_dlg.input_edit.text().strip(),
+                "output_path": self._folders_dlg.output_edit.text().strip(),
                 "model_dir": self._settings_win.model_dir_edit.text().strip(),
             },
             "model_settings": self._serialize_model_settings(),
@@ -2555,17 +2575,17 @@ class MainWindow(QMainWindow):
         paths = job["paths"]
         self._settings_win.python_exe_edit.setText(str(paths.get("python_exe", "")))
         self._settings_win.seedvr2_folder_edit.setText(str(paths.get("seedvr2_folder", "")))
-        self._settings_win.input_edit.setText(str(paths.get("input_path", "")))
-        self._settings_win.output_edit.setText(str(paths.get("output_path", "")))
+        self._folders_dlg.input_edit.setText(str(paths.get("input_path", "")))
+        self._folders_dlg.output_edit.setText(str(paths.get("output_path", "")))
         self._settings_win.model_dir_edit.setText(str(paths.get("model_dir", "")))
         mode = str(paths.get("input_mode", "File"))
-        idx = self._settings_win.input_mode_combo.findText(mode)
+        idx = self._folders_dlg.input_mode_combo.findText(mode)
         if idx >= 0:
-            self._settings_win.input_mode_combo.setCurrentIndex(idx)
+            self._folders_dlg.input_mode_combo.setCurrentIndex(idx)
         model_settings = job.get("model_settings", {})
         if isinstance(model_settings, dict):
             self._apply_model_settings(model_settings)
-        inp = self._settings_win.input_edit.text().strip()
+        inp = self._folders_dlg.input_edit.text().strip()
         if inp and Path(inp).is_file():
             self._load_preview(inp)
         self._on_log(f"▶  Queue job #{job['id']} started.")
@@ -2644,7 +2664,7 @@ class MainWindow(QMainWindow):
         """Update input metadata as: Input: <file> | <current>/<total> frame."""
         if not _MULTIMEDIA_AVAILABLE or not self._input_player or self._current_input_is_image:
             return
-        input_path = self._settings_win.input_edit.text().strip()
+        input_path = self._folders_dlg.input_edit.text().strip()
         if not input_path:
             return
         if position_ms is None:
@@ -2706,8 +2726,8 @@ class MainWindow(QMainWindow):
         args: list[str] = []
 
         # positional input
-        inp = self._settings_win.input_edit.text().strip()
-        input_mode = self._settings_win.input_mode_combo.currentText()
+        inp = self._folders_dlg.input_edit.text().strip()
+        input_mode = self._folders_dlg.input_mode_combo.currentText()
         input_is_directory = (
             not self._is_preview_run
             and (
@@ -2718,7 +2738,7 @@ class MainWindow(QMainWindow):
         args.append(inp)
 
         # output
-        out = self._settings_win.output_edit.text().strip()
+        out = self._folders_dlg.output_edit.text().strip()
         if self._is_preview_run:
             export_dir = self._resolve_export_output_dir()
             if self._is_preview_video_mode:
@@ -2728,7 +2748,7 @@ class MainWindow(QMainWindow):
             else:
                 # Image-mode preview: single PNG frame.
                 preview_out = self._generate_export_output_path(".png", export_dir)
-            self._settings_win.output_edit.setText(str(preview_out))
+            self._folders_dlg.output_edit.setText(str(preview_out))
             args += ["--output", str(preview_out)]
         elif input_is_directory:
             # Directory-mode should mirror native CLI usage:
@@ -2868,7 +2888,7 @@ class MainWindow(QMainWindow):
             # Fall back to --chunk_duration_minutes when FPS cannot be determined.
             fps: float = self._current_fps
             if fps <= 0 and cv2 is not None:
-                inp_path = self._settings_win.input_edit.text().strip()
+                inp_path = self._folders_dlg.input_edit.text().strip()
                 if inp_path:
                     try:
                         cap = cv2.VideoCapture(inp_path)
@@ -2998,13 +3018,13 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _run(self) -> None:
-        inp = self._settings_win.input_edit.text().strip()
+        inp = self._folders_dlg.input_edit.text().strip()
         if not inp:
             self._on_log("❌  Please specify an input file or directory (⚙ Settings).")
             return
         if (
             not self._is_preview_run
-            and self._settings_win.input_mode_combo.currentText() == "Folder"
+            and self._folders_dlg.input_mode_combo.currentText() == "Folder"
             and not Path(inp).is_dir()
         ):
             self._on_log(f"❌  Folder mode requires a directory path, got: {inp}")
@@ -3036,6 +3056,7 @@ class MainWindow(QMainWindow):
 
         # Persist the current paths
         self._settings_win.save_settings()
+        self._folders_dlg.save_io_paths()
         self._save_model_settings()
         self._set_latest_output_path(None)
 
@@ -3083,8 +3104,8 @@ class MainWindow(QMainWindow):
         if not original or Path(original).suffix.lower() not in SUPPORTED_VIDEO_EXTS:
             return False
         self._preview_compare_active = False
-        self._settings_win.input_mode_combo.setCurrentText(self._preview_original_input_mode)
-        self._settings_win.input_edit.setText(original)
+        self._folders_dlg.input_mode_combo.setCurrentText(self._preview_original_input_mode)
+        self._folders_dlg.input_edit.setText(original)
         self._current_input_is_image = False
         self._input_player.setVideoOutput(self._solo_input_vw)
         if switch_mode:
@@ -3159,9 +3180,9 @@ class MainWindow(QMainWindow):
         single image, and display the result in Split View.
         """
         # Save the caller's state so _on_finished can restore it.
-        self._preview_original_input_path = self._settings_win.input_edit.text().strip()
-        self._preview_original_input_mode = self._settings_win.input_mode_combo.currentText()
-        self._preview_original_output_path = self._settings_win.output_edit.text().strip()
+        self._preview_original_input_path = self._folders_dlg.input_edit.text().strip()
+        self._preview_original_input_mode = self._folders_dlg.input_mode_combo.currentText()
+        self._preview_original_output_path = self._folders_dlg.output_edit.text().strip()
         self._preview_saved_batch_size = self.batch_size_spin.value()
         if self._input_player is not None:
             self._preview_original_position = self._input_player.position()
@@ -3244,7 +3265,7 @@ class MainWindow(QMainWindow):
         # Point input to the temp file, set batch size to 1, mark as preview run.
         # Also set an explicit output PNG path so the CLI never tries to create a video from
         # a single-image input (which caused the cv2.imwrite crash on .mp4 extension).
-        self._settings_win.input_edit.setText(self._preview_temp_path)
+        self._folders_dlg.input_edit.setText(self._preview_temp_path)
         # Derive preview output name from the original input filename.
         _orig_for_preview = Path(self._preview_original_input_path) if self._preview_original_input_path else None
         if _orig_for_preview and _orig_for_preview.stem:
@@ -3254,7 +3275,7 @@ class MainWindow(QMainWindow):
         preview_out_png = str(
             self._ensure_unique_file_path(export_dir / f"{_preview_out_stem}.png")
         )
-        self._settings_win.output_edit.setText(preview_out_png)
+        self._folders_dlg.output_edit.setText(preview_out_png)
         self.batch_size_spin.setValue(1)
         self._is_preview_run = True
 
@@ -3289,7 +3310,7 @@ class MainWindow(QMainWindow):
             if self._current_input_is_image:
                 # Always re-load input pixmap so the tab shows the original image even
                 # if the previous tab had swapped _image_view to display the output.
-                inp_path = self._settings_win.input_edit.text().strip()
+                inp_path = self._folders_dlg.input_edit.text().strip()
                 if inp_path:
                     pix = QPixmap(inp_path)
                     if not pix.isNull():
@@ -3330,7 +3351,7 @@ class MainWindow(QMainWindow):
                     self._input_player.setVideoOutput(self._split_view.input_sink)
             elif self._current_input_is_image:
                 # Image input: feed directly into SplitViewWidget; no video sink needed.
-                inp_path = self._settings_win.input_edit.text().strip()
+                inp_path = self._folders_dlg.input_edit.text().strip()
                 if inp_path:
                     pix = QPixmap(inp_path)
                     if not pix.isNull():
@@ -3635,7 +3656,7 @@ class MainWindow(QMainWindow):
             self._output_player.metaDataChanged.connect(self._on_output_meta_changed)
 
     def _browse_output_video(self) -> None:
-        start_dir = self._settings_win.output_edit.text().strip() or ""
+        start_dir = self._folders_dlg.output_edit.text().strip() or ""
         path, _ = QFileDialog.getOpenFileName(
             self, "Select Output Video", start_dir,
             "Videos (*.mp4 *.avi *.mov *.mkv *.webm);;All Files (*)",
@@ -3647,7 +3668,7 @@ class MainWindow(QMainWindow):
 
     def _browse_input_for_player(self) -> None:
         """Open a file picker from the mode bar; sets the input path and loads the preview."""
-        start_dir = self._settings_win.input_edit.text().strip() or ""
+        start_dir = self._folders_dlg.input_edit.text().strip() or ""
         path, _ = QFileDialog.getOpenFileName(
             self, "Select Input File", start_dir,
             INPUT_DIALOG_FILTER,
@@ -3657,7 +3678,7 @@ class MainWindow(QMainWindow):
                 self._on_log(f"⚠  Unsupported input format: {path}")
 
     def _try_auto_load_output(self) -> None:
-        out = self._settings_win.output_edit.text().strip()
+        out = self._folders_dlg.output_edit.text().strip()
         if not out:
             return
         out_path = Path(out)
@@ -3667,7 +3688,7 @@ class MainWindow(QMainWindow):
 
         # ── Image input: construct output path directly (mirrors inference_cli.generate_output_path) ──
         if self._current_input_is_image and self._split_view is not None:
-            inp = self._settings_win.input_edit.text().strip()
+            inp = self._folders_dlg.input_edit.text().strip()
             if not inp:
                 return
             inp_path = Path(inp)
@@ -3939,11 +3960,11 @@ class MainWindow(QMainWindow):
             cap.release()
 
     def _collect_input_files_for_estimation(self) -> list[Path]:
-        inp = self._settings_win.input_edit.text().strip()
+        inp = self._folders_dlg.input_edit.text().strip()
         if not inp:
             return []
         input_path = Path(inp)
-        if self._settings_win.input_mode_combo.currentText() == "Folder" and input_path.is_dir():
+        if self._folders_dlg.input_mode_combo.currentText() == "Folder" and input_path.is_dir():
             try:
                 files = [
                     p for p in sorted(input_path.iterdir(), key=lambda x: x.name.lower())
@@ -4146,7 +4167,7 @@ class MainWindow(QMainWindow):
             # Feed completed output path into the split tracking context so that
             # multi-part chunk compilation can resolve input→output mappings.
             if not was_preview and self._latest_output_path is not None:
-                inp_raw = self._settings_win.input_edit.text().strip()
+                inp_raw = self._folders_dlg.input_edit.text().strip()
                 if inp_raw:
                     self._on_log(
                         f"📂  Output: {self._latest_output_path.resolve()}"
@@ -4177,8 +4198,8 @@ class MainWindow(QMainWindow):
                     except Exception:
                         pass
                 if self._preview_original_input_path:
-                    self._settings_win.input_mode_combo.setCurrentText(self._preview_original_input_mode)
-                    self._settings_win.input_edit.setText(self._preview_original_input_path)
+                    self._folders_dlg.input_mode_combo.setCurrentText(self._preview_original_input_mode)
+                    self._folders_dlg.input_edit.setText(self._preview_original_input_path)
                 self._mode_split_btn.setChecked(True)
                 self._on_mode_button(2, True)
         else:
@@ -4213,7 +4234,7 @@ class MainWindow(QMainWindow):
         # Restore output path that was overridden during preview (but keep the input field
         # pointing at the original path so the user still sees the correct input displayed).
         if was_preview and hasattr(self, "_preview_original_output_path"):
-            self._settings_win.output_edit.setText(self._preview_original_output_path)
+            self._folders_dlg.output_edit.setText(self._preview_original_output_path)
         self._worker = None
         self._thread = None
 
@@ -4303,15 +4324,15 @@ class MainWindow(QMainWindow):
         self._preview_compare_active = False
         if path.is_dir():
             frames = self._sequence_frame_candidates(path)
-            self._settings_win.input_mode_combo.setCurrentText("Folder")
-            self._settings_win.input_edit.setText(str(path))
+            self._folders_dlg.input_mode_combo.setCurrentText("Folder")
+            self._folders_dlg.input_edit.setText(str(path))
             if frames:
                 self._load_preview(str(frames[0]))
                 self._mode_input_btn.setChecked(True)
             self._on_log(f"📂  Loaded image-sequence folder ({len(frames)} frames): {path}")
             return True
-        self._settings_win.input_mode_combo.setCurrentText("File")
-        self._settings_win.input_edit.setText(str(path))
+        self._folders_dlg.input_mode_combo.setCurrentText("File")
+        self._folders_dlg.input_edit.setText(str(path))
         self._load_preview(str(path))
         self._mode_input_btn.setChecked(True)
         self._on_log(f"📂  Input file set from drag-drop: {path}")
