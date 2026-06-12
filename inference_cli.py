@@ -688,55 +688,61 @@ def _normalize_output_path_for_target(
     video_backend: str,
 ) -> str:
     """
-    Normalize output paths so extension/target type matches requested export mode.
-    """
-    path = Path(output_path).resolve()
-    fmt = (output_format or "mp4").lower()
+    Reconcile the output path's extension with the requested export target.
 
+    The user-selected ``--output_format`` is *authoritative*. Any extension the
+    user supplied on ``--output`` (for example a stray ``.png``) is stripped via
+    :func:`os.path.splitext` and the correct extension for the format is
+    re-appended. For video-container exports this override is **mandatory** and
+    unconditional: there is no code path that lets an image extension (``.png``
+    etc.) reach the ffmpeg command when a video container (mp4/mov/mkv/…) is the
+    requested format, regardless of ``video_backend``.
+    """
+    fmt = (output_format or "mp4").lower()
+    abs_path = str(Path(output_path).resolve())
+    base, ext = os.path.splitext(abs_path)
+
+    # --- Single image output (image input) ---
     if input_type == "image":
-        # Image pipeline always writes a single image file.
         target_ext = f".{fmt}" if f".{fmt}" in _IMAGE_OUTPUT_EXTS else ".png"
-        if path.suffix.lower() != target_ext:
+        if ext.lower() != target_ext:
             debug.log(
-                f"Output extension '{path.suffix or '<none>'}' is invalid for image output; "
+                f"Output extension '{ext or '<none>'}' is invalid for image output; "
                 f"using '{target_ext}'.",
                 level="WARNING",
                 category="file",
                 force=True,
             )
-            path = path.with_suffix(target_ext)
-        return str(path)
+        return base + target_ext
 
-    # Video input + image sequence export writes into a directory.
+    # --- Image-sequence export (video input → directory of frames) ---
     if fmt in _IMAGE_SEQUENCE_FORMATS:
-        if path.suffix:
+        if ext:
             debug.log(
                 f"Image-sequence export requested ({fmt}); removing file extension "
-                f"'{path.suffix}' to use directory output.",
+                f"'{ext}' to use directory output.",
                 level="WARNING",
                 category="file",
                 force=True,
             )
-            path = path.with_suffix("")
-        return str(path)
+            return base
+        return abs_path
 
-    # Video export path: enforce container extension from --output_format.
+    # --- Video container export: extension MUST match --output_format ---
+    # Look up the canonical container extension and re-append it after stripping
+    # whatever the user supplied. This guarantees that, for the ffmpeg backend,
+    # the filename always matches the requested format (never .png/.jpg/etc.).
     target_ext = _VIDEO_CONTAINER_EXTS.get(fmt, f".{fmt}")
-    if path.suffix.lower() != target_ext:
+    if ext.lower() != target_ext:
         debug.log(
-            f"Output extension '{path.suffix or '<none>'}' does not match "
-            f"--output_format '{fmt}'; using '{target_ext}'.",
+            f"Output extension '{ext or '<none>'}' does not match "
+            f"--output_format '{fmt}'; enforcing '{target_ext}'"
+            + (" for ffmpeg backend." if video_backend == "ffmpeg" else "."),
             level="WARNING",
             category="file",
             force=True,
         )
-        path = path.with_suffix(target_ext)
-
-    # ffmpeg backend always writes a video stream target, never an image file.
-    if video_backend == "ffmpeg" and path.suffix.lower() in _IMAGE_OUTPUT_EXTS:
-        path = path.with_suffix(target_ext)
-
-    return str(path)
+    return base + target_ext
 
 
 def resolve_canonical_output_path(
@@ -941,62 +947,139 @@ def _is_oom_error(err: BaseException) -> bool:
     return "out of memory" in str(err).lower()
 
 
-def _apply_oom_mitigation(args: "argparse.Namespace", attempt: int) -> str:
-    """Dynamically relax memory-hungry settings after an OOM, returning a summary.
+# Auto Tune OOM fail-safe chain configuration.
+_AUTOTUNE_BATCH_STEP = 4              # batch_size reduction per loop iteration
+_AUTOTUNE_BATCH_REDUCTION_ITERS = 10  # number of batch-reduction iterations
+# 4 fixed stages (1: batch=77/ds=2, 2: tiling, 3: tile=256, 4: batch=45) plus the
+# 10-iteration batch-reduction loop = 14 escalation stages before termination.
+_AUTOTUNE_MAX_STAGES = 4 + _AUTOTUNE_BATCH_REDUCTION_ITERS
 
-    Auto Tune escalates rather than failing: each retry trades quality/speed for a
-    smaller peak VRAM footprint. Order of attack, cheapest-impact first:
-      1. Shrink the DiT batch size (the dominant VRAM driver) — halve while large,
-         step down by 4 once small, never below 1.
-      2. Enable VAE tiling if it is off — tiling caps the VAE's peak activation
-         size at the cost of extra compute, which is the next-biggest lever.
-      3. Otherwise shrink the tile size toward a 256px floor.
-      4. Reduce temporal overlap toward 0 (fewer concurrently held frames).
+
+def _apply_oom_mitigation(args: "argparse.Namespace", stage: int) -> str:
+    """Apply the OOM mitigation prescribed for a given escalation *stage*.
+
+    Implements a fixed 10-step fail-safe chain (see :func:`_run_with_auto_tune`):
+
+      Stage 1  → batch_size=77, pre_downscale=2
+      Stage 2  → enable VAE encode/decode tiling, tile_size=512, tile_overlap=32
+      Stage 3  → reduce tile_size to 256
+      Stage 4  → batch_size=45
+      Stages 5-14 → reduce batch_size by 4 each iteration (45, 41, 37, …)
+
+    Returns a short human-readable summary of the change applied.
     """
     changes: List[str] = []
 
-    if args.batch_size > 1:
-        old_bs = args.batch_size
-        args.batch_size = max(1, args.batch_size // 2 if args.batch_size > 8
-                              else args.batch_size - 4)
-        changes.append(f"batch_size {old_bs}→{args.batch_size}")
+    if stage == 1:
+        args.batch_size = 77
+        args.pre_downscale = 2
+        changes.append("batch_size=77, pre_downscale=2")
 
-    # Engage tiling (or tighten it) on every attempt past the first batch cut so
-    # we keep making headway even when batch_size has bottomed out at 1.
-    if not getattr(args, "vae_decode_tiled", False):
-        args.vae_decode_tiled = True
+    elif stage == 2:
         args.vae_encode_tiled = True
-        changes.append("enabled VAE encode/decode tiling")
-    else:
-        for attr in ("vae_decode_tile_size", "vae_encode_tile_size"):
-            cur = getattr(args, attr, None)
-            if isinstance(cur, int) and cur > 256:
-                new = max(256, cur // 2)
-                # Keep overlap strictly smaller than the (possibly shrunk) tile.
-                ov_attr = attr.replace("tile_size", "tile_overlap")
-                if getattr(args, ov_attr, 0) >= new:
-                    setattr(args, ov_attr, max(16, new // 4))
-                setattr(args, attr, new)
-                changes.append(f"{attr} {cur}→{new}")
+        args.vae_decode_tiled = True
+        args.vae_encode_tile_size = 512
+        args.vae_decode_tile_size = 512
+        args.vae_encode_tile_overlap = 32
+        args.vae_decode_tile_overlap = 32
+        changes.append("enabled VAE tiling (tile_size=512, tile_overlap=32)")
 
-    if getattr(args, "temporal_overlap", 0) > 0:
-        old_ov = args.temporal_overlap
-        args.temporal_overlap = max(0, args.temporal_overlap - 1)
-        changes.append(f"temporal_overlap {old_ov}→{args.temporal_overlap}")
+    elif stage == 3:
+        args.vae_encode_tile_size = 256
+        args.vae_decode_tile_size = 256
+        # Keep overlap strictly smaller than the (now smaller) tile.
+        args.vae_encode_tile_overlap = min(getattr(args, "vae_encode_tile_overlap", 32), 32)
+        args.vae_decode_tile_overlap = min(getattr(args, "vae_decode_tile_overlap", 32), 32)
+        changes.append("reduced tile_size=256")
+
+    elif stage == 4:
+        args.batch_size = 45
+        changes.append("batch_size=45")
+
+    else:
+        # Stages 5..14: ten iterations stepping batch_size down by 4 each time.
+        iteration = stage - 4
+        args.batch_size = max(1, args.batch_size - _AUTOTUNE_BATCH_STEP)
+        changes.append(
+            f"batch_size→{args.batch_size} "
+            f"(reduction {iteration}/{_AUTOTUNE_BATCH_REDUCTION_ITERS})"
+        )
 
     return ", ".join(changes) if changes else "no further mitigations available"
 
 
-def _run_with_auto_tune(process_fn, args: "argparse.Namespace",
-                        on_success=None, max_attempts: int = 5) -> int:
-    """Run ``process_fn`` and, when Auto Tune is on, retry through OOM.
+def _probe_input_short_side(input_path: str) -> Optional[int]:
+    """Return the short-side pixel resolution of an image/video input, or ``None``.
 
-    On a CUDA OOM the allocator caches are flushed and memory-hungry settings are
-    progressively relaxed via :func:`_apply_oom_mitigation` so processing recovers
-    automatically instead of crashing. Non-OOM errors, or OOMs once Auto Tune is
-    disabled/exhausted, propagate unchanged.
+    Used by the Auto Tune pre-check to decide the initial ``pre_downscale``. Never
+    raises: probing failures simply return ``None`` so the pre-check is skipped.
     """
-    attempts = 0
+    try:
+        itype = get_input_type(input_path)
+        if itype == "video":
+            cap = cv2.VideoCapture(input_path)
+            if not cap.isOpened():
+                return None
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cap.release()
+            return min(width, height) if width and height else None
+        if itype == "image":
+            img = cv2.imread(input_path)
+            if img is None:
+                return None
+            height, width = img.shape[:2]
+            return min(width, height)
+    except Exception:
+        return None
+    return None
+
+
+def _autotune_precheck(args: "argparse.Namespace", input_path: str) -> None:
+    """Auto Tune pre-check: set ``pre_downscale`` from the input resolution.
+
+    Runs once per input (before the retry loop) when Auto Tune is enabled:
+      * input short side > 480p  → force ``pre_downscale = 2``
+      * input short side <= 480p → force ``pre_downscale = 1``
+    """
+    if not getattr(args, "auto_tune", False):
+        return
+    short_side = _probe_input_short_side(input_path)
+    if short_side is None:
+        return
+    if short_side > 480:
+        args.pre_downscale = 2
+        debug.log(
+            f"Auto Tune pre-check: input short side {short_side}px > 480p → pre_downscale=2",
+            category="setup", force=True,
+        )
+    else:
+        args.pre_downscale = 1
+        debug.log(
+            f"Auto Tune pre-check: input short side {short_side}px <= 480p → pre_downscale=1",
+            category="setup", force=True,
+        )
+
+
+def _run_with_auto_tune(process_fn, args: "argparse.Namespace",
+                        on_success=None) -> int:
+    """Run ``process_fn`` and, when Auto Tune is on, retry through CUDA OOM.
+
+    On every CUDA out-of-memory error the allocator caches are flushed and the
+    next stage of a fixed 10-step fail-safe chain is applied (see
+    :func:`_apply_oom_mitigation`):
+
+        1. batch_size=77, pre_downscale=2
+        2. enable VAE tiling (tile_size=512, tile_overlap=32)
+        3. reduce tile_size to 256
+        4. batch_size=45
+        5-14. reduce batch_size by 4 each iteration (10 iterations)
+
+    If OOM persists after the 10th batch-reduction iteration the process is
+    terminated with a CRITICAL MEMORY ERROR message. Non-OOM errors, or OOMs when
+    Auto Tune is disabled, propagate unchanged.
+    """
+    stage = 0
     while True:
         try:
             frames = process_fn()
@@ -1004,18 +1087,24 @@ def _run_with_auto_tune(process_fn, args: "argparse.Namespace",
                 on_success()
             return frames
         except (torch.cuda.OutOfMemoryError, RuntimeError) as err:
-            if not getattr(args, "auto_tune", False) or attempts >= max_attempts:
+            if not getattr(args, "auto_tune", False) or not _is_oom_error(err):
                 raise
-            if not _is_oom_error(err):
-                raise
-            attempts += 1
+            if stage >= _AUTOTUNE_MAX_STAGES:
+                # Fail-safe chain exhausted: capture state and terminate.
+                _log_crash_diagnostics()
+                debug.log(
+                    "CRITICAL MEMORY ERROR: Unable to fit model in VRAM even with minimal settings.",
+                    level="ERROR", category="generation", force=True,
+                )
+                sys.exit(1)
+            stage += 1
             if hasattr(torch, "cuda"):
                 torch.cuda.empty_cache()
             gc.collect()
-            summary = _apply_oom_mitigation(args, attempts)
+            summary = _apply_oom_mitigation(args, stage)
             debug.log(
-                f"Auto Tune: OOM detected, relaxing settings ({summary}) "
-                f"[attempt {attempts}/{max_attempts}]",
+                f"Auto Tune: CUDA OOM caught — escalating fail-safe stage "
+                f"{stage}/{_AUTOTUNE_MAX_STAGES} ({summary})",
                 category="setup", force=True,
             )
 
@@ -2522,6 +2611,7 @@ def main() -> None:
                 
                 # Process with explicit output path and runner cache. Auto Tune
                 # (when enabled) recovers from OOM by relaxing settings and retrying.
+                _autotune_precheck(args, file_path)
                 total_frames_processed += _run_with_auto_tune(
                     lambda: process_single_file(
                         file_path, args, device_list, output_path,
@@ -2580,6 +2670,7 @@ def main() -> None:
                         category="tip", force=True
                     )
             
+            _autotune_precheck(args, args.input)
             total_frames_processed += _run_with_auto_tune(
                 lambda: process_single_file(
                     args.input, args, device_list, args.output,
@@ -2587,7 +2678,7 @@ def main() -> None:
                     runner_cache=runner_cache),
                 args,
             )
-        
+
         else:
             debug.log(f"Unsupported input type: {args.input}", level="ERROR", category="file", force=True)
             sys.exit(1)
