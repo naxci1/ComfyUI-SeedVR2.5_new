@@ -2798,6 +2798,15 @@ class MainWindow(QMainWindow):
         elif out:
             out_path = Path(out)
             if out_path.suffix:
+                # Force-enforce the correct extension based on the selected export
+                # format BEFORE launching the subprocess.  A user-supplied path may
+                # carry a stale extension (e.g. ".png") that does not match the
+                # chosen container/image-sequence format.  Reconcile it here so the
+                # GUI never sends a mismatched extension (such as ".png" when MP4 is
+                # selected) to inference_cli.py.
+                correct_ext = self._selected_export_extension()
+                if correct_ext and out_path.suffix.lower() != correct_ext.lower():
+                    out_path = out_path.with_suffix(correct_ext)
                 args += ["--output", str(self._ensure_unique_file_path(out_path))]
             else:
                 args += ["--output", out]
