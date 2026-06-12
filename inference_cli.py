@@ -1071,6 +1071,32 @@ def _autotune_precheck(args: "argparse.Namespace", input_path: str) -> None:
         )
 
 
+def _halve_chunk_size_on_oom(args: "argparse.Namespace") -> Optional[str]:
+    """Halve the active streaming ``chunk_size`` after a CUDA OOM.
+
+    Dynamic step-down chunking (PR #462): when a phase OOMs despite the
+    per-phase cleanup, fewer frames must flow through the pipeline at once. The
+    streaming chunk size is halved (floored at 1) so the next retry re-reads the
+    video in smaller, memory-bounded chunks and resumes processing. Chunk
+    duration (minutes) overrides are also collapsed to the explicit frame count.
+
+    Returns a short human-readable summary, or ``None`` when no chunking is
+    active (so nothing was changed).
+    """
+    current = int(getattr(args, "chunk_size", 0) or 0)
+    if current <= 1:
+        return None
+    new_size = max(1, current // 2)
+    if new_size == current:
+        return None
+    args.chunk_size = new_size
+    # An explicit frame-count chunk takes precedence over a minute-based one;
+    # drop the duration override so the halved frame count is authoritative.
+    if getattr(args, "chunk_duration_minutes", 0):
+        args.chunk_duration_minutes = 0.0
+    return f"chunk_size {current}→{new_size}"
+
+
 def _run_with_auto_tune(process_fn, args: "argparse.Namespace",
                         on_success=None) -> int:
     """Run ``process_fn`` and, when Auto Tune is on, retry through CUDA OOM.
@@ -1111,7 +1137,13 @@ def _run_with_auto_tune(process_fn, args: "argparse.Namespace",
             if hasattr(torch, "cuda"):
                 torch.cuda.empty_cache()
             gc.collect()
+            # Dynamic step-down chunking: halve the streaming chunk size (when
+            # active) on every OOM so the retry re-reads the video in smaller,
+            # memory-bounded chunks and resumes the phase.
+            chunk_summary = _halve_chunk_size_on_oom(args)
             summary = _apply_oom_mitigation(args, stage)
+            if chunk_summary:
+                summary = f"{chunk_summary}, {summary}"
             debug.log(
                 f"Auto Tune: CUDA OOM caught — escalating fail-safe stage "
                 f"{stage}/{_AUTOTUNE_MAX_STAGES} ({summary})",
@@ -1499,30 +1531,37 @@ def _stream_video_chunks(
                      category="generation", force=True)
             debug.log("", category="none", force=True)
 
-        # Process chunk
-        result = _process_frames_core(
-            frames_tensor=frames.to(torch.float16),
-            args=chunk_args,
-            device_id=device_id,
-            debug=debug,
-            runner_cache=runner_cache
-        )
+        # Process chunk. The processing + yield is wrapped in try/finally so the
+        # per-chunk VRAM is always released afterwards, even if a phase OOMs.
+        result = None
+        try:
+            result = _process_frames_core(
+                frames_tensor=frames.to(torch.float16),
+                args=chunk_args,
+                device_id=device_id,
+                debug=debug,
+                runner_cache=runner_cache
+            )
 
-        # Remove context frames from output
-        if context_count > 0:
-            result = result[context_count:]
+            # Remove context frames from output
+            if context_count > 0:
+                result = result[context_count:]
 
-        # Save tail for next chunk context (downscaled frames for consistency)
-        prev_raw_tail = new_frames[-overlap:].clone() if overlap > 0 else None
+            # Save tail for next chunk context (downscaled frames for consistency)
+            prev_raw_tail = new_frames[-overlap:].clone() if overlap > 0 else None
 
-        # Cleanup before yield
-        del frames
+            # Cleanup before yield
+            del frames
 
-        yield result
-
-        # Memory cleanup between chunks
-        if streaming:
-            clear_memory(debug=debug, deep=True, force=True, timer_name=cleanup_timer_name)
+            yield result
+        finally:
+            # Strict cleanup after every chunk (PR #462/#572): release VRAM even
+            # on OOM so the allocator is defragmented before the next chunk or an
+            # Auto Tune step-down retry.
+            if streaming:
+                clear_memory(debug=debug, deep=True, force=True, timer_name=cleanup_timer_name)
+            else:
+                _strict_batch_flush()
 
 
 def _save_image_bgr(frame: np.ndarray, file_path: str) -> None:
@@ -1598,6 +1637,31 @@ def _strict_batch_flush(*objs: Any) -> None:
 def _release_post_file_resources() -> None:
     """Force Python and CUDA cleanup between sequential files."""
     _strict_batch_flush()
+
+
+def _release_phase_memory(phase: str, debug: Optional['Debug'] = None) -> None:
+    """Offload and clear VRAM after a single processing phase.
+
+    Implements the PR #572 phase-based discipline: after each of the four
+    phases (Encode → Upscale → Decode → Postprocess) the allocator caches are
+    flushed with an explicit ``gc.collect()`` followed by
+    ``torch.cuda.empty_cache()`` so VRAM is released *between* phases instead
+    of only at the end of the chunk. This keeps the peak working set bounded to
+    a single phase and defragments the allocator before the next phase runs.
+
+    Never raises: cleanup failures are swallowed so they cannot mask the real
+    error (e.g. an in-flight OOM that must propagate to the Auto Tune retry).
+    """
+    gc.collect()
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            if hasattr(torch.cuda, "ipc_collect"):
+                torch.cuda.ipc_collect()
+    except Exception:
+        pass
+    if debug is not None:
+        debug.log(f"Phase cleanup ({phase}): VRAM cache flushed", category="memory")
 
 
 def save_frames_to_video(
@@ -1914,46 +1978,60 @@ def _process_frames_core(
     )
     log_generation_start(gen_info, debug)
     
-    # Phase 1: Encode
-    ctx = encode_all_batches(
-        runner, ctx=ctx, images=frames_tensor,
-        debug=debug, 
-        batch_size=args.batch_size,
-        uniform_batch_size=args.uniform_batch_size,
-        seed=args.seed,
-        progress_callback=None, 
-        temporal_overlap=args.temporal_overlap,
-        resolution=args.resolution,
-        max_resolution=args.max_resolution,
-        input_noise_scale=args.input_noise_scale,
-        color_correction=args.color_correction
-    )
-    
-    # Phase 2: Upscale
-    ctx = upscale_all_batches(
-        runner, ctx=ctx, debug=debug, progress_callback=None,
-        seed=args.seed,
-        latent_noise_scale=args.latent_noise_scale,
-        cache_model=cache_dit
-    )
-    
-    # Phase 3: Decode
-    ctx = decode_all_batches(
-        runner, ctx=ctx, debug=debug, progress_callback=None,
-        cache_model=cache_vae,
-        only_frames=args.only_frames
-    )
-    
-    # Phase 4: Post-process
-    ctx = postprocess_all_batches(
-        ctx=ctx, debug=debug, progress_callback=None,
-        color_correction=args.color_correction,
-        prepend_frames=0,  # Worker mode handles this in main process
-        temporal_overlap=args.temporal_overlap,
-        batch_size=args.batch_size
-    )
-    
-    result_tensor = ctx['final_video']
+    # 4-phase pipeline (PR #572): each phase runs in isolation and its VRAM is
+    # explicitly offloaded/cleared before the next phase begins. The whole block
+    # is wrapped in try/finally so that an OOM mid-phase still releases VRAM
+    # before the error propagates to the Auto Tune step-down retry.
+    try:
+        # Phase 1: Encode
+        ctx = encode_all_batches(
+            runner, ctx=ctx, images=frames_tensor,
+            debug=debug, 
+            batch_size=args.batch_size,
+            uniform_batch_size=args.uniform_batch_size,
+            seed=args.seed,
+            progress_callback=None, 
+            temporal_overlap=args.temporal_overlap,
+            resolution=args.resolution,
+            max_resolution=args.max_resolution,
+            input_noise_scale=args.input_noise_scale,
+            color_correction=args.color_correction
+        )
+        _release_phase_memory("Encode", debug)
+
+        # Phase 2: Upscale
+        ctx = upscale_all_batches(
+            runner, ctx=ctx, debug=debug, progress_callback=None,
+            seed=args.seed,
+            latent_noise_scale=args.latent_noise_scale,
+            cache_model=cache_dit
+        )
+        _release_phase_memory("Upscale", debug)
+
+        # Phase 3: Decode
+        ctx = decode_all_batches(
+            runner, ctx=ctx, debug=debug, progress_callback=None,
+            cache_model=cache_vae,
+            only_frames=args.only_frames
+        )
+        _release_phase_memory("Decode", debug)
+
+        # Phase 4: Post-process
+        ctx = postprocess_all_batches(
+            ctx=ctx, debug=debug, progress_callback=None,
+            color_correction=args.color_correction,
+            prepend_frames=0,  # Worker mode handles this in main process
+            temporal_overlap=args.temporal_overlap,
+            batch_size=args.batch_size
+        )
+        _release_phase_memory("Postprocess", debug)
+
+        result_tensor = ctx['final_video']
+    finally:
+        # Strict cleanup: guarantee VRAM release after the chunk's phases, even
+        # when a phase raises (e.g. CUDA OOM), so the next chunk or retry starts
+        # from a clean, defragmented allocator state.
+        _release_phase_memory("chunk-cleanup", debug)
     
     # Convert to CPU and compatible dtype
     if result_tensor.is_cuda or result_tensor.is_mps:
@@ -2520,6 +2598,22 @@ def main() -> None:
         if hasattr(args, "vae_decode_tile_overlap"):
             args.vae_decode_tile_overlap = 32
         debug.log("Auto Tune active: VAE tile overlap forced to 32", category="setup", force=True)
+
+    # 16-bit TIFF optimization: clamp the VAE decode tile size to <=256 to cap
+    # peak VRAM during the Decode phase. 16-bit TIFF frames carry full-precision
+    # data, so their decode tiles are far larger than 8-bit ones; large tiles
+    # spike VRAM and trigger OOM. 256 keeps the decode peak bounded.
+    _decode_fmt = (getattr(args, "output_format", None) or "").lower()
+    if _decode_fmt in ("tiff", "tif") and getattr(args, "vae_decode_tile_size", 0) > 256:
+        debug.log(
+            f"16-bit TIFF output: clamping vae_decode_tile_size "
+            f"{args.vae_decode_tile_size}→256 to bound Decode-phase VRAM",
+            category="setup", force=True,
+        )
+        args.vae_decode_tile_size = 256
+        # Keep the tile overlap strictly smaller than the clamped tile size.
+        if getattr(args, "vae_decode_tile_overlap", 0) >= 256:
+            args.vae_decode_tile_overlap = min(args.vae_decode_tile_overlap, 32)
 
     # print header
     debug.print_header(cli=True)
