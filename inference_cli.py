@@ -52,7 +52,9 @@ import argparse
 import time
 import shlex
 import platform
+import threading
 import multiprocessing as mp
+from collections import deque
 from typing import Dict, Any, List, Optional, Tuple, Literal, Generator
 from datetime import datetime
 from pathlib import Path
@@ -286,15 +288,49 @@ class FFMPEGVideoWriter:
                 force=True,
             )
 
+        # Persistent encoder pipe. We keep ffmpeg's stderr connected to a PIPE
+        # (instead of discarding it) and drain it on a background daemon thread
+        # into a bounded ring buffer. This is what makes long exports debuggable:
+        # when the pipe breaks after minutes of streaming, the OS only tells us
+        # "broken pipe" — the *reason* (codec rejection, disk full, bad LUT) is
+        # only ever written by ffmpeg to stderr. Buffering the tail lets us report
+        # the real cause instead of an opaque error.
+        self._stderr_tail: "deque[str]" = deque(maxlen=50)
         self.proc = subprocess.Popen(
             ffmpeg_cmd,
-            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         )
-    
+        self._stderr_thread = threading.Thread(
+            target=self._drain_stderr, name="ffmpeg-stderr-drain", daemon=True
+        )
+        self._stderr_thread.start()
+
+    def _drain_stderr(self) -> None:
+        """Continuously read ffmpeg stderr so the pipe never fills and blocks the
+        encoder, retaining only the most recent lines for diagnostics."""
+        stream = self.proc.stderr if self.proc else None
+        if stream is None:
+            return
+        try:
+            for raw in iter(stream.readline, b""):
+                line = raw.decode("utf-8", errors="replace").rstrip()
+                if line:
+                    self._stderr_tail.append(line)
+        except (ValueError, OSError):
+            pass  # Stream closed during shutdown.
+
+    def _stderr_message(self) -> str:
+        """Return the captured ffmpeg stderr tail, if any, for error reporting."""
+        if not self._stderr_tail:
+            return ""
+        return " | ffmpeg said: " + " / ".join(list(self._stderr_tail)[-5:])
+
     def write(self, frame_bgr: np.ndarray):
         if not self.isOpened():
-            raise RuntimeError("FFMPEGVideoWriter: ffmpeg process is not running")
-        
+            raise RuntimeError(
+                "FFMPEGVideoWriter: ffmpeg process is not running." + self._stderr_message()
+            )
+
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         try:
             self.proc.stdin.write(frame_rgb.astype(np.uint8).tobytes())
@@ -302,25 +338,29 @@ class FFMPEGVideoWriter:
         except BrokenPipeError:
             raise RuntimeError(
                 "FFMPEGVideoWriter: ffmpeg process terminated unexpectedly. "
-                "Check video path, codec support, and disk space."
+                "Check video path, codec support, and disk space." + self._stderr_message()
             )
-    
+
     def isOpened(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
-    
+
     def release(self):
         if self.proc:
             try:
                 self.proc.stdin.close()
             except Exception:
                 pass  # Ignore errors on close
-            
+
             self.proc.wait()
-            
+
+            # Let the drain thread flush any final stderr lines before we read them.
+            if self._stderr_thread is not None:
+                self._stderr_thread.join(timeout=2.0)
+
             if self.proc.returncode != 0:
                 debug.log(
                     f"ffmpeg exited with code {self.proc.returncode}. "
-                    "Check output file for corruption.",
+                    "Check output file for corruption." + self._stderr_message(),
                     level="WARNING", force=True, category="file"
                 )
             self.proc = None
@@ -856,6 +896,128 @@ def _force_disable_cudagraphs_for_safe_mode(args: "argparse.Namespace", mode_lab
         force=True,
         indent_level=1,
     )
+
+
+def _log_crash_diagnostics() -> None:
+    """Log the exact GPU/RAM state at the moment of a fatal error.
+
+    Called from the centralized error handler so that a crash report captures the
+    memory picture *before* the process unwinds — by the time a traceback prints,
+    allocator state is already being torn down. We never let diagnostics raise:
+    a failure here must not mask the original exception.
+    """
+    try:
+        import psutil  # Project dependency; imported lazily to keep startup light.
+        vm = psutil.virtual_memory()
+        proc_rss = psutil.Process(os.getpid()).memory_info().rss
+        debug.log(
+            f"System RAM: used {vm.used / 1e9:.2f} GB / {vm.total / 1e9:.2f} GB "
+            f"({vm.percent:.0f}%), this process RSS {proc_rss / 1e9:.2f} GB",
+            level="ERROR", category="generation", force=True,
+        )
+    except Exception:
+        pass
+
+    try:
+        if is_cuda_available() and torch.cuda.is_available():
+            for dev in range(torch.cuda.device_count()):
+                free_b, total_b = torch.cuda.mem_get_info(dev)
+                allocated = torch.cuda.memory_allocated(dev)
+                reserved = torch.cuda.memory_reserved(dev)
+                debug.log(
+                    f"GPU {dev} ({torch.cuda.get_device_name(dev)}): "
+                    f"free {free_b / 1e9:.2f} GB / total {total_b / 1e9:.2f} GB, "
+                    f"allocated {allocated / 1e9:.2f} GB, reserved {reserved / 1e9:.2f} GB",
+                    level="ERROR", category="generation", force=True,
+                )
+    except Exception:
+        pass
+
+
+def _is_oom_error(err: BaseException) -> bool:
+    """True when an exception represents a CUDA out-of-memory condition."""
+    if isinstance(err, getattr(torch.cuda, "OutOfMemoryError", ())):
+        return True
+    return "out of memory" in str(err).lower()
+
+
+def _apply_oom_mitigation(args: "argparse.Namespace", attempt: int) -> str:
+    """Dynamically relax memory-hungry settings after an OOM, returning a summary.
+
+    Auto Tune escalates rather than failing: each retry trades quality/speed for a
+    smaller peak VRAM footprint. Order of attack, cheapest-impact first:
+      1. Shrink the DiT batch size (the dominant VRAM driver) — halve while large,
+         step down by 4 once small, never below 1.
+      2. Enable VAE tiling if it is off — tiling caps the VAE's peak activation
+         size at the cost of extra compute, which is the next-biggest lever.
+      3. Otherwise shrink the tile size toward a 256px floor.
+      4. Reduce temporal overlap toward 0 (fewer concurrently held frames).
+    """
+    changes: List[str] = []
+
+    if args.batch_size > 1:
+        old_bs = args.batch_size
+        args.batch_size = max(1, args.batch_size // 2 if args.batch_size > 8
+                              else args.batch_size - 4)
+        changes.append(f"batch_size {old_bs}→{args.batch_size}")
+
+    # Engage tiling (or tighten it) on every attempt past the first batch cut so
+    # we keep making headway even when batch_size has bottomed out at 1.
+    if not getattr(args, "vae_decode_tiled", False):
+        args.vae_decode_tiled = True
+        args.vae_encode_tiled = True
+        changes.append("enabled VAE encode/decode tiling")
+    else:
+        for attr in ("vae_decode_tile_size", "vae_encode_tile_size"):
+            cur = getattr(args, attr, None)
+            if isinstance(cur, int) and cur > 256:
+                new = max(256, cur // 2)
+                # Keep overlap strictly smaller than the (possibly shrunk) tile.
+                ov_attr = attr.replace("tile_size", "tile_overlap")
+                if getattr(args, ov_attr, 0) >= new:
+                    setattr(args, ov_attr, max(16, new // 4))
+                setattr(args, attr, new)
+                changes.append(f"{attr} {cur}→{new}")
+
+    if getattr(args, "temporal_overlap", 0) > 0:
+        old_ov = args.temporal_overlap
+        args.temporal_overlap = max(0, args.temporal_overlap - 1)
+        changes.append(f"temporal_overlap {old_ov}→{args.temporal_overlap}")
+
+    return ", ".join(changes) if changes else "no further mitigations available"
+
+
+def _run_with_auto_tune(process_fn, args: "argparse.Namespace",
+                        on_success=None, max_attempts: int = 5) -> int:
+    """Run ``process_fn`` and, when Auto Tune is on, retry through OOM.
+
+    On a CUDA OOM the allocator caches are flushed and memory-hungry settings are
+    progressively relaxed via :func:`_apply_oom_mitigation` so processing recovers
+    automatically instead of crashing. Non-OOM errors, or OOMs once Auto Tune is
+    disabled/exhausted, propagate unchanged.
+    """
+    attempts = 0
+    while True:
+        try:
+            frames = process_fn()
+            if on_success is not None:
+                on_success()
+            return frames
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as err:
+            if not getattr(args, "auto_tune", False) or attempts >= max_attempts:
+                raise
+            if not _is_oom_error(err):
+                raise
+            attempts += 1
+            if hasattr(torch, "cuda"):
+                torch.cuda.empty_cache()
+            gc.collect()
+            summary = _apply_oom_mitigation(args, attempts)
+            debug.log(
+                f"Auto Tune: OOM detected, relaxing settings ({summary}) "
+                f"[attempt {attempts}/{max_attempts}]",
+                category="setup", force=True,
+            )
 
 
 def process_single_file(input_path: str, args: "argparse.Namespace", device_list: "List[str]",
@@ -2147,7 +2309,8 @@ Examples:
     debug_group = parser.add_argument_group('Debugging')
     debug_group.add_argument("--auto_tune", action="store_true",
                         help="Enable Auto Tune: performs pre-flight VRAM detection, forces VAE tile overlap "
-                             "to 32, and automatically reduces batch size on OOM (up to 5 retries).")
+                             "to 32, and on OOM automatically relaxes settings and retries (up to 5 times) by "
+                             "shrinking batch size, enabling/tightening VAE tiling, and reducing temporal overlap.")
     debug_group.add_argument("--debug", action="store_true",
                         help="Enable verbose debug logging")
     
@@ -2357,33 +2520,16 @@ def main() -> None:
                     video_backend=args.video_backend, from_directory=True,
                 )
                 
-                # Process with explicit output path and runner cache
-                _auto_tune_attempts = 0
-                _auto_tune_max_attempts = 5
-                while True:
-                    try:
-                        frames = process_single_file(file_path, args, device_list, output_path,
-                                                    format_auto_detected=format_auto_detected,
-                                                    runner_cache=runner_cache)
-                        total_frames_processed += frames
-                        _release_post_file_resources()
-                        break
-                    except (torch.cuda.OutOfMemoryError, RuntimeError) as _oom_err:
-                        if not getattr(args, 'auto_tune', False) or _auto_tune_attempts >= _auto_tune_max_attempts:
-                            raise
-                        if 'out of memory' not in str(_oom_err).lower() and not isinstance(_oom_err, torch.cuda.OutOfMemoryError):
-                            raise
-                        _auto_tune_attempts += 1
-                        if hasattr(torch, 'cuda'):
-                            torch.cuda.empty_cache()
-                        gc.collect()
-                        old_bs = args.batch_size
-                        args.batch_size = max(1, args.batch_size - 4)
-                        debug.log(
-                            f"Auto Tune: OOM detected, reducing batch_size {old_bs}→{args.batch_size} "
-                            f"(attempt {_auto_tune_attempts}/{_auto_tune_max_attempts})",
-                            category="setup", force=True
-                        )
+                # Process with explicit output path and runner cache. Auto Tune
+                # (when enabled) recovers from OOM by relaxing settings and retrying.
+                total_frames_processed += _run_with_auto_tune(
+                    lambda: process_single_file(
+                        file_path, args, device_list, output_path,
+                        format_auto_detected=format_auto_detected,
+                        runner_cache=runner_cache),
+                    args,
+                    on_success=_release_post_file_resources,
+                )
                 
                 # Restore original format
                 args.output_format = original_format
@@ -2434,31 +2580,13 @@ def main() -> None:
                         category="tip", force=True
                     )
             
-            _auto_tune_attempts = 0
-            _auto_tune_max_attempts = 5
-            while True:
-                try:
-                    frames = process_single_file(args.input, args, device_list, args.output,
-                                                format_auto_detected=format_auto_detected,
-                                                runner_cache=runner_cache)
-                    total_frames_processed += frames
-                    break
-                except (torch.cuda.OutOfMemoryError, RuntimeError) as _oom_err:
-                    if not getattr(args, 'auto_tune', False) or _auto_tune_attempts >= _auto_tune_max_attempts:
-                        raise
-                    if 'out of memory' not in str(_oom_err).lower() and not isinstance(_oom_err, torch.cuda.OutOfMemoryError):
-                        raise
-                    _auto_tune_attempts += 1
-                    if hasattr(torch, 'cuda'):
-                        torch.cuda.empty_cache()
-                    gc.collect()
-                    old_bs = args.batch_size
-                    args.batch_size = max(1, args.batch_size - 4)
-                    debug.log(
-                        f"Auto Tune: OOM detected, reducing batch_size {old_bs}→{args.batch_size} "
-                        f"(attempt {_auto_tune_attempts}/{_auto_tune_max_attempts})",
-                        category="setup", force=True
-                    )
+            total_frames_processed += _run_with_auto_tune(
+                lambda: process_single_file(
+                    args.input, args, device_list, args.output,
+                    format_auto_detected=format_auto_detected,
+                    runner_cache=runner_cache),
+                args,
+            )
         
         else:
             debug.log(f"Unsupported input type: {args.input}", level="ERROR", category="file", force=True)
@@ -2477,6 +2605,8 @@ def main() -> None:
         
     except Exception as e:
         debug.log(f"Error during processing: {e}", level="ERROR", category="generation", force=True)
+        # Capture the exact GPU/RAM state before unwinding so crash reports are actionable.
+        _log_crash_diagnostics()
         import traceback
         traceback.print_exc()
         sys.exit(1)
