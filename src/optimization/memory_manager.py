@@ -361,14 +361,24 @@ def clear_memory(debug: Optional['Debug'] = None, deep: bool = False, force: boo
 def retry_on_oom(func, *args, debug=None, operation_name="operation", **kwargs):
     """
     Execute function with single OOM retry after memory cleanup.
-    
+
+    On OOM the function performs a strict three-step drain before retrying:
+      1. deep clear_memory() (gc + GPU cache)
+      2. torch.cuda.empty_cache() – releases all cached-but-unallocated ("ghost") blocks
+      3. torch.cuda.synchronize() – ensures the GPU has finished all pending work so
+         that the allocator sees an accurate free-memory picture before the retry
+
+    This sequence is essential on platforms where expandable_segments is not
+    supported (e.g. Windows), where ~1.5 GB of reserved-but-unallocated VRAM can
+    linger and trigger a second OOM on the retry.
+
     Args:
         func: Callable to execute
         *args: Positional arguments for func
         debug: Debug instance for logging (optional)
         operation_name: Name for logging
         **kwargs: Keyword arguments for func
-    
+
     Returns:
         Result of func(*args, **kwargs)
     """
@@ -378,17 +388,26 @@ def retry_on_oom(func, *args, debug=None, operation_name="operation", **kwargs):
         # Only handle OOM errors
         if not any(x in str(e).lower() for x in ["out of memory", "allocation on device"]):
             raise
-        
+
         if debug:
             debug.log(f"OOM during {operation_name}: {e}", level="WARNING", category="memory", force=True)
             debug.log(f"Clearing memory and retrying", category="info", force=True)
-        
-        # Clear memory
+
+        # Step 1: deep GC + GPU cache clear
         clear_memory(debug=debug, deep=True, force=True, timer_name=operation_name)
+
+        # Step 2 & 3: strict CUDA drain to reclaim ghost memory
+        # (reserved-but-unallocated blocks that clear_memory alone may not release)
+        if is_cuda_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
         # Let memory settle
         time.sleep(0.5)
-        debug.log_memory_state("After memory clearing", show_tensors=False, detailed_tensors=False)
-        
+
+        if debug:
+            debug.log_memory_state("After memory clearing", show_tensors=False, detailed_tensors=False)
+
         # Single retry
         try:
             result = func(*args, **kwargs)

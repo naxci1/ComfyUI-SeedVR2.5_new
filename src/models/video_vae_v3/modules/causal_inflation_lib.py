@@ -201,13 +201,30 @@ class InflatedCausalConv3d(Conv3d):
             # Update cache.
             cache = next_cache
 
-        output = retry_on_oom(
-            torch.cat,
-            x,
-            split_dim,
-            debug=getattr(self, 'debug', None),
-            operation_name="InflatedCausalConv3d.concat_splits"
-        )
+        # Pre-allocate a single contiguous output block before concatenating the
+        # split results.  This prevents the fragmentation pattern that causes OOM
+        # during Phase 3 VAE decoding on platforms without expandable_segments
+        # (e.g. Windows with 10-bit ProRes 422 HQ export).
+        try:
+            total_dim_size = sum(xi.size(split_dim) for xi in x)
+            out_shape = list(x[0].shape)
+            out_shape[split_dim] = total_dim_size
+            output = torch.empty(
+                out_shape,
+                dtype=x[0].dtype,
+                device=x[0].device,
+                memory_format=torch.contiguous_format,
+            )
+            torch.cat(x, dim=split_dim, out=output)
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as _pre_alloc_err:
+            # Fall back to the standard retry path if pre-allocation itself OOMs.
+            output = retry_on_oom(
+                torch.cat,
+                x,
+                split_dim,
+                debug=getattr(self, 'debug', None),
+                operation_name="InflatedCausalConv3d.concat_splits"
+            )
         return output
 
     def forward(
@@ -270,7 +287,9 @@ class InflatedCausalConv3d(Conv3d):
             and cache_size != 0
         ):
             if cache_size > input[-1].size(2) and cache is not None and len(input) == 1:
-                input[0] = torch.cat([cache, input[0]], dim=2)
+                # Cast cache to the input dtype to avoid float32 upcasting during
+                # concatenation, which can trigger OOM in the 10-bit ProRes pipeline.
+                input[0] = torch.cat([cache.to(dtype=input[0].dtype), input[0]], dim=2)
                 cache = None
             if cache_size <= input[-1].size(2):
                 self.memory = input[-1][:, :, -cache_size:].detach().contiguous()
@@ -287,7 +306,9 @@ class InflatedCausalConv3d(Conv3d):
                 cache_size = get_cache_size(self, input[i].size(2) + cache_len, pad_len=0)
             if cache_size != 0:
                 if cache_size > input[i].size(2) and cache is not None:
-                    input[i] = torch.cat([cache, input[i]], dim=2)
+                    # Cast cache to the input dtype to avoid float32 upcasting during
+                    # concatenation, which can trigger OOM in the 10-bit ProRes pipeline.
+                    input[i] = torch.cat([cache.to(dtype=input[i].dtype), input[i]], dim=2)
                     cache = None
                 assert cache_size <= input[i].size(2), f"{cache_size} > {input[i].size(2)}"
                 next_cache = input[i][:, :, -cache_size:]
