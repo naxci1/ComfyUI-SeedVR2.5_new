@@ -628,64 +628,6 @@ def generate_output_path(input_path: str, output_format: str, output_dir: Option
         output_path = base_dir / f"{input_name}.png"
         return str(ensure_unique_output_path(output_path).resolve())
 
-
-def _normalize_output_path_for_target(
-        output_path: str,
-        output_format: Optional[str],
-        input_type: str,
-        video_backend: str,
-) -> str:
-        """
-        Normalize output paths so extension/target type matches requested export mode.
-        """
-        path = Path(output_path).resolve()
-        fmt = (output_format or "mp4").lower()
-
-        if input_type == "image":
-            # Image pipeline always writes a single image file.
-            target_ext = f".{fmt}" if f".{fmt}" in _IMAGE_OUTPUT_EXTS else ".png"
-            if path.suffix.lower() != target_ext:
-                debug.log(
-                    f"Output extension '{path.suffix or '<none>'}' is invalid for image output; "
-                    f"using '{target_ext}'.",
-                    level="WARNING",
-                    category="file",
-                    force=True,
-                )
-                path = path.with_suffix(target_ext)
-            return str(path)
-
-        # Video input + image sequence export writes into a directory.
-        if fmt in _IMAGE_SEQUENCE_FORMATS:
-            if path.suffix:
-                debug.log(
-                    f"Image-sequence export requested ({fmt}); removing file extension "
-                    f"'{path.suffix}' to use directory output.",
-                    level="WARNING",
-                    category="file",
-                    force=True,
-                )
-                path = path.with_suffix("")
-            return str(path)
-
-        # Video export path: enforce container extension from --output_format.
-        target_ext = _VIDEO_CONTAINER_EXTS.get(fmt, f".{fmt}")
-        if path.suffix.lower() != target_ext:
-            debug.log(
-                f"Output extension '{path.suffix or '<none>'}' does not match "
-                f"--output_format '{fmt}'; using '{target_ext}'.",
-                level="WARNING",
-                category="file",
-                force=True,
-            )
-            path = path.with_suffix(target_ext)
-
-        # ffmpeg backend always writes a video stream target, never an image file.
-        if video_backend == "ffmpeg" and path.suffix.lower() in _IMAGE_OUTPUT_EXTS:
-            path = path.with_suffix(target_ext)
-
-        return str(path)
-
     # Generate output path based on format
     if output_format == "png":
         # PNG sequence: output is a directory, not a file
@@ -695,8 +637,66 @@ def _normalize_output_path_for_target(
         fmt_lower = (output_format or "mp4").lower()
         ext = _VIDEO_CONTAINER_EXTS.get(fmt_lower, f".{fmt_lower}")
         output_path = base_dir / f"{input_name}{ext}"
-    
+
     return str(ensure_unique_output_path(output_path).resolve())
+
+
+def _normalize_output_path_for_target(
+    output_path: str,
+    output_format: Optional[str],
+    input_type: str,
+    video_backend: str,
+) -> str:
+    """
+    Normalize output paths so extension/target type matches requested export mode.
+    """
+    path = Path(output_path).resolve()
+    fmt = (output_format or "mp4").lower()
+
+    if input_type == "image":
+        # Image pipeline always writes a single image file.
+        target_ext = f".{fmt}" if f".{fmt}" in _IMAGE_OUTPUT_EXTS else ".png"
+        if path.suffix.lower() != target_ext:
+            debug.log(
+                f"Output extension '{path.suffix or '<none>'}' is invalid for image output; "
+                f"using '{target_ext}'.",
+                level="WARNING",
+                category="file",
+                force=True,
+            )
+            path = path.with_suffix(target_ext)
+        return str(path)
+
+    # Video input + image sequence export writes into a directory.
+    if fmt in _IMAGE_SEQUENCE_FORMATS:
+        if path.suffix:
+            debug.log(
+                f"Image-sequence export requested ({fmt}); removing file extension "
+                f"'{path.suffix}' to use directory output.",
+                level="WARNING",
+                category="file",
+                force=True,
+            )
+            path = path.with_suffix("")
+        return str(path)
+
+    # Video export path: enforce container extension from --output_format.
+    target_ext = _VIDEO_CONTAINER_EXTS.get(fmt, f".{fmt}")
+    if path.suffix.lower() != target_ext:
+        debug.log(
+            f"Output extension '{path.suffix or '<none>'}' does not match "
+            f"--output_format '{fmt}'; using '{target_ext}'.",
+            level="WARNING",
+            category="file",
+            force=True,
+        )
+        path = path.with_suffix(target_ext)
+
+    # ffmpeg backend always writes a video stream target, never an image file.
+    if video_backend == "ffmpeg" and path.suffix.lower() in _IMAGE_OUTPUT_EXTS:
+        path = path.with_suffix(target_ext)
+
+    return str(path)
 
 
 def ensure_unique_output_path(path: Path | str) -> Path:
