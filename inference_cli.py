@@ -1394,8 +1394,10 @@ def _process_frames_core(
         if runner_cache is not None:
             runner_cache['ctx'] = ctx
 
-    # Propagate Auto Tune flag into ctx so generation phases can read it
+    # Propagate Auto Tune flag into ctx so generation phases can read it.
+    # Keep the legacy key for compatibility with any older code paths.
     ctx['auto_tune'] = getattr(args, 'auto_tune', False)
+    ctx['auto_safeguard'] = ctx['auto_tune']
 
     # Build torch compile args
     torch_compile_args_dit = None

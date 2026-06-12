@@ -991,18 +991,20 @@ def decode_all_batches(
             except Exception:
                 pass  # ComfyUI not installed – fall through to tiled decode path
 
+            auto_tune_enabled = bool(ctx.get('auto_tune', ctx.get('auto_safeguard', False)))
+
             # ── Tile-size auto-reduction safeguard ──────────────────────────────
-            # When --auto_safeguard is active AND tiled VAE decode is on with a
+            # When --auto_tune is active AND tiled VAE decode is on with a
             # large tile (e.g. 720) AND the batch exceeds 16 frames at 720p, the
             # peak pixel-space tensor can spill 2+ GB into Windows Shared System
             # RAM without raising an OOM error.  Drop the tile size to (512, 512)
             # for this batch and restore it afterwards so subsequent smaller batches
             # still benefit from the user's preferred setting.
-            # When --auto_safeguard is NOT set, user-defined tile sizes are always
+            # When --auto_tune is NOT set, user-defined tile sizes are always
             # respected exactly as specified.
             _orig_decode_tile_size = None
             num_frames_check = upscaled_latent.shape[0]
-            if (ctx.get('auto_safeguard', False)
+            if (auto_tune_enabled
                     and runner.decode_tiled
                     and num_frames_check > 16
                     and runner.decode_tile_size is not None
@@ -1010,7 +1012,7 @@ def decode_all_batches(
                 _orig_decode_tile_size = runner.decode_tile_size
                 runner.decode_tile_size = (512, 512)
                 debug.log(
-                    f"[Auto Safeguard] Reducing VAE decode tile size from "
+                    f"[Auto Tune] Reducing VAE decode tile size from "
                     f"{_orig_decode_tile_size} to (512, 512) for "
                     f"{num_frames_check}-frame batch to prevent VRAM overflow "
                     "into Windows Shared RAM",
@@ -1018,17 +1020,17 @@ def decode_all_batches(
                 )
 
             # ── Micro-chunk basket cap ───────────────────────────────────────────
-            # When --auto_safeguard is active, cap micro-chunk decode at 8 frames
+            # When --auto_tune is active, cap micro-chunk decode at 8 frames
             # per pass for batches exceeding 16 frames as an additional safety net
             # against silent shared-RAM spillover.
-            # Without --auto_safeguard, the VRAM headroom check above still applies
+            # Without --auto_tune, the VRAM headroom check above still applies
             # but the hard 8-frame cap is not imposed.
-            if (ctx.get('auto_safeguard', False)
+            if (auto_tune_enabled
                     and _micro_chunk_size == 0
                     and num_frames_check > 16):
                 _micro_chunk_size = 8
                 debug.log(
-                    f"[Auto Safeguard] Activating precautionary 8-frame micro-chunk "
+                    f"[Auto Tune] Activating precautionary 8-frame micro-chunk "
                     f"VAE decode ({num_frames_check} frames total > 16-frame safe "
                     "threshold)",
                     category="memory", force=True
