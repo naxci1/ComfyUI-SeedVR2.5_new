@@ -83,7 +83,9 @@ if platform.system() == "Darwin":
     os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
     os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.0")
 else:
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
+    # Force max_split_size_mb to prevent fragmentation during Phase 3 VAE decoding
+    # on platforms without expandable_segments (e.g. Windows with 10-bit ProRes/AV1).
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
 
     # Pre-parse arguments that must be handled before torch import
     _pre_parser = argparse.ArgumentParser(add_help=False)
@@ -782,35 +784,9 @@ def process_single_file(input_path: str, args: "argparse.Namespace", device_list
         if input_type == "image" and Path(output_path).suffix.lower() not in _IMAGE_OUTPUT_EXTS:
             output_path = str(Path(output_path).with_suffix(".png").resolve())
 
-        # Guard: video/directory inputs must never write to an image-extension path when the
-        # requested output format is a video container.  This fixes the BrokenPipeError that
-        # occurs when FFmpeg is told to write ProRes/H.265/etc. into a path ending with .png,
-        # .jpg, or another image suffix (e.g. GUI preview paths like preview_frame_001.png).
-        if input_type in ("video", "directory") and args.output_format not in ("png",):
-            fmt_lower = (args.output_format or "mp4").lower()
-            correct_ext = _VIDEO_CONTAINER_EXTS.get(fmt_lower, f".{fmt_lower}")
-            if Path(output_path).suffix.lower() in _IMAGE_OUTPUT_EXTS:
-                output_path = str(Path(output_path).with_suffix(correct_ext).resolve())
-                debug.log(
-                    f"Output path extension corrected to '{correct_ext}' to match "
-                    f"container '{args.output_format}' (was an image extension)",
-                    category="info", force=True, indent_level=1
-                )
-
-        # Codec-container compatibility gate: when --ffmpeg_video_args is supplied the
-        # user's codec selection drives the container choice.  If the current output_path
-        # extension is incompatible with the codec (e.g. ProRes in .mp4), correct the
-        # extension so ffmpeg never receives an invalid combination.
-        _custom_ffmpeg = getattr(args, "ffmpeg_video_args", None)
-        if _custom_ffmpeg and input_type in ("video", "directory") and args.output_format not in ("png",):
-            _codec = _extract_codec_from_ffmpeg_args(_custom_ffmpeg)
-            corrected_fmt, _warn = _resolve_output_format_for_codec(
-                _codec, args.output_format or "mp4"
-            )
-            if _warn:
-                correct_ext = _VIDEO_CONTAINER_EXTS.get(corrected_fmt, f".{corrected_fmt}")
-                output_path = str(Path(output_path).with_suffix(correct_ext).resolve())
-                debug.log(_warn, level="WARNING", category="setup", force=True, indent_level=1)
+        # Extension and codec-container auto-correction is intentionally disabled.
+        # The pipeline respects the user-provided output path and extension as-is,
+        # and passes ffmpeg_video_args to FFmpeg without modification.
     
         # Show format with auto-detection indicator
         format_prefix = "Auto-detected" if format_auto_detected else "Requested"
@@ -2110,15 +2086,8 @@ def main() -> None:
         # Force ffmpeg backend when custom args are given
         args.video_backend = "ffmpeg"
 
-        # Pre-check: if --output_format was explicitly provided by the user, validate now
-        # (before any path generation) that the codec is compatible with the container.
-        # This is the earliest point we can guarantee that ffmpeg_video_args is a parsed list.
-        if args.output_format is not None:
-            _codec = _extract_codec_from_ffmpeg_args(args.ffmpeg_video_args)
-            corrected, _warn = _resolve_output_format_for_codec(_codec, args.output_format)
-            if _warn:
-                debug.log(_warn, level="WARNING", category="setup", force=True)
-                args.output_format = corrected
+        # Codec-container pre-check is intentionally disabled.
+        # args.output_format is used as provided by the caller without modification.
     
     if args.video_backend == "ffmpeg" and shutil.which("ffmpeg") is None:
         debug.log("--video_backend ffmpeg requires ffmpeg in PATH. Install ffmpeg and retry.", 

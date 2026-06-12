@@ -123,7 +123,17 @@ class InflatedCausalConv3d(Conv3d):
         # Compatible with no limit.
         if math.isinf(self.memory_limit):
             if prev_cache is not None:
-                x = torch.cat([prev_cache, x], dim=split_dim - 1)
+                # Pre-allocate output to avoid intermediate buffer from torch.cat.
+                _dim = split_dim - 1
+                _cl = prev_cache.size(_dim)
+                _xl = x.size(_dim)
+                _shape = list(x.shape)
+                _shape[_dim] = _cl + _xl
+                _buf = torch.empty(_shape, dtype=x.dtype, device=x.device,
+                                   memory_format=torch.contiguous_format)
+                _buf.narrow(_dim, 0, _cl).copy_(prev_cache)
+                _buf.narrow(_dim, _cl, _xl).copy_(x)
+                x = _buf
             return super().forward(x)
 
         # Compute tensor shape after concat & padding.
@@ -135,7 +145,17 @@ class InflatedCausalConv3d(Conv3d):
         if memory_occupy < self.memory_limit or split_dim == x.ndim:
             x_concat = x
             if prev_cache is not None:
-                x_concat = torch.cat([prev_cache, x], dim=split_dim - 1)
+                # Pre-allocate output to avoid intermediate buffer from torch.cat.
+                _dim = split_dim - 1
+                _cl = prev_cache.size(_dim)
+                _xl = x.size(_dim)
+                _shape = list(x.shape)
+                _shape[_dim] = _cl + _xl
+                _buf = torch.empty(_shape, dtype=x.dtype, device=x.device,
+                                   memory_format=torch.contiguous_format)
+                _buf.narrow(_dim, 0, _cl).copy_(prev_cache)
+                _buf.narrow(_dim, _cl, _xl).copy_(x)
+                x_concat = _buf
             
             def pad_and_forward():
                 padded = safe_pad_operation(x_concat, padding, mode='constant', value=0.0)
@@ -162,9 +182,19 @@ class InflatedCausalConv3d(Conv3d):
         # Loop Fwd.
         cache = None
         for idx in range(len(x)):
-            # Concat prev cache from last dim
+            # Concat prev cache from last dim using pre-allocation to avoid
+            # intermediate tensor buffers that trigger OOM under VRAM pressure.
             if prev_cache is not None:
-                x[idx] = torch.cat([prev_cache[idx], x[idx]], dim=split_dim - 1)
+                _dim = split_dim - 1
+                _cl = prev_cache[idx].size(_dim)
+                _xl = x[idx].size(_dim)
+                _shape = list(x[idx].shape)
+                _shape[_dim] = _cl + _xl
+                _buf = torch.empty(_shape, dtype=x[idx].dtype, device=x[idx].device,
+                                   memory_format=torch.contiguous_format)
+                _buf.narrow(_dim, 0, _cl).copy_(prev_cache[idx])
+                _buf.narrow(_dim, _cl, _xl).copy_(x[idx])
+                x[idx] = _buf
 
             # Get padding pattern.
             lpad_dim = (x[idx].ndim - split_dim - 1) * 2
