@@ -50,6 +50,7 @@ import gc
 import json
 import argparse
 import time
+import shlex
 import platform
 import multiprocessing as mp
 from typing import Dict, Any, List, Optional, Tuple, Literal, Generator
@@ -273,10 +274,20 @@ class FFMPEGVideoWriter:
         if lut_path:
             filter_args = ['-vf', f'lut3d={lut_path}']
 
+        ffmpeg_cmd = [
+            'ffmpeg', '-y', '-f', 'rawvideo', '-pix_fmt', 'rgb24',
+            '-s', f'{width}x{height}', '-r', str(fps), '-i', '-',
+            *filter_args, *video_enc_args, path
+        ]
+        if debug.enabled:
+            debug.log(
+                f"FFmpeg command: {' '.join(shlex.quote(str(part)) for part in ffmpeg_cmd)}",
+                category="file",
+                force=True,
+            )
+
         self.proc = subprocess.Popen(
-            ['ffmpeg', '-y', '-f', 'rawvideo', '-pix_fmt', 'rgb24',
-             '-s', f'{width}x{height}', '-r', str(fps), '-i', '-',
-             *filter_args, *video_enc_args, path],
+            ffmpeg_cmd,
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
     
@@ -484,6 +495,7 @@ def get_input_type(input_path: str) -> Literal['video', 'image', 'directory', 'u
 
 
 _IMAGE_OUTPUT_EXTS = frozenset({".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp"})
+_IMAGE_SEQUENCE_FORMATS = frozenset({"png", "tif", "tiff", "jpg", "jpeg", "dpx", "exr"})
 _VIDEO_CONTAINER_EXTS: Dict[str, str] = {
     "mp4": ".mp4",
     "mov": ".mov",
@@ -615,6 +627,64 @@ def generate_output_path(input_path: str, output_format: str, output_dir: Option
     if input_type == "image":
         output_path = base_dir / f"{input_name}.png"
         return str(ensure_unique_output_path(output_path).resolve())
+
+
+def _normalize_output_path_for_target(
+        output_path: str,
+        output_format: Optional[str],
+        input_type: str,
+        video_backend: str,
+) -> str:
+        """
+        Normalize output paths so extension/target type matches requested export mode.
+        """
+        path = Path(output_path).resolve()
+        fmt = (output_format or "mp4").lower()
+
+        if input_type == "image":
+            # Image pipeline always writes a single image file.
+            target_ext = f".{fmt}" if f".{fmt}" in _IMAGE_OUTPUT_EXTS else ".png"
+            if path.suffix.lower() != target_ext:
+                debug.log(
+                    f"Output extension '{path.suffix or '<none>'}' is invalid for image output; "
+                    f"using '{target_ext}'.",
+                    level="WARNING",
+                    category="file",
+                    force=True,
+                )
+                path = path.with_suffix(target_ext)
+            return str(path)
+
+        # Video input + image sequence export writes into a directory.
+        if fmt in _IMAGE_SEQUENCE_FORMATS:
+            if path.suffix:
+                debug.log(
+                    f"Image-sequence export requested ({fmt}); removing file extension "
+                    f"'{path.suffix}' to use directory output.",
+                    level="WARNING",
+                    category="file",
+                    force=True,
+                )
+                path = path.with_suffix("")
+            return str(path)
+
+        # Video export path: enforce container extension from --output_format.
+        target_ext = _VIDEO_CONTAINER_EXTS.get(fmt, f".{fmt}")
+        if path.suffix.lower() != target_ext:
+            debug.log(
+                f"Output extension '{path.suffix or '<none>'}' does not match "
+                f"--output_format '{fmt}'; using '{target_ext}'.",
+                level="WARNING",
+                category="file",
+                force=True,
+            )
+            path = path.with_suffix(target_ext)
+
+        # ffmpeg backend always writes a video stream target, never an image file.
+        if video_backend == "ffmpeg" and path.suffix.lower() in _IMAGE_OUTPUT_EXTS:
+            path = path.with_suffix(target_ext)
+
+        return str(path)
 
     # Generate output path based on format
     if output_format == "png":
@@ -772,22 +842,24 @@ def process_single_file(input_path: str, args: "argparse.Namespace", device_list
         debug.log(f"Processing {input_type}: {Path(input_path).name}", category="generation", force=True)
         
         # Generate or validate output path
+        requested_format = (args.output_format or "").lower()
         if output_path is None:
             output_path = generate_output_path(input_path, args.output_format, input_type=input_type)
-        elif not Path(output_path).suffix or (args.output_format == "png" and input_type != "image"):
+        elif not Path(output_path).suffix or (requested_format in _IMAGE_SEQUENCE_FORMATS and input_type != "image"):
             # No extension or PNG sequence → treat as directory, generate filename
             output_path = generate_output_path(input_path, args.output_format, 
                                              output_dir=output_path, input_type=input_type)
         else:
-            output_path = str(ensure_unique_output_path(output_path).resolve())
-        
-        # Guard: image inputs must never write to a video-extension path (OpenCV imwrite crash)
-        if input_type == "image" and Path(output_path).suffix.lower() not in _IMAGE_OUTPUT_EXTS:
-            output_path = str(Path(output_path).with_suffix(".png").resolve())
+            output_path = str(Path(output_path).resolve())
 
-        # Extension and codec-container auto-correction is intentionally disabled.
-        # The pipeline respects the user-provided output path and extension as-is,
-        # and passes ffmpeg_video_args to FFmpeg without modification.
+        # Normalize path/extension for selected output mode and backend.
+        output_path = _normalize_output_path_for_target(
+            output_path=output_path,
+            output_format=args.output_format,
+            input_type=input_type,
+            video_backend=args.video_backend,
+        )
+        output_path = str(ensure_unique_output_path(output_path).resolve())
     
         # Show format with auto-detection indicator
         format_prefix = "Auto-detected" if format_auto_detected else "Requested"
@@ -861,8 +933,7 @@ def process_single_file(input_path: str, args: "argparse.Namespace", device_list
                     )
             
             # Image sequences: detect by format extension, not just "png"
-            _image_seq_exts = {"png", "tif", "tiff", "jpg", "jpeg", "dpx", "exr"}
-            is_png = (args.output_format or "").lower() in _image_seq_exts
+            is_png = (args.output_format or "").lower() in _IMAGE_SEQUENCE_FORMATS
             overlap = args.temporal_overlap
             frames_written = 0
             chunk_idx = 0
@@ -1216,6 +1287,18 @@ def save_frames_to_video(
     T, H, W, C = frames_tensor.shape
 
     effective_backend = video_backend if video_backend in ("ffmpeg", "opencv") else "ffmpeg"
+    output_suffix = Path(output_path).suffix.lower()
+
+    if effective_backend == "ffmpeg":
+        if output_suffix in _IMAGE_OUTPUT_EXTS:
+            raise ValueError(
+                f"FFmpeg backend requires a video container path, got image extension '{output_suffix}' "
+                f"for output '{output_path}'."
+            )
+        if not output_suffix:
+            raise ValueError(
+                f"FFmpeg backend requires an explicit video file extension for output '{output_path}'."
+            )
 
     if writer is None:
         debug.log(f"Saving {T} frames to video: {output_path} (backend={effective_backend})", category="file")
