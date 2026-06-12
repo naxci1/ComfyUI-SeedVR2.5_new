@@ -2394,26 +2394,12 @@ class MainWindow(QMainWindow):
     def _resolve_export_output_dir(self) -> Path:
         """Return the base output directory for all generated files.
 
-        The default for every operation (Preview, Upscale, Split) is the parent
-        directory of the input file, i.e. ``os.path.dirname(input_file)``. A
-        configured output path is only honored when the user *explicitly*
-        selected it (via Browse or manual typing); auto-derived or restored
-        values are ignored so outputs are never written to a stale/arbitrary
-        location.
+        The output (and temp) location is always *exactly* the parent directory
+        of the input file (``os.path.dirname(input_file)``) for every operation
+        (Preview, Upscale, Split). No subfolders or nested directories are ever
+        created, and configured/user-selected output paths are intentionally
+        ignored so that every generated file lands directly beside the input.
         """
-        if getattr(self._folders_dlg, "output_user_selected", False):
-            out_raw = self._folders_dlg.output_edit.text().strip()
-            if out_raw:
-                out_path = Path(out_raw)
-                # Existing directory => use it.
-                if out_path.exists() and out_path.is_dir():
-                    return out_path
-                # If user entered a file-like path, use its parent directory.
-                if out_path.suffix:
-                    return out_path.parent if str(out_path.parent) else Path.cwd()
-                # Non-existing path without suffix: treat as target directory.
-                return out_path
-        # Default: the directory containing the input file.
         inp = self._folders_dlg.input_edit.text().strip()
         if inp:
             inp_path = Path(inp)
@@ -2812,13 +2798,11 @@ class MainWindow(QMainWindow):
         args.append(inp)
 
         # output
-        # Only honor an explicit, user-selected output path. Auto-derived or
-        # restored values are ignored so that, by default, every output lands in
-        # the input file's parent directory (handled by the branches below and
-        # _resolve_export_output_dir).
-        out = self._folders_dlg.output_edit.text().strip()
-        if not getattr(self._folders_dlg, "output_user_selected", False):
-            out = ""
+        # The output is always forced to the input file's parent directory
+        # (resolved via _resolve_export_output_dir). User-selected, auto-derived
+        # and restored output paths are all ignored so that every generated file
+        # lands directly beside the input with no subfolders.
+        out = ""
         if self._is_preview_run:
             export_dir = self._resolve_export_output_dir()
             if self._is_preview_video_mode:
@@ -4272,7 +4256,10 @@ class MainWindow(QMainWindow):
         if success:
             self.status_label.setText(f"✅  {msg}")
             self.status_label.setToolTip(msg)
-            self._try_auto_load_output()
+            # For non-preview runs use the heuristic auto-loader; preview runs
+            # load the two generated TIFF files explicitly below.
+            if not was_preview:
+                self._try_auto_load_output()
             # Feed completed output path into the split tracking context so that
             # multi-part chunk compilation can resolve input→output mappings.
             if not was_preview and self._latest_output_path is not None:
@@ -4292,23 +4279,40 @@ class MainWindow(QMainWindow):
                     _winsound.MessageBeep(_winsound.MB_ICONASTERISK)
                 except Exception:
                     pass
-            # After a Preview run, automatically switch to Split View for comparison
-            if was_preview and _MULTIMEDIA_AVAILABLE:
-                self._preview_compare_active = self._latest_output_path is not None
-                # For image-mode preview: load the captured input frame into the left
-                # side of the split view BEFORE restoring the input_edit path so the
-                # viewer shows original-vs-upscaled rather than blank-vs-upscaled.
-                preview_temp = getattr(self, "_preview_temp_path", None)
-                if preview_temp and self._split_view is not None and not self._is_preview_video_mode:
+            # As soon as the preview upscale finishes, automatically trigger and
+            # open the split-screen comparison view (SplitViewWidget) using the
+            # two generated TIFF files: the captured preview input frame and the
+            # upscaled output – both living directly in the input file's dir.
+            if was_preview and _MULTIMEDIA_AVAILABLE and self._split_view is not None:
+                preview_in = getattr(self, "_preview_temp_path", None)
+                preview_out = self._folders_dlg.output_edit.text().strip()
+                loaded_out = False
+                # Left side: captured original frame (image-mode preview only).
+                if preview_in and not self._is_preview_video_mode:
                     try:
-                        pix = QPixmap(preview_temp)
-                        if not pix.isNull():
-                            self._split_view.set_input_image(pix.toImage())
+                        pix_in = QPixmap(preview_in)
+                        if not pix_in.isNull():
+                            self._split_view.set_input_image(pix_in.toImage())
                     except Exception:
                         pass
+                # Right side: upscaled TIFF written by the CLI.
+                if preview_out and Path(preview_out).is_file():
+                    try:
+                        pix_out = QPixmap(preview_out)
+                        if not pix_out.isNull():
+                            self._split_view.set_output_image(pix_out.toImage())
+                            self._set_latest_output_path(Path(preview_out))
+                            loaded_out = True
+                    except Exception:
+                        pass
+                # Fallback to the heuristic loader (e.g. video-mode previews).
+                if not loaded_out:
+                    self._try_auto_load_output()
+                self._preview_compare_active = self._latest_output_path is not None
                 if self._preview_original_input_path:
                     self._folders_dlg.input_mode_combo.setCurrentText(self._preview_original_input_mode)
                     self._folders_dlg.input_edit.setText(self._preview_original_input_path)
+                # Open the split-screen comparison view.
                 self._mode_split_btn.setChecked(True)
                 self._on_mode_button(2, True)
         else:
