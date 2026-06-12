@@ -3704,9 +3704,21 @@ class MainWindow(QMainWindow):
         Split View mode has an immediate preview without waiting for the player.
         """
         import tempfile
+        import os as _os
         try:
-            fd, tmp_path = tempfile.mkstemp(suffix="_frame0.png", prefix="seedvr2_preview_")
-            import os as _os
+            # Force the temporary working directory to the absolute parent
+            # directory of the input file, overriding the default system temp
+            # path. Fall back to the system temp dir only if that location is
+            # unavailable/unwritable.
+            try:
+                temp_dir = str(Path(video_path).resolve().parent)
+                if not (temp_dir and _os.path.isdir(temp_dir) and _os.access(temp_dir, _os.W_OK)):
+                    temp_dir = None
+            except Exception:
+                temp_dir = None
+            fd, tmp_path = tempfile.mkstemp(
+                suffix="_frame0.png", prefix="seedvr2_preview_", dir=temp_dir
+            )
             _os.close(fd)  # close fd so ffmpeg can write to the path
             result = subprocess.run(
                 [
