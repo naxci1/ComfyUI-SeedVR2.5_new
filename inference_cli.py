@@ -2578,12 +2578,22 @@ def main() -> None:
     # a stray ".png"). When --output_format is auto-detected (None) the canonical
     # reconciliation later in main() resolves the final path instead.
     if getattr(args, "output", None) and getattr(args, "output_format", None):
-        base_path = os.path.splitext(args.output)[0]
+        base_path, output_ext = os.path.splitext(args.output)
         fmt = args.output_format.lower()
         if fmt in _IMAGE_SEQUENCE_FORMATS:
-            # Image-sequence export writes a directory of frames, not a single
-            # file, so strip any extension and use the bare base path.
-            args.output = base_path
+            if output_ext.lower() in _IMAGE_OUTPUT_EXTS:
+                # The caller supplied a direct image file path (e.g. a
+                # "..._preview_upscaled.tiff"). Honor it as an exact filename so
+                # the image is written directly to that path (only its parent
+                # directory is created) instead of treating the path as a
+                # directory and dropping a frame sequence inside a new subfolder.
+                target_ext = f".{fmt}" if f".{fmt}" in _IMAGE_OUTPUT_EXTS else output_ext
+                args.output = f"{base_path}{target_ext}"
+            else:
+                # No image extension → image-sequence export writes a directory
+                # of frames, not a single file, so strip any extension and use
+                # the bare base path.
+                args.output = base_path
         else:
             ext = _VIDEO_CONTAINER_EXTS.get(fmt, f".{fmt}")
             args.output = f"{base_path}{ext}"
