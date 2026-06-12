@@ -34,9 +34,9 @@ from PyQt6.QtWidgets import (
 )
 
 try:
-    from gui.config_manager import load_config, save_config, DEFAULT_PATHS
+    from gui.config_manager import load_config, save_config, DEFAULT_PATHS, INVALID_PATHS
 except ImportError:
-    from config_manager import load_config, save_config, DEFAULT_PATHS  # type: ignore[no-redef]
+    from config_manager import load_config, save_config, DEFAULT_PATHS, INVALID_PATHS  # type: ignore[no-redef]
 
 try:
     from gui.worker import DEFAULT_PYTHON_EXE
@@ -196,6 +196,17 @@ class SettingsWindow(QDialog):
         info.setWordWrap(True)
         info.setStyleSheet("color:#888; font-size:10px; padding:4px 0;")
         dir_layout.addWidget(info)
+
+        # Warning banner – shown when one or more paths could not be resolved.
+        self._invalid_paths_warning = QLabel()
+        self._invalid_paths_warning.setWordWrap(True)
+        self._invalid_paths_warning.setStyleSheet(
+            "color:#fff; background:#b03030; border-radius:4px;"
+            " padding:6px 8px; font-size:11px;"
+        )
+        self._invalid_paths_warning.hide()
+        dir_layout.addWidget(self._invalid_paths_warning)
+
         dir_layout.addStretch(1)
 
         tabs.addTab(dir_tab, "Directory Setup")
@@ -286,6 +297,35 @@ class SettingsWindow(QDialog):
             self.model_dir_edit.setText(path)
 
     # ------------------------------------------------------------------
+    # Invalid-paths warning
+    # ------------------------------------------------------------------
+
+    def _refresh_invalid_paths_warning(self) -> None:
+        """Show or hide the warning banner based on INVALID_PATHS."""
+        try:
+            from gui.config_manager import INVALID_PATHS as _ip
+        except ImportError:
+            from config_manager import INVALID_PATHS as _ip  # type: ignore[no-redef]
+
+        if not _ip:
+            self._invalid_paths_warning.hide()
+            return
+
+        _label_map = {
+            "python_exe": "Python Executable",
+            "ffmpeg_path": "FFmpeg Executable",
+            "models_dir": "Models Directory",
+            "seedvr2_folder": "SeedVR2 Script Folder",
+        }
+        names = ", ".join(_label_map.get(k, k) for k in sorted(_ip))
+        self._invalid_paths_warning.setText(
+            "⚠  The following path(s) could not be found automatically and "
+            "need to be set manually:<br><b>{}</b><br>"
+            "Please use the <b>Browse…</b> buttons above to locate them.".format(names)
+        )
+        self._invalid_paths_warning.show()
+
+    # ------------------------------------------------------------------
     # Settings persistence (config.json + QSettings for back-compat)
     # ------------------------------------------------------------------
 
@@ -312,6 +352,9 @@ class SettingsWindow(QDialog):
         self.model_dir_edit.setText(
             _get("models_dir", "model_dir", "")
         )
+
+        # Refresh the invalid-paths warning banner.
+        self._refresh_invalid_paths_warning()
 
     def save_settings(self) -> None:
         """Write current field values to config.json (and QSettings)."""

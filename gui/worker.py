@@ -34,9 +34,17 @@ _CREATE_NEW_PROCESS_GROUP: int = 0x00000200 if sys.platform == "win32" else 0
 # Resolved dynamically from config.json / ROOT_DIR so the application works
 # from any installation path.  The user can still override it in the GUI.
 try:
-    from gui.config_manager import load_config as _load_config, DEFAULT_PATHS as _DEFAULT_PATHS
+    from gui.config_manager import (
+        load_config as _load_config,
+        DEFAULT_PATHS as _DEFAULT_PATHS,
+        ROOT_DIR as _ROOT_DIR,
+    )
 except ImportError:
-    from config_manager import load_config as _load_config, DEFAULT_PATHS as _DEFAULT_PATHS  # type: ignore[no-redef]
+    from config_manager import (  # type: ignore[no-redef]
+        load_config as _load_config,
+        DEFAULT_PATHS as _DEFAULT_PATHS,
+        ROOT_DIR as _ROOT_DIR,
+    )
 
 try:
     _cfg = _load_config()
@@ -47,6 +55,10 @@ finally:
     del _load_config, _DEFAULT_PATHS
     try:
         del _cfg
+    except NameError:
+        pass
+    try:
+        del _ROOT_DIR
     except NameError:
         pass
 
@@ -76,9 +88,14 @@ def resolve_paths(seedvr2_folder: str = "", python_exe: str = "") -> tuple[str, 
 
     # ── 1. PyInstaller bundle ───────────────────────────────────────────
     if hasattr(sys, "_MEIPASS"):
-        base = Path(sys._MEIPASS)
-        python_exe = str(base / "python_embedded" / "python.exe")
-        cli_script = str(base / "inference_cli.py")
+        try:
+            from gui.config_manager import ROOT_DIR as _bundle_root
+        except ImportError:
+            from config_manager import ROOT_DIR as _bundle_root  # type: ignore[no-redef]
+        python_exe = os.path.normpath(
+            os.path.join(str(_bundle_root), "python_embeded", "python.exe")
+        )
+        cli_script = str(Path(str(_bundle_root)) / "inference_cli.py")
         return python_exe, cli_script
 
     # ── 2. User-supplied SeedVR2 folder only (no explicit python_exe) ───
