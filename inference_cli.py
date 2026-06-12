@@ -488,12 +488,94 @@ _VIDEO_CONTAINER_EXTS: Dict[str, str] = {
     "webm": ".webm",
     "avi": ".avi",
 }
+
+# Codec name substrings that mandate a specific output container format.
+# Codecs absent from this map are assumed to work in any standard container.
+_CODEC_REQUIRED_FORMAT: Dict[str, str] = {
+    "prores": "mov",   # Apple ProRes family (prores_ks, prores, prores_lt, prores_xe …)
+    "dnxhd": "mov",    # Avid DNxHD
+    "dnxhr": "mov",    # Avid DNxHR (HD and UHD variants)
+}
+
+# Containers that carry an explicit codec allow-list.
+# Containers NOT listed here are considered permissive (e.g. MKV accepts almost anything).
+_FORMAT_ALLOWED_CODEC_PATTERNS: Dict[str, frozenset] = {
+    "mp4": frozenset({
+        "h264", "libx264", "hevc", "libx265", "h265", "avc",
+        "h264_nvenc", "hevc_nvenc", "h264_amf", "hevc_amf",
+        "h264_qsv", "hevc_qsv", "av1", "libaom", "vp9", "mpeg4",
+    }),
+    "webm": frozenset({"vp8", "vp9", "av1", "libaom", "libvpx"}),
+}
+
 OUTPUT_FILE_PREFIX = "seedvr_"
 SECONDS_PER_MINUTE = 60.0
 
 
 def _seedvr_prefixed_name(name: str) -> str:
     return name if name.startswith(OUTPUT_FILE_PREFIX) else f"{OUTPUT_FILE_PREFIX}{name}"
+
+
+def _extract_codec_from_ffmpeg_args(ffmpeg_args: Optional[List[str]]) -> Optional[str]:
+    """Return the value of the -c:v flag in ffmpeg_args, or None if absent."""
+    if not ffmpeg_args:
+        return None
+    for idx, token in enumerate(ffmpeg_args):
+        if token == "-c:v" and idx + 1 < len(ffmpeg_args):
+            return ffmpeg_args[idx + 1]
+    return None
+
+
+def _resolve_output_format_for_codec(
+    codec: Optional[str],
+    requested_format: str,
+) -> Tuple[str, Optional[str]]:
+    """
+    Validate that *codec* is compatible with *requested_format* container.
+
+    Returns ``(final_format, warning_message)`` where *warning_message* is a
+    human-readable string when a correction was made, or ``None`` when the
+    requested format was already valid.
+
+    Rules applied in order:
+      1. Codec has a required container and *requested_format* matches → accept.
+      2. Codec has a required container and *requested_format* does NOT match →
+         correct to the required container and return a warning.
+      3. *requested_format* has a strict allow-list and the codec is not in it →
+         correct to the codec's required format (or "mov" as a safe fallback).
+      4. No conflict → return *requested_format* unchanged.
+    """
+    if codec is None:
+        return requested_format, None
+
+    codec_lower = codec.lower()
+
+    # Check whether this codec mandates a specific container.
+    req_format: Optional[str] = None
+    for pattern, fmt in _CODEC_REQUIRED_FORMAT.items():
+        if pattern in codec_lower:
+            req_format = fmt
+            break
+
+    if req_format is not None and req_format != requested_format:
+        msg = (
+            f"Codec '{codec}' requires container '{req_format}' "
+            f"(requested: '{requested_format}') — output format corrected to '{req_format}'."
+        )
+        return req_format, msg
+
+    # Check whether the requested container explicitly disallows this codec.
+    allowed = _FORMAT_ALLOWED_CODEC_PATTERNS.get(requested_format)
+    if allowed is not None:
+        if not any(pat in codec_lower for pat in allowed):
+            fallback = req_format or "mov"
+            msg = (
+                f"Codec '{codec}' is not supported in container '{requested_format}' "
+                f"— output format corrected to '{fallback}'."
+            )
+            return fallback, msg
+
+    return requested_format, None
 
 
 def generate_output_path(input_path: str, output_format: str, output_dir: Optional[str] = None, 
@@ -714,6 +796,21 @@ def process_single_file(input_path: str, args: "argparse.Namespace", device_list
                     f"container '{args.output_format}' (was an image extension)",
                     category="info", force=True, indent_level=1
                 )
+
+        # Codec-container compatibility gate: when --ffmpeg_video_args is supplied the
+        # user's codec selection drives the container choice.  If the current output_path
+        # extension is incompatible with the codec (e.g. ProRes in .mp4), correct the
+        # extension so ffmpeg never receives an invalid combination.
+        _custom_ffmpeg = getattr(args, "ffmpeg_video_args", None)
+        if _custom_ffmpeg and input_type in ("video", "directory") and args.output_format not in ("png",):
+            _codec = _extract_codec_from_ffmpeg_args(_custom_ffmpeg)
+            corrected_fmt, _warn = _resolve_output_format_for_codec(
+                _codec, args.output_format or "mp4"
+            )
+            if _warn:
+                correct_ext = _VIDEO_CONTAINER_EXTS.get(corrected_fmt, f".{corrected_fmt}")
+                output_path = str(Path(output_path).with_suffix(correct_ext).resolve())
+                debug.log(_warn, level="WARNING", category="setup", force=True, indent_level=1)
     
         # Show format with auto-detection indicator
         format_prefix = "Auto-detected" if format_auto_detected else "Requested"
@@ -2012,6 +2109,16 @@ def main() -> None:
             sys.exit(1)
         # Force ffmpeg backend when custom args are given
         args.video_backend = "ffmpeg"
+
+        # Pre-check: if --output_format was explicitly provided by the user, validate now
+        # (before any path generation) that the codec is compatible with the container.
+        # This is the earliest point we can guarantee that ffmpeg_video_args is a parsed list.
+        if args.output_format is not None:
+            _codec = _extract_codec_from_ffmpeg_args(args.ffmpeg_video_args)
+            corrected, _warn = _resolve_output_format_for_codec(_codec, args.output_format)
+            if _warn:
+                debug.log(_warn, level="WARNING", category="setup", force=True)
+                args.output_format = corrected
     
     if args.video_backend == "ffmpeg" and shutil.which("ffmpeg") is None:
         debug.log("--video_backend ffmpeg requires ffmpeg in PATH. Install ffmpeg and retry.", 
@@ -2112,10 +2219,21 @@ def main() -> None:
                     category="generation", force=True
                 )
                 
-                # Auto-detect format per file if not user-specified
+                # Auto-detect format per file if not user-specified.
+                # When --ffmpeg_video_args is provided, derive the default container from
+                # the codec rather than blindly using "mp4" — this lets ProRes, DNxHD, etc.
+                # select the correct container automatically.
                 if format_auto_detected:
                     file_type = get_input_type(file_path)
-                    file_output_format = "mp4" if file_type == "video" else "png"
+                    if file_type == "video":
+                        _codec = _extract_codec_from_ffmpeg_args(
+                            getattr(args, "ffmpeg_video_args", None)
+                        )
+                        file_output_format, _warn = _resolve_output_format_for_codec(_codec, "mp4")
+                        if _warn:
+                            debug.log(_warn, level="WARNING", category="setup", force=True)
+                    else:
+                        file_output_format = "png"
                 else:
                     file_output_format = args.output_format
                 
@@ -2138,9 +2256,19 @@ def main() -> None:
                 args.output_format = original_format
 
         elif input_type in ("video", "image"):
-            # Auto-detect output format for single file if not specified
+            # Auto-detect output format for single file if not specified.
+            # When --ffmpeg_video_args carries a codec, derive the container from it
+            # rather than defaulting to "mp4" unconditionally.
             if format_auto_detected:
-                args.output_format = "mp4" if input_type == "video" else "png"
+                if input_type == "video":
+                    _codec = _extract_codec_from_ffmpeg_args(
+                        getattr(args, "ffmpeg_video_args", None)
+                    )
+                    args.output_format, _warn = _resolve_output_format_for_codec(_codec, "mp4")
+                    if _warn:
+                        debug.log(_warn, level="WARNING", category="setup", force=True)
+                else:
+                    args.output_format = "png"
             
             # Caching: single-GPU streaming uses runner_cache, multi-GPU streaming workers cache internally
             runner_cache = None
