@@ -26,10 +26,12 @@ class TrimTimeline(QWidget):
     _HANDLE_W = 14
     _HANDLE_H = 24
     _GRAB = 20
+    _TRACK_Y = 20
+    _BAR_HEIGHT = 20
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.setMinimumHeight(Dims.TRIM_HEIGHT + 24)
+        self.setMinimumHeight(72)
         self.setMouseTracking(True)
 
         self._frame_count = 0
@@ -114,7 +116,7 @@ class TrimTimeline(QWidget):
     # ---------------------------------------------------------------- geometry
     def _track_rect(self) -> QRectF:
         m = self._HANDLE_W
-        return QRectF(m, 20, self.width() - 2 * m, Dims.TRIM_HEIGHT)
+        return QRectF(m, self._TRACK_Y, self.width() - 2 * m, self._BAR_HEIGHT)
 
     def _frame_from_x(self, x: float) -> int:
         track = self._track_rect()
@@ -164,10 +166,18 @@ class TrimTimeline(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
         track = self._track_rect()
+        total_frames = max(0, self._frame_count)
 
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(Colors.SCRUB_TRACK))
         painter.drawRoundedRect(track, 4, 4)
+
+        # Tick marks.
+        painter.setPen(QPen(QColor(Colors.TEXT_SECONDARY), 1))
+        for i in range(21):
+            frac = i / 20.0
+            x = int(track.left() + track.width() * frac)
+            painter.drawLine(x, int(track.top()) - 6, x, int(track.top()) - 2)
 
         in_x = self._x_from_frame(self._in)
         out_x = self._x_from_frame(self._out)
@@ -201,23 +211,25 @@ class TrimTimeline(QWidget):
         painter.setPen(Qt.NoPen)
         painter.drawPolygon(tri)
 
-        # Timecode markers below track.
+        # Endpoint frame/time labels below track.
         painter.setPen(QColor(Colors.TEXT_SECONDARY))
         font = painter.font()
         font.setFamily(Fonts.FAMILY_MONO)
         font.setPointSize(Fonts.SIZE_TINY)
         painter.setFont(font)
-        marks = 6
-        for i in range(marks + 1):
-            frac = i / marks
-            frame = int(frac * max(0, self._frame_count - 1))
-            x = self._x_from_frame(frame)
-            painter.drawText(
-                QRectF(x - 24, track.bottom() + 2, 48, 14),
-                Qt.AlignCenter,
-                self.frame_to_timecode(frame),
-            )
+        right_frame = total_frames
+        left_time = "00:00"
+        right_time = self._format_mmss(total_frames / self._fps if self._fps > 0 else 0.0)
+        painter.drawText(QRectF(track.left(), track.bottom() + 2, 64, 14), Qt.AlignLeft, "0")
+        painter.drawText(QRectF(track.left(), track.bottom() + 16, 64, 14), Qt.AlignLeft, left_time)
+        painter.drawText(QRectF(track.right() - 64, track.bottom() + 2, 64, 14), Qt.AlignRight, str(right_frame))
+        painter.drawText(QRectF(track.right() - 64, track.bottom() + 16, 64, 14), Qt.AlignRight, right_time)
         painter.end()
+
+    @staticmethod
+    def _format_mmss(total_seconds: float) -> str:
+        seconds = max(0, int(total_seconds))
+        return f"{seconds // 60:02d}:{seconds % 60:02d}"
 
     def _draw_handle(self, painter: QPainter, x: float, color: QColor) -> None:
         track = self._track_rect()

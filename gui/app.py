@@ -201,8 +201,6 @@ class MainWindow(QMainWindow):
         self._current_phase_index = 0
 
         self._build_ui()
-        # Build hidden io_bar for path tracking.
-        self.io_bar = self._build_io_bar()
         self._connect_signals()
         self.input_path_edit.setText(self._config.get("input_path", ""))
         self.output_path_edit.setText(self._config.get("output_path", ""))
@@ -231,6 +229,10 @@ class MainWindow(QMainWindow):
         root.addWidget(center, 1)
 
         center_layout.addWidget(self._build_header())
+        self.io_bar = self._build_io_bar()
+        center_layout.addWidget(self.io_bar)
+        self.view_mode_bar = self._build_view_mode_bar()
+        center_layout.addWidget(self.view_mode_bar)
 
         self.center_stack = QStackedWidget(self)
         self.drop_zone = DropZone(self)
@@ -398,9 +400,8 @@ class MainWindow(QMainWindow):
             self._show_comparison(original_path, processed_path)
 
     def _build_io_bar(self) -> QWidget:
-        """Legacy I/O path bar (still built for internal path tracking)."""
+        """Visible I/O path bar above preview."""
         widget = QWidget(self)
-        widget.setVisible(False)  # Hidden — replaced by view mode buttons.
         layout = QHBoxLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(Dims.PADDING_SM)

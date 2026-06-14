@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Set
 
-from PySide6.QtCore import QSize, Qt, Signal, QTimer
+from PySide6.QtCore import QEvent, QSize, Qt, Signal, QTimer
+from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -26,6 +27,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QScrollArea,
     QSlider,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -241,6 +243,8 @@ class SettingsPanel(QWidget):
         self._trim_out_frame = 0
         self._trim_frame_count = 0
         self._trim_active = False
+        self._tooltip_widgets: Set[QWidget] = set()
+        self._tooltip_target: Optional[QWidget] = None
         self._forms: List[QFormLayout] = []
         self._model_fallback = [
             "seedvr2_ema_3b_fp8_e4m3fn.safetensors",
@@ -260,6 +264,10 @@ class SettingsPanel(QWidget):
         self._vram_timer.setInterval(300)
         self._vram_timer.timeout.connect(self._update_vram_prediction)
         self.settings_changed.connect(self._vram_timer.start)
+        self._tooltip_timer = QTimer(self)
+        self._tooltip_timer.setSingleShot(True)
+        self._tooltip_timer.setInterval(3000)
+        self._tooltip_timer.timeout.connect(self._show_delayed_tooltip)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, Dims.PADDING_LG, 0)
@@ -288,6 +296,7 @@ class SettingsPanel(QWidget):
         self._layout.addStretch(1)
 
         self._update_resolution_mode()
+        self._update_pre_downscale_visibility()
         self._update_vae_controls()
         self._update_vram_prediction()
 
@@ -336,6 +345,14 @@ class SettingsPanel(QWidget):
         self._preset_name_edit.setPlaceholderText("Preset name…")
         self._save_preset_btn = Button3D("Save", variant="default", parent=box)
         self._save_preset_btn.clicked.connect(self._on_save_preset)
+        self._set_setting_tooltip(
+            self._preset_name_edit,
+            "Name for a reusable settings profile. Save to quickly recall the same configuration.",
+        )
+        self._set_setting_tooltip(
+            self._save_preset_btn,
+            "Save current settings to the preset name entered on the left.",
+        )
         btn_row.addWidget(self._preset_name_edit, 1)
         btn_row.addWidget(self._save_preset_btn)
         vlay.addLayout(btn_row)
@@ -351,6 +368,10 @@ class SettingsPanel(QWidget):
         self._preset_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self._preset_list.customContextMenuRequested.connect(self._on_preset_context_menu)
         self._preset_list.itemDoubleClicked.connect(self._on_load_preset)
+        self._set_setting_tooltip(
+            self._preset_list,
+            "Saved presets. Double-click to load. Right-click to update, rename, or delete.",
+        )
         vlay.addWidget(self._preset_list)
 
         del_lbl = QLabel("(double-click to load • right-click to update)", box)
@@ -456,6 +477,15 @@ class SettingsPanel(QWidget):
                 self.resolution_scale_combo.setCurrentText(str(settings["resolution_scale"]))
             if "resolution_presets" in settings:
                 self.resolution_presets_combo.setCurrentText(str(settings["resolution_presets"]))
+            if "pre_downscale" in settings:
+                raw_downscale = str(settings["pre_downscale"]).strip()
+                if raw_downscale in {"0", "1", "1:1"}:
+                    self.pre_downscale_toggle.setChecked(False)
+                else:
+                    ratio = f"1:{raw_downscale}" if ":" not in raw_downscale else raw_downscale
+                    if ratio in {"1:2", "1:3", "1:4", "1:5"}:
+                        self.pre_downscale_combo.setCurrentText(ratio)
+                        self.pre_downscale_toggle.setChecked(True)
             if "batch_size" in settings:
                 self.batch_size_spin.setValue(int(settings["batch_size"]))
             if "auto_tune" in settings:
@@ -474,6 +504,25 @@ class SettingsPanel(QWidget):
 
     def _label(self, text: str) -> QLabel:
         return QLabel(text)
+
+    def _set_setting_tooltip(self, widget: QWidget, tooltip: str, label: Optional[QLabel] = None) -> None:
+        if not tooltip:
+            return
+        widget.setToolTip(tooltip)
+        if widget not in self._tooltip_widgets:
+            widget.installEventFilter(self)
+            self._tooltip_widgets.add(widget)
+        if label is not None:
+            label.setToolTip(tooltip)
+            if label not in self._tooltip_widgets:
+                label.installEventFilter(self)
+                self._tooltip_widgets.add(label)
+
+    def _add_row(self, form: QFormLayout, label_text: str, field: QWidget, tooltip: str) -> QLabel:
+        label = self._label(label_text)
+        form.addRow(label, field)
+        self._set_setting_tooltip(field, tooltip, label=label)
+        return label
 
     def _spin(self, minimum: int, maximum: int, value: int, step: int = 1, formatter=None, parser=None) -> NumericSlider:
         spin = NumericSlider(minimum, maximum, value, step=step, formatter=formatter, parser=parser)
@@ -507,6 +556,32 @@ class SettingsPanel(QWidget):
             formatter=lambda v: f"{v / 100.0:.2f}",
             parser=lambda text: int(round(float(text.strip()) * 100.0)),
         )
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if isinstance(obj, QWidget) and obj in self._tooltip_widgets:
+            event_type = event.type()
+            if event_type in (QEvent.Enter, QEvent.FocusIn):
+                self._tooltip_target = obj
+                self._tooltip_timer.start()
+            elif event_type in (QEvent.Leave, QEvent.FocusOut, QEvent.Hide):
+                if self._tooltip_target is obj:
+                    self._tooltip_target = None
+                    self._tooltip_timer.stop()
+                QToolTip.hideText()
+            elif event_type == QEvent.ToolTip:
+                return True
+        return super().eventFilter(obj, event)
+
+    def _show_delayed_tooltip(self) -> None:
+        target = self._tooltip_target
+        if target is None:
+            return
+        text = target.toolTip()
+        if not text:
+            return
+        if not target.underMouse():
+            return
+        QToolTip.showText(QCursor.pos(), text, target)
 
     def _populate_cuda_devices(self) -> None:
         self.cuda_device_list.clear()
@@ -570,19 +645,58 @@ class SettingsPanel(QWidget):
         self.max_resolution_toggle = self._toggle(True)
         self.max_resolution_toggle.toggled.connect(self._update_resolution_mode)
         self.max_resolution_spin = self._spin(128, 7680, 3840, 1)
-        self.pre_downscale_combo = self._combo(["1:1", "1:2"], "1:1")
+        self.pre_downscale_toggle = self._toggle(False)
+        self.pre_downscale_toggle.toggled.connect(self._update_pre_downscale_visibility)
+        self.pre_downscale_combo = self._combo(["1:2", "1:3", "1:4", "1:5"], "1:2")
 
-        self._resolution_label = self._label("Resolution")
-        self._resolution_scale_label = self._label("Scale")
-        self._resolution_presets_label = self._label("Preset")
-
-        form.addRow(self._label("Mode"), self.resolution_mode_combo)
-        form.addRow(self._resolution_label, self.resolution_spin)
-        form.addRow(self._resolution_scale_label, self.resolution_scale_combo)
-        form.addRow(self._resolution_presets_label, self.resolution_presets_combo)
-        form.addRow(self._label("Max resolution"), self.max_resolution_toggle)
-        form.addRow(self._label("Max px"), self.max_resolution_spin)
-        form.addRow(self._label("Pre-downscale"), self.pre_downscale_combo)
+        self._add_row(
+            form,
+            "Mode",
+            self.resolution_mode_combo,
+            "How output size is defined: fixed pixels, scale multiplier, or preset resolution.",
+        )
+        self._resolution_label = self._add_row(
+            form,
+            "Resolution",
+            self.resolution_spin,
+            "Target short-side resolution in pixels when Mode is pixel.",
+        )
+        self._resolution_scale_label = self._add_row(
+            form,
+            "Scale",
+            self.resolution_scale_combo,
+            "Upscale multiplier when Mode is xtimes.",
+        )
+        self._resolution_presets_label = self._add_row(
+            form,
+            "Preset",
+            self.resolution_presets_combo,
+            "Common output resolution presets.",
+        )
+        self._add_row(
+            form,
+            "Max resolution",
+            self.max_resolution_toggle,
+            "Enable a hard cap for output resolution regardless of mode.",
+        )
+        self._add_row(
+            form,
+            "Max px",
+            self.max_resolution_spin,
+            "Maximum allowed output short-side pixels when Max resolution is enabled.",
+        )
+        self._add_row(
+            form,
+            "Pre-downscale",
+            self.pre_downscale_toggle,
+            "Enable pre-downscaling before processing to reduce VRAM usage.",
+        )
+        self._pre_downscale_ratio_label = self._add_row(
+            form,
+            "Downscale ratio",
+            self.pre_downscale_combo,
+            "Pre-downscale ratio when enabled. Larger reduction lowers VRAM use but can lose detail.",
+        )
 
     def _build_model_group(self) -> None:
         form = self._group("MODEL & PERFORMANCE", advanced_only=True)
@@ -599,30 +713,90 @@ class SettingsPanel(QWidget):
         self.use_10bit_toggle = self._toggle(True)
         self.debug_toggle = self._toggle(False)
 
-        form.addRow(self._label("DiT model"), self.dit_model_combo)
-        form.addRow(self._label("Attention"), self.attention_mode_combo)
-        form.addRow(self._label("Auto tune"), self.auto_tune_toggle)
-        form.addRow(self._label("Cache DiT"), self.cache_dit_toggle)
-        form.addRow(self._label("Cache VAE"), self.cache_vae_toggle)
-        form.addRow(self._label("10-bit output"), self.use_10bit_toggle)
-        form.addRow(self._label("Debug"), self.debug_toggle)
+        self._add_row(
+            form,
+            "DiT model",
+            self.dit_model_combo,
+            "AI model for upscaling. 3B is faster; 7B can improve detail quality.",
+        )
+        self._add_row(
+            form,
+            "Attention",
+            self.attention_mode_combo,
+            "Attention backend implementation. sage_attn_3 is generally the recommended default.",
+        )
+        self._add_row(
+            form,
+            "Auto tune",
+            self.auto_tune_toggle,
+            "Automatic OOM recovery by reducing workload and retrying when GPU memory is exceeded.",
+        )
+        self._add_row(
+            form,
+            "Cache DiT",
+            self.cache_dit_toggle,
+            "Keep DiT resources cached between phases for speed at the cost of extra VRAM.",
+        )
+        self._add_row(
+            form,
+            "Cache VAE",
+            self.cache_vae_toggle,
+            "Keep VAE resources cached between phases for speed at the cost of extra VRAM.",
+        )
+        self._add_row(
+            form,
+            "10-bit output",
+            self.use_10bit_toggle,
+            "Prefer 10-bit output formats when available to reduce banding artifacts.",
+        )
+        self._add_row(
+            form,
+            "Debug",
+            self.debug_toggle,
+            "Enable verbose debug logging and diagnostics output.",
+        )
 
     def _build_runtime_group(self) -> None:
         form = self._group("RUNTIME", advanced_only=True)
         self.uniform_batch_toggle = self._toggle(True)
         self.batch_size_spin = self._spin(1, 200, 81, 4)
-        self.load_cap_spin = self._spin(0, 999999, 0)
-        self.skip_first_frames_spin = self._spin(0, 999999, 0)
+        self.load_cap_spin = self._spin(0, 1000, 0)
+        self.skip_first_frames_spin = self._spin(0, 1000, 0)
         self.only_frames_edit = _FrameListLineEdit(self)
         self.only_frames_edit.setPlaceholderText("e.g. 1,5,9")
         self.only_frames_edit.textChanged.connect(self._emit_settings_changed)
         self.only_frames_edit.validated.connect(self._emit_settings_changed)
 
-        form.addRow(self._label("Uniform batch"), self.uniform_batch_toggle)
-        form.addRow(self._label("Batch size"), self.batch_size_spin)
-        form.addRow(self._label("Load cap"), self.load_cap_spin)
-        form.addRow(self._label("Skip first frames"), self.skip_first_frames_spin)
-        form.addRow(self._label("Only frames"), self.only_frames_edit)
+        self._add_row(
+            form,
+            "Uniform batch",
+            self.uniform_batch_toggle,
+            "Keep all processing batches the same size for predictable VRAM usage.",
+        )
+        self._add_row(
+            form,
+            "Batch size",
+            self.batch_size_spin,
+            "Number of frames processed simultaneously. Higher is faster but uses more VRAM.",
+        )
+        self._add_row(
+            form,
+            "Load cap",
+            self.load_cap_spin,
+            "Maximum number of frames to process from the source (0 means no cap).",
+        )
+        self._add_row(
+            form,
+            "Skip first frames",
+            self.skip_first_frames_spin,
+            "Number of initial frames to skip before processing begins.",
+        )
+        self._add_row(
+            form,
+            "Only frames",
+            self.only_frames_edit,
+            "Comma-separated list of exact frame indices to process.",
+        )
 
     def _build_batch_group(self) -> None:
         form = self._group("QUALITY")
@@ -635,44 +809,124 @@ class SettingsPanel(QWidget):
         self.temporal_overlap_spin = self._spin(0, 64, 8)
         self.prepend_frames_spin = self._spin(0, 16, 4)
 
-        form.addRow(self._label("Color correction"), self.color_correction_combo)
-        form.addRow(self._label("Input noise"), self.input_noise_slider)
-        form.addRow(self._label("Latent noise"), self.latent_noise_slider)
-        form.addRow(self._label("Temporal overlap"), self.temporal_overlap_spin)
-        form.addRow(self._label("Prepend frames"), self.prepend_frames_spin)
+        self._add_row(
+            form,
+            "Color correction",
+            self.color_correction_combo,
+            "Color matching mode for output frames. lab usually preserves source color most accurately.",
+        )
+        self._add_row(
+            form,
+            "Input noise",
+            self.input_noise_slider,
+            "Noise injected into input frames before processing. 0 disables extra input noise.",
+        )
+        self._add_row(
+            form,
+            "Latent noise",
+            self.latent_noise_slider,
+            "Noise scale applied in latent space during generation.",
+        )
+        self._add_row(
+            form,
+            "Temporal overlap",
+            self.temporal_overlap_spin,
+            "Overlap between adjacent batch segments to improve temporal consistency.",
+        )
+        self._add_row(
+            form,
+            "Prepend frames",
+            self.prepend_frames_spin,
+            "Number of preceding frames used as temporal context for each segment.",
+        )
 
     def _build_vae_group(self) -> None:
         form = self._group("VAE TILING", advanced_only=True)
         self.vae_encode_tiled_toggle = self._toggle(True)
         self.vae_encode_tiled_toggle.toggled.connect(self._update_vae_controls)
-        self.vae_encode_tile_size_spin = self._spin(128, 4096, 1024, 128)
-        self.vae_encode_tile_overlap_spin = self._spin(0, 512, 64)
+        self.vae_encode_tile_size_spin = self._spin(64, 8192, 1024, 1)
+        self.vae_encode_tile_overlap_spin = self._spin(0, 8192, 64, 1)
         self.vae_decode_tiled_toggle = self._toggle(True)
         self.vae_decode_tiled_toggle.toggled.connect(self._update_vae_controls)
-        self.vae_decode_tile_size_spin = self._spin(128, 4096, 1024, 128)
-        self.vae_decode_tile_overlap_spin = self._spin(0, 512, 64)
+        self.vae_decode_tile_size_spin = self._spin(64, 8192, 1024, 1)
+        self.vae_decode_tile_overlap_spin = self._spin(0, 8192, 64, 1)
 
-        form.addRow(self._label("Encode tiled"), self.vae_encode_tiled_toggle)
-        form.addRow(self._label("Encode tile size"), self.vae_encode_tile_size_spin)
-        form.addRow(self._label("Encode overlap"), self.vae_encode_tile_overlap_spin)
+        self._add_row(
+            form,
+            "Encode tiled",
+            self.vae_encode_tiled_toggle,
+            "Enable tiled VAE encoding to reduce VRAM usage on high-resolution frames.",
+        )
+        self._add_row(
+            form,
+            "Encode tile size",
+            self.vae_encode_tile_size_spin,
+            "Tile size for VAE encoding. Smaller tiles reduce VRAM but can be slower.",
+        )
+        self._add_row(
+            form,
+            "Encode overlap",
+            self.vae_encode_tile_overlap_spin,
+            "Overlap size between encoding tiles to reduce seam artifacts.",
+        )
         form.addRow(_separator())
-        form.addRow(self._label("Decode tiled"), self.vae_decode_tiled_toggle)
-        form.addRow(self._label("Decode tile size"), self.vae_decode_tile_size_spin)
-        form.addRow(self._label("Decode overlap"), self.vae_decode_tile_overlap_spin)
+        self._add_row(
+            form,
+            "Decode tiled",
+            self.vae_decode_tiled_toggle,
+            "Enable tiled VAE decoding to lower peak VRAM during frame reconstruction.",
+        )
+        self._add_row(
+            form,
+            "Decode tile size",
+            self.vae_decode_tile_size_spin,
+            "Tile size for VAE decoding. Smaller values use less VRAM and may run slower.",
+        )
+        self._add_row(
+            form,
+            "Decode overlap",
+            self.vae_decode_tile_overlap_spin,
+            "Overlap size between decoding tiles to reduce visible tile boundaries.",
+        )
 
     def _build_quality_group(self) -> None:
         form = self._group("OFFLOAD & BLOCKSWAP", advanced_only=True)
         self.dit_offload_device_combo = self._combo(["none", "cpu"], "none")
         self.vae_offload_device_combo = self._combo(["none", "cpu"], "cpu")
         self.tensor_offload_device_combo = self._combo(["none", "cpu"], "none")
-        self.blocks_to_swap_spin = self._spin(0, 200, 0)
+        self.blocks_to_swap_spin = self._spin(0, 36, 0)
         self.swap_io_components_check = self._check(False)
 
-        form.addRow(self._label("DiT offload"), self.dit_offload_device_combo)
-        form.addRow(self._label("VAE offload"), self.vae_offload_device_combo)
-        form.addRow(self._label("Tensor offload"), self.tensor_offload_device_combo)
-        form.addRow(self._label("Blocks to swap"), self.blocks_to_swap_spin)
-        form.addRow(self._label("Swap I/O components"), self.swap_io_components_check)
+        self._add_row(
+            form,
+            "DiT offload",
+            self.dit_offload_device_combo,
+            "Move DiT model blocks to CPU when possible to reduce GPU memory pressure.",
+        )
+        self._add_row(
+            form,
+            "VAE offload",
+            self.vae_offload_device_combo,
+            "Move VAE model data to CPU between phases to save VRAM.",
+        )
+        self._add_row(
+            form,
+            "Tensor offload",
+            self.tensor_offload_device_combo,
+            "Offload intermediate tensors to CPU memory to lower VRAM usage.",
+        )
+        self._add_row(
+            form,
+            "Blocks to swap",
+            self.blocks_to_swap_spin,
+            "Number of model blocks swapped to CPU. Higher saves VRAM but can reduce speed.",
+        )
+        self._add_row(
+            form,
+            "Swap I/O components",
+            self.swap_io_components_check,
+            "Also swap model input/output components when block swapping is enabled.",
+        )
 
     def _build_device_group(self) -> None:
         form = self._group("COMPILATION & DEVICES", advanced_only=True)
@@ -686,11 +940,36 @@ class SettingsPanel(QWidget):
         self.cuda_device_list.itemSelectionChanged.connect(self._emit_settings_changed)
         self._populate_cuda_devices()
 
-        form.addRow(self._label("Compile DiT"), self.compile_dit_check)
-        form.addRow(self._label("Compile VAE"), self.compile_vae_check)
-        form.addRow(self._label("Compile backend"), self.compile_backend_combo)
-        form.addRow(self._label("Compile mode"), self.compile_mode_combo)
-        form.addRow(self._label("CUDA device(s)"), self.cuda_device_list)
+        self._add_row(
+            form,
+            "Compile DiT",
+            self.compile_dit_check,
+            "Enable torch.compile for DiT to improve runtime speed after warmup.",
+        )
+        self._add_row(
+            form,
+            "Compile VAE",
+            self.compile_vae_check,
+            "Enable torch.compile for VAE for potential speed gains after initial compile time.",
+        )
+        self._add_row(
+            form,
+            "Compile backend",
+            self.compile_backend_combo,
+            "torch.compile backend implementation to use for graph execution.",
+        )
+        self._add_row(
+            form,
+            "Compile mode",
+            self.compile_mode_combo,
+            "Compilation optimization profile balancing compile time and runtime speed.",
+        )
+        self._add_row(
+            form,
+            "CUDA device(s)",
+            self.cuda_device_list,
+            "Select one or more CUDA devices used for processing.",
+        )
 
     def _build_vram_group(self) -> None:
         box = QGroupBox("ESTIMATED VRAM", self)
@@ -725,7 +1004,14 @@ class SettingsPanel(QWidget):
         self._set_field_visible(self.resolution_scale_combo, mode == "xtimes")
         self._set_field_visible(self.resolution_presets_combo, mode == "presets")
         self._set_field_visible(self.max_resolution_spin, self.max_resolution_toggle.isChecked())
+        self._update_pre_downscale_visibility(emit=False)
         self._emit_settings_changed()
+
+    def _update_pre_downscale_visibility(self, _checked: bool = False, emit: bool = True) -> None:
+        enabled = self.pre_downscale_toggle.isChecked()
+        self._set_field_visible(self.pre_downscale_combo, enabled)
+        if emit:
+            self._emit_settings_changed()
 
     def _update_vae_controls(self) -> None:
         encode_enabled = self.vae_encode_tiled_toggle.isChecked()
@@ -802,7 +1088,7 @@ class SettingsPanel(QWidget):
             "resolution_scale": self.resolution_scale_combo.currentText(),
             "resolution_presets": self.resolution_presets_combo.currentText(),
             "max_resolution": self.max_resolution_spin.value() if self.max_resolution_toggle.isChecked() else 0,
-            "pre_downscale": "2" if self.pre_downscale_combo.currentText() == "1:2" else "1",
+            "pre_downscale": self.pre_downscale_combo.currentText().split(":", 1)[1] if self.pre_downscale_toggle.isChecked() else "1",
             "dit_model": _filename_for_display(self.dit_model_combo.currentText()),
             "attention_mode": self.attention_mode_combo.currentText(),
             "auto_tune": self.auto_tune_toggle.isChecked(),
