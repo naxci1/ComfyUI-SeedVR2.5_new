@@ -88,8 +88,8 @@ else:
     # expandable_segments lets the CUDA allocator grow/shrink segment sizes on demand,
     # preventing the VRAM fragmentation that causes OOM during Phase 3 VAE decoding
     # (10.87 GiB allocated, 1.56 GiB reserved-but-unallocated, 1.32 GiB contiguous block missing).
-    # cudaMallocAsync further reduces fragmentation/allocation latency on recent CUDA runtimes.
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,backend:cudaMallocAsync"
+    # cudaNative is used instead of cudaMallocAsync to avoid the "ignores max_split_size_mb" warning.
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     # Pre-parse arguments that must be handled before torch import
     _pre_parser = argparse.ArgumentParser(add_help=False)

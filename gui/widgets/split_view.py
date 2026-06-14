@@ -72,9 +72,9 @@ class SplitViewWidget(QWidget):
         if event.button() == Qt.LeftButton:
             split_x = int(self._split_frac * self.width())
             near_divider = abs(event.position().x() - split_x) <= self._HANDLE_W * 2
-            if near_divider and self._zoom <= 1.0:
+            if near_divider:
                 self._dragging = True
-            elif self._zoom > 1.0 and not near_divider:
+            elif self._zoom > 1.0:
                 self._panning = True
                 self._last_mouse_pos = event.pos()
         super().mousePressEvent(event)
@@ -88,10 +88,12 @@ class SplitViewWidget(QWidget):
             self._last_mouse_pos = event.pos()
             self.update()
             return
-        if self._zoom > 1.0:
-            self.setCursor(Qt.OpenHandCursor if not self._panning else Qt.ClosedHandCursor)
+        if near or self._dragging:
+            self.setCursor(Qt.SplitHCursor)
+        elif self._zoom > 1.0:
+            self.setCursor(Qt.OpenHandCursor)
         else:
-            self.setCursor(Qt.SplitHCursor if near or self._dragging else Qt.ArrowCursor)
+            self.setCursor(Qt.ArrowCursor)
         if self._dragging and self.width() > 0:
             frac = event.position().x() / self.width()
             self._split_frac = max(0.01, min(0.99, frac))

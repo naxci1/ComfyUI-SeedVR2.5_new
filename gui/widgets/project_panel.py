@@ -131,6 +131,7 @@ class ProjectPanel(QWidget):
         super().__init__(parent)
         self.setFixedWidth(Dims.PANEL_WIDTH_LEFT)
         self._threads: List[QThread] = []
+        self._workers: list = []  # keep worker refs alive until thread finishes
         self._output_dir: str = ""
         self._item_widgets: dict = {}  # path → (QListWidgetItem, _FileItemWidget)
 
@@ -221,8 +222,16 @@ class ProjectPanel(QWidget):
             thread.quit()
 
         worker.done.connect(_apply)
-        thread.finished.connect(lambda t=thread: self._threads.remove(t) if t in self._threads else None)
+
+        def _cleanup(t=thread, w=worker) -> None:
+            if t in self._threads:
+                self._threads.remove(t)
+            if w in self._workers:
+                self._workers.remove(w)
+
+        thread.finished.connect(_cleanup)
         self._threads.append(thread)
+        self._workers.append(worker)
         thread.start()
 
     def _on_open_output_folder(self) -> None:
@@ -269,3 +278,4 @@ class ProjectPanel(QWidget):
             t.quit()
             t.wait(200)
         self._threads.clear()
+        self._workers.clear()

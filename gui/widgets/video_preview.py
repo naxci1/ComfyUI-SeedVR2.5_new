@@ -268,6 +268,14 @@ class VideoPreviewWidget(QWidget):
             self._pixmap = QPixmap.fromImage(_bgr_to_qimage(frame))
             self._current = idx
             self.frame_changed.emit(idx)
+            # Seek audio to the same position when not playing (playing keeps its own sync).
+            if not self._playing and self._media_player is not None:
+                try:
+                    fps = self._fps if self._fps > 0 else 25.0
+                    ms = int(idx / fps * 1000)
+                    self._media_player.setPosition(ms)
+                except Exception:
+                    pass
             self.update()
 
     # ---------------------------------------------------------------- events

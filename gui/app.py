@@ -200,6 +200,7 @@ class MainWindow(QMainWindow):
         self._log_viewer: Optional[LogViewer] = None
         self._preview_mode = "single"
         self._current_phase_index = 0
+        self._fs_win = None  # fullscreen overlay window reference
 
         self._build_ui()
         self._connect_signals()
@@ -372,6 +373,8 @@ class MainWindow(QMainWindow):
 
         if mode == "single":
             if self._current_file:
+                # Reload the original input so Single View always shows the source.
+                self.preview_widget.load_file(self._current_file)
                 self.center_stack.setCurrentWidget(self.preview_widget)
             else:
                 self.center_stack.setCurrentWidget(self.drop_zone)
@@ -384,7 +387,11 @@ class MainWindow(QMainWindow):
             Toast.show(self, "No split view to show fullscreen", "warning")
             return
         # Create a frameless fullscreen container.
+        # Store as instance attribute so Python's GC doesn't destroy it immediately.
         fs_win = QWidget(None, Qt.Window | Qt.FramelessWindowHint)
+        self._fs_win = fs_win
+        fs_win.setAttribute(Qt.WA_DeleteOnClose)
+        fs_win.destroyed.connect(lambda: setattr(self, "_fs_win", None))
         fs_win.setStyleSheet(f"background: {Colors.PREVIEW_BG};")
         layout = QVBoxLayout(fs_win)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -534,7 +541,6 @@ class MainWindow(QMainWindow):
         self.playback_controls.prev_frame_requested.connect(self.preview_widget.step_backward)
         self.playback_controls.next_frame_requested.connect(self.preview_widget.step_forward)
         self.playback_controls.mute_toggled.connect(self._on_mute_toggled)
-        self.playback_controls.snapshot_requested.connect(self._request_preview)
         self.playback_controls.trim_in_requested.connect(self._set_trim_in)
         self.playback_controls.trim_out_requested.connect(self._set_trim_out)
         self.playback_controls.trim_clear_requested.connect(self._clear_trim)
@@ -935,6 +941,10 @@ class MainWindow(QMainWindow):
         args += ["--seed", str(int(settings.get("seed", 313)))]
         args += ["--video_backend", str(settings.get("video_backend", "ffmpeg"))]
         args += ["--tile_debug", str(settings.get("tile_debug", "false"))]
+
+        chunk_minutes = int(settings.get("chunk_minutes", 0))
+        if chunk_minutes > 0:
+            args += ["--chunk_duration_minutes", str(chunk_minutes)]
 
         only_frames = str(settings.get("only_frames", "")).strip()
         if only_frames:

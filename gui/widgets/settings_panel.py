@@ -295,6 +295,7 @@ class SettingsPanel(QWidget):
         self._build_model_group()
         self._build_runtime_group()
         self._build_batch_group()
+        self._build_chunk_group()
         self._build_vae_group()
         self._build_quality_group()
         self._build_device_group()
@@ -981,6 +982,30 @@ class SettingsPanel(QWidget):
             "Number of preceding frames used as temporal context for each segment.",
         )
 
+    def _build_chunk_group(self) -> None:
+        form = self._group("CHUNK PROCESSING")
+        self.chunk_enabled_toggle = self._toggle(False)
+        self.chunk_minutes_spin = self._spin(1, 5, 3)
+        self.chunk_enabled_toggle.toggled.connect(self._update_chunk_visibility)
+
+        self._add_row(
+            form,
+            "Enable chunks",
+            self.chunk_enabled_toggle,
+            "Split long videos into timed segments and process them one at a time.",
+        )
+        self._chunk_minutes_label = self._add_row(
+            form,
+            "Chunk size (min)",
+            self.chunk_minutes_spin,
+            "Duration of each chunk in minutes (1-5). Frames per chunk = minutes × 60 × FPS.",
+        )
+        self._update_chunk_visibility()
+
+    def _update_chunk_visibility(self) -> None:
+        enabled = self.chunk_enabled_toggle.isChecked()
+        self._set_field_visible(self.chunk_minutes_spin, enabled)
+
     def _build_vae_group(self) -> None:
         form = self._group("VAE TILING", advanced_only=True)
         self.vae_encode_tiled_toggle = self._toggle(True)
@@ -1279,4 +1304,6 @@ class SettingsPanel(QWidget):
             "seed": 313,
             "video_backend": "ffmpeg",
             "tile_debug": "false",
+            "chunk_enabled": self.chunk_enabled_toggle.isChecked(),
+            "chunk_minutes": self.chunk_minutes_spin.value() if self.chunk_enabled_toggle.isChecked() else 0,
         }

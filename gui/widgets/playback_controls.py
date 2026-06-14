@@ -15,7 +15,6 @@ class PlaybackControls(QWidget):
     prev_frame_requested = Signal()
     next_frame_requested = Signal()
     mute_toggled = Signal(bool)
-    snapshot_requested = Signal()
     trim_in_requested = Signal()
     trim_out_requested = Signal()
     trim_clear_requested = Signal()
@@ -33,7 +32,6 @@ class PlaybackControls(QWidget):
         self.prev_btn = Button3D("⏮", variant="ghost", parent=self)
         self.next_btn = Button3D("⏭", variant="ghost", parent=self)
         self.mute_btn = Button3D("🔊", variant="ghost", parent=self)
-        self.snapshot_btn = Button3D("📷", variant="default", parent=self)
         self.trim_in_btn = Button3D("[", variant="ghost", parent=self)
         self.trim_in_btn.setToolTip("IN [")
         self.trim_clear_btn = Button3D("✕", variant="ghost", parent=self)
@@ -45,7 +43,6 @@ class PlaybackControls(QWidget):
         self.prev_btn.clicked.connect(self.prev_frame_requested.emit)
         self.next_btn.clicked.connect(self.next_frame_requested.emit)
         self.mute_btn.clicked.connect(self._toggle_mute)
-        self.snapshot_btn.clicked.connect(self.snapshot_requested.emit)
         self.trim_in_btn.clicked.connect(self.trim_in_requested.emit)
         self.trim_clear_btn.clicked.connect(self.trim_clear_requested.emit)
         self.trim_out_btn.clicked.connect(self.trim_out_requested.emit)
@@ -55,7 +52,6 @@ class PlaybackControls(QWidget):
             self.prev_btn,
             self.next_btn,
             self.mute_btn,
-            self.snapshot_btn,
             self.trim_in_btn,
             self.trim_clear_btn,
             self.trim_out_btn,
