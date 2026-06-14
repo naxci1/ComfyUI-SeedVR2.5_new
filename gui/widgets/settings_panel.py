@@ -101,6 +101,12 @@ class SettingsPanel(QWidget):
             "seedvr2_ema_7b_sharp-Q4_K_M.gguf",
         ]
 
+        self._vram_timer = QTimer(self)
+        self._vram_timer.setSingleShot(True)
+        self._vram_timer.setInterval(300)
+        self._vram_timer.timeout.connect(self._update_vram_prediction)
+        self.settings_changed.connect(self._vram_timer.start)
+
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
@@ -126,14 +132,9 @@ class SettingsPanel(QWidget):
         self._build_vram_group()
         self._layout.addStretch(1)
 
-        self._vram_timer = QTimer(self)
-        self._vram_timer.setSingleShot(True)
-        self._vram_timer.setInterval(200)
-        self._vram_timer.timeout.connect(self.update_vram_estimate)
-
         self._update_resolution_mode()
         self._update_vae_controls()
-        self.update_vram_estimate()
+        self._update_vram_prediction()
 
     def set_trim_range(self, trim_in: int, trim_out: int, frame_count: int, active: bool) -> None:
         self._trim_in_frame = max(0, int(trim_in))
@@ -417,9 +418,8 @@ class SettingsPanel(QWidget):
 
     def _emit_settings_changed(self) -> None:
         self.settings_changed.emit()
-        self._vram_timer.start()
 
-    def update_vram_estimate(self) -> None:
+    def _update_vram_prediction(self) -> None:
         settings = self.get_all_settings()
         resolution = settings["resolution"]
         if settings["resolution_mode"] == "presets":
@@ -455,6 +455,9 @@ class SettingsPanel(QWidget):
             f"font-size: {Fonts.SIZE_H1 + 6}px; font-weight: {Fonts.WEIGHT_BOLD}; color: {color};"
         )
         self.vram_status_label.setText(text)
+
+    def update_vram_estimate(self) -> None:
+        self._update_vram_prediction()
 
     def set_enabled_state(self, enabled: bool) -> None:
         self.setEnabled(enabled)

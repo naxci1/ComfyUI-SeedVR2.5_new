@@ -115,6 +115,11 @@ class VideoPreviewWidget(QWidget):
     def current_frame(self) -> int:
         return self._current
 
+    def current_frame_image(self) -> QImage:
+        if self._pixmap is None or self._pixmap.isNull():
+            return QImage()
+        return self._pixmap.toImage()
+
     # ---------------------------------------------------------------- playback
     def play(self) -> None:
         if self._is_image or self._cap is None:

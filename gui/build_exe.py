@@ -109,7 +109,7 @@ VSVersionInfo(
           '040904B0',
           [
             StringStruct('CompanyName', 'SeedVR2'),
-            StringStruct('FileDescription', '1Click SeedVR2.5 GUI'),
+            StringStruct('FileDescription', '1-Click SeedVR2.5 (by Naxci1)'),
             StringStruct('FileVersion', '{VERSION}'),
             StringStruct('InternalName', 'SeedVR2_GUI'),
             StringStruct('OriginalFilename', 'SeedVR2_GUI.exe'),

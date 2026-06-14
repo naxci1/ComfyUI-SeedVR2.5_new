@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PySide6 application entry-point for 1Click SeedVR2.5 v1.8b."""
+"""PySide6 application entry-point for 1-Click SeedVR2.5 (by Naxci1)."""
 
 from __future__ import annotations
 
@@ -20,13 +20,16 @@ for _p in (_APP_ROOT, _APP_DIR):
         sys.path.insert(0, _p)
 
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QImage, QKeySequence, QPixmap, QShortcut
+from PySide6.QtGui import QImage, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
+    QFileDialog,
     QHBoxLayout,
+    QLineEdit,
     QLabel,
     QMainWindow,
     QMessageBox,
+    QComboBox,
     QStackedWidget,
     QStatusBar,
     QVBoxLayout,
@@ -66,6 +69,7 @@ try:
         SettingsDialog,
         SettingsPanel,
         Toast,
+        ToggleSwitch,
         TrimTimeline,
         VideoPreviewWidget,
     )
@@ -85,10 +89,14 @@ except ImportError:  # pragma: no cover - direct-script execution fallback
         SettingsDialog,
         SettingsPanel,
         Toast,
+        ToggleSwitch,
         TrimTimeline,
         VideoPreviewWidget,
     )
     from workers import create_worker_thread, resolve_paths  # type: ignore
+
+APP_NAME = "1-Click SeedVR2.5 (by Naxci1)"
+GITHUB_URL = "https://github.com/naxci1/1Click_SeedVR2.5"
 
 
 class _HardwareProbe(QObject):
@@ -152,7 +160,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("1Click SeedVR2.5 v1.8b")
+        self.setWindowTitle(APP_NAME)
         self.resize(1440, 900)
         self.setMinimumSize(1180, 760)
 
@@ -164,6 +172,10 @@ class MainWindow(QMainWindow):
         self._active_mode = ""
         self._active_output_path = ""
         self._snapshot_fallback_path = ""
+        self._preview_source_frame_path = ""
+        self._last_processed_preview_path = ""
+        self._simple_container_value = "MP4"
+        self._syncing_simple_controls = False
         self._codec_cache = {"nvenc": False, "qsv": False, "amf": False}
         self._gpu_name = "CPU"
         self._gpu_vram = "—"
@@ -171,6 +183,8 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._connect_signals()
+        self.input_path_edit.setText(self._config.get("input_path", ""))
+        self.output_path_edit.setText(self._config.get("output_path", ""))
         self._start_hardware_probe()
         self._start_codec_probe()
         self._apply_view_mode("advanced")
@@ -197,6 +211,10 @@ class MainWindow(QMainWindow):
         root.addWidget(center, 1)
 
         center_layout.addWidget(self._build_header())
+        self.simple_mode_controls = self._build_simple_mode_bar()
+        center_layout.addWidget(self.simple_mode_controls)
+        self.io_bar = self._build_io_bar()
+        center_layout.addWidget(self.io_bar)
 
         self.center_stack = QStackedWidget(self)
         self.drop_zone = DropZone(self)
@@ -217,6 +235,7 @@ class MainWindow(QMainWindow):
 
         self.settings_panel = SettingsPanel(self)
         root.addWidget(self.settings_panel)
+        self._sync_simple_controls_from_settings()
 
         self._build_status_bar()
         self._build_shortcuts()
@@ -227,7 +246,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(Dims.PADDING_SM)
 
-        title = QLabel("1Click SeedVR2.5 v1.8b", header)
+        title = QLabel(APP_NAME, header)
         title.setProperty("role", "h1")
         layout.addWidget(title)
 
@@ -244,6 +263,59 @@ class MainWindow(QMainWindow):
         for button in (self.show_log_btn, self.settings_btn, self.about_btn, self.github_btn):
             layout.addWidget(button)
         return header
+
+    def _build_simple_mode_bar(self) -> QWidget:
+        widget = QWidget(self)
+        layout = QHBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(Dims.PADDING_SM)
+
+        self.simple_resolution_combo = QComboBox(widget)
+        self.simple_model_combo = QComboBox(widget)
+        self.simple_quality_combo = QComboBox(widget)
+        self.simple_container_combo = QComboBox(widget)
+        self.simple_auto_tune_toggle = ToggleSwitch("", True, widget)
+
+        self.simple_resolution_combo.addItems(list(self._PRESET_TO_RESOLUTION.keys()))
+        self.simple_model_combo.addItems(["3B", "7B"])
+        self.simple_quality_combo.addItems(["Fast", "Balanced", "High Quality"])
+        self.simple_container_combo.addItems(["MP4", "MOV", "MKV", "WEBM"])
+
+        layout.addWidget(QLabel("Resolution", widget))
+        layout.addWidget(self.simple_resolution_combo)
+        layout.addWidget(QLabel("Model", widget))
+        layout.addWidget(self.simple_model_combo)
+        layout.addWidget(QLabel("Quality", widget))
+        layout.addWidget(self.simple_quality_combo)
+        layout.addWidget(QLabel("Container", widget))
+        layout.addWidget(self.simple_container_combo)
+        layout.addWidget(QLabel("Auto Tune", widget))
+        layout.addWidget(self.simple_auto_tune_toggle)
+        layout.addStretch(1)
+        return widget
+
+    def _build_io_bar(self) -> QWidget:
+        widget = QWidget(self)
+        layout = QHBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(Dims.PADDING_SM)
+
+        self.input_path_edit = QLineEdit(widget)
+        self.output_path_edit = QLineEdit(widget)
+        self.input_path_edit.setPlaceholderText("Input path")
+        self.output_path_edit.setPlaceholderText("Output path")
+        self.browse_input_btn = Button3D("Browse", variant="default", parent=widget)
+        self.browse_output_btn = Button3D("Browse", variant="default", parent=widget)
+        self.split_btn = Button3D("Split", variant="default", parent=widget)
+
+        layout.addWidget(QLabel("Input", widget))
+        layout.addWidget(self.input_path_edit, 2)
+        layout.addWidget(self.browse_input_btn)
+        layout.addWidget(QLabel("Output", widget))
+        layout.addWidget(self.output_path_edit, 2)
+        layout.addWidget(self.browse_output_btn)
+        layout.addWidget(self.split_btn)
+        return widget
 
     def _build_view_toggle_page(self, selected: str) -> QWidget:
         widget = QWidget(self)
@@ -344,14 +416,119 @@ class MainWindow(QMainWindow):
         self.show_log_btn.clicked.connect(self._show_log_viewer)
         self.settings_btn.clicked.connect(self._open_settings_dialog)
         self.about_btn.clicked.connect(self._show_about_dialog)
-        self.github_btn.clicked.connect(lambda: webbrowser.open("https://github.com/naxci1/ComfyUI-SeedVR2.5_new"))
+        self.github_btn.clicked.connect(lambda: webbrowser.open(GITHUB_URL))
 
         self.settings_panel.settings_changed.connect(self._update_status_summary)
+        self.settings_panel.settings_changed.connect(self._sync_simple_controls_from_settings)
+
+        self.browse_input_btn.clicked.connect(self._browse_input_path)
+        self.browse_output_btn.clicked.connect(self._browse_output_path)
+        self.split_btn.clicked.connect(self._show_split_comparison)
+        self.input_path_edit.editingFinished.connect(self._on_input_path_edited)
+        self.output_path_edit.editingFinished.connect(self._on_output_path_edited)
+
+        self.simple_resolution_combo.currentTextChanged.connect(self._apply_simple_controls)
+        self.simple_model_combo.currentTextChanged.connect(self._apply_simple_controls)
+        self.simple_quality_combo.currentTextChanged.connect(self._apply_simple_controls)
+        self.simple_container_combo.currentTextChanged.connect(self._on_simple_container_changed)
+        self.simple_auto_tune_toggle.toggled.connect(lambda _=False: self._apply_simple_controls())
 
     def _apply_view_mode(self, mode: str) -> None:
         advanced = mode == "advanced"
         self.view_toggle_stack.setCurrentIndex(1 if advanced else 0)
         self.settings_panel.setVisible(advanced)
+        self.simple_mode_controls.setVisible(not advanced)
+
+    def _resolve_output_dir(self) -> Path:
+        raw = self.output_path_edit.text().strip() if hasattr(self, "output_path_edit") else ""
+        if raw:
+            out = Path(raw)
+            if out.is_file():
+                out = out.parent
+            out.mkdir(parents=True, exist_ok=True)
+            return out
+        if self._current_file:
+            return Path(self._current_file).parent
+        return Path.cwd()
+
+    def _browse_input_path(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Select input media", "", "Media (*.*)")
+        if not path:
+            return
+        self.input_path_edit.setText(path)
+        self.load_file(path)
+
+    def _browse_output_path(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Select output directory", self.output_path_edit.text().strip() or "")
+        if not path:
+            return
+        self.output_path_edit.setText(path)
+        self._config["output_path"] = path
+        save_config(self._config)
+
+    def _on_input_path_edited(self) -> None:
+        path = self.input_path_edit.text().strip()
+        if path and os.path.isfile(path):
+            self.load_file(path)
+
+    def _on_output_path_edited(self) -> None:
+        raw = self.output_path_edit.text().strip()
+        self._config["output_path"] = raw
+        save_config(self._config)
+
+    def _sync_simple_controls_from_settings(self) -> None:
+        if self._syncing_simple_controls:
+            return
+        self._syncing_simple_controls = True
+        try:
+            settings = self.settings_panel.get_all_settings()
+            if settings.get("resolution_mode") == "presets":
+                self.simple_resolution_combo.setCurrentText(settings.get("resolution_presets", "720p (HD)"))
+            elif settings.get("resolution_mode") == "pixel":
+                resolution = int(settings.get("resolution", 720))
+                nearest = min(self._PRESET_TO_RESOLUTION.items(), key=lambda item: abs(item[1] - resolution))[0]
+                self.simple_resolution_combo.setCurrentText(nearest)
+            model_text = str(settings.get("dit_model", "")).lower()
+            self.simple_model_combo.setCurrentText("7B" if "7b" in model_text else "3B")
+            batch = int(settings.get("batch_size", 81))
+            if batch <= 41:
+                self.simple_quality_combo.setCurrentText("Fast")
+            elif batch >= 121:
+                self.simple_quality_combo.setCurrentText("High Quality")
+            else:
+                self.simple_quality_combo.setCurrentText("Balanced")
+            self.simple_auto_tune_toggle.setChecked(bool(settings.get("auto_tune", True)))
+        finally:
+            self._syncing_simple_controls = False
+
+    def _apply_simple_controls(self) -> None:
+        if self._syncing_simple_controls:
+            return
+        self.settings_panel.resolution_mode_combo.setCurrentText("presets")
+        self.settings_panel.resolution_presets_combo.setCurrentText(self.simple_resolution_combo.currentText())
+        if self.simple_model_combo.currentText() == "7B":
+            for i in range(self.settings_panel.dit_model_combo.count()):
+                text = self.settings_panel.dit_model_combo.itemText(i)
+                if "7b" in text.lower():
+                    self.settings_panel.dit_model_combo.setCurrentIndex(i)
+                    break
+        else:
+            for i in range(self.settings_panel.dit_model_combo.count()):
+                text = self.settings_panel.dit_model_combo.itemText(i)
+                if "3b" in text.lower():
+                    self.settings_panel.dit_model_combo.setCurrentIndex(i)
+                    break
+        quality = self.simple_quality_combo.currentText()
+        if quality == "Fast":
+            self.settings_panel.batch_size_spin.setValue(41)
+        elif quality == "High Quality":
+            self.settings_panel.batch_size_spin.setValue(121)
+        else:
+            self.settings_panel.batch_size_spin.setValue(81)
+        self.settings_panel.auto_tune_toggle.setChecked(self.simple_auto_tune_toggle.isChecked())
+
+    def _on_simple_container_changed(self, value: str) -> None:
+        self._simple_container_value = value or "MP4"
 
     def _start_hardware_probe(self) -> None:
         self._hw_thread = QThread(self)
@@ -401,6 +578,9 @@ class MainWindow(QMainWindow):
         if not path or not os.path.isfile(path):
             return
         self._current_file = path
+        self.input_path_edit.setText(path)
+        if not self.output_path_edit.text().strip():
+            self.output_path_edit.setText(str(Path(path).parent))
         self.preview_widget.load_file(path)
         self.trim_timeline.load_video(path)
         self.settings_panel.set_trim_range(0, 0, self.preview_widget.get_frame_count(), False)
@@ -408,6 +588,7 @@ class MainWindow(QMainWindow):
         self._update_trim_labels()
         self.status_label.setText(f"Loaded {os.path.basename(path)}")
         self._config["input_path"] = path
+        self._config["output_path"] = self.output_path_edit.text().strip()
         save_config(self._config)
 
     def _on_preview_frame_changed(self, frame: int) -> None:
@@ -482,6 +663,8 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _on_export_confirmed(self, export_settings: dict) -> None:
+        if not export_settings.get("container"):
+            export_settings["container"] = self._simple_container_value
         payload = {
             "mode": "export",
             "input": self._current_file,
@@ -514,7 +697,9 @@ class MainWindow(QMainWindow):
 
     def _preview_output_path(self) -> str:
         source = Path(self._current_file)
-        return str(source.with_name(f"{source.stem}_preview_sv2.tiff"))
+        out_dir = self._resolve_output_dir()
+        frame = self.preview_widget.current_frame()
+        return str(out_dir / f"{source.stem}_preview_f{frame:06d}_sv2.tiff")
 
     def _build_cli_args(self, payload: dict) -> list[str]:
         settings = payload.get("settings", {})
@@ -651,18 +836,34 @@ class MainWindow(QMainWindow):
             Toast.show(self, "inference_cli.py not found", "error")
             return
 
+        frame_image = self.preview_widget.current_frame_image()
+        if frame_image.isNull():
+            Toast.show(self, "No preview frame available", "warning")
+            return
+
+        out_dir = self._resolve_output_dir()
+        source = Path(self._current_file)
+        frame_idx = int(payload.get("frame_index", 0))
+        input_frame_path = out_dir / f"{source.stem}_preview_source_f{frame_idx:06d}.tiff"
+        preview_output = Path(self._preview_output_path())
+
+        self._save_qimage_as_tiff16(frame_image, str(input_frame_path))
+        self._preview_source_frame_path = str(input_frame_path)
+
         preview_settings = dict(payload.get("settings", {}))
-        preview_settings["skip_first_frames"] = int(payload.get("frame_index", 0))
-        preview_settings["load_cap"] = 1
+        preview_settings["skip_first_frames"] = 0
+        preview_settings["load_cap"] = 0
         preview_payload = {
             "mode": "preview",
-            "input": self._current_file,
+            "input": str(input_frame_path),
             "settings": preview_settings,
-            "output_path": self._preview_output_path(),
+            "output_path": str(preview_output),
             "output_format": "tiff",
         }
-        self._snapshot_fallback_path = str(Path(self._preview_output_path()).with_name(Path(self._preview_output_path()).stem + "_fallback.tiff"))
-        self._save_qimage_as_tiff16(self.preview_widget.grab().toImage(), self._snapshot_fallback_path)
+        self._snapshot_fallback_path = str(
+            preview_output.with_name(preview_output.stem + "_fallback.tiff")
+        )
+        self._save_qimage_as_tiff16(frame_image, self._snapshot_fallback_path)
         args = self._build_cli_args(preview_payload)
         self._start_worker(cli_script, python_exe, args, "preview", preview_payload["output_path"])
 
@@ -729,7 +930,7 @@ class MainWindow(QMainWindow):
             4000,
         )
 
-    def _load_preview_outputs(self) -> None:
+    def _load_preview_outputs(self) -> Optional[Path]:
         candidates: list[Path] = []
         output = Path(self._active_output_path) if self._active_output_path else None
         if output is not None:
@@ -757,7 +958,42 @@ class MainWindow(QMainWindow):
             self.preview_widget.set_pixmap(pixmap)
             self.center_stack.setCurrentWidget(self.preview_widget)
             self.status_label.setText(f"Preview loaded: {candidate.name}")
+            self._last_processed_preview_path = str(candidate)
+            return candidate
+        return None
+
+    def _show_comparison(self, original_path: str, processed_path: str) -> None:
+        if not original_path or not processed_path:
             return
+        orig = QPixmap(original_path)
+        proc = QPixmap(processed_path)
+        if orig.isNull() or proc.isNull():
+            return
+        target_h = max(1, max(orig.height(), proc.height()))
+        orig_s = orig.scaledToHeight(target_h, Qt.SmoothTransformation)
+        proc_s = proc.scaledToHeight(target_h, Qt.SmoothTransformation)
+        combined = QPixmap(orig_s.width() + proc_s.width(), target_h)
+        combined.fill(Qt.transparent)
+        painter = QPainter(combined)
+        painter.drawPixmap(0, 0, orig_s)
+        painter.drawPixmap(orig_s.width(), 0, proc_s)
+        painter.end()
+        self.preview_widget.set_pixmap(combined)
+        self.center_stack.setCurrentWidget(self.preview_widget)
+        self.status_label.setText("Comparison shown: original vs processed")
+
+    def _show_split_comparison(self) -> None:
+        processed = self._last_processed_preview_path
+        if not processed and self._active_output_path and Path(self._active_output_path).exists():
+            processed = self._active_output_path
+        original = self._preview_source_frame_path or self._snapshot_fallback_path
+        if not processed or not Path(processed).exists():
+            Toast.show(self, "No processed preview found yet", "warning")
+            return
+        if not original or not Path(original).exists():
+            Toast.show(self, "No source frame available for split view", "warning")
+            return
+        self._show_comparison(original, processed)
 
     def _on_finished(self, success: bool, message: str) -> None:
         self._set_processing(False)
@@ -766,7 +1002,11 @@ class MainWindow(QMainWindow):
             self.progress.setValue(100.0)
             self._play_success_sound()
             Toast.show(self, "Completed successfully", "success")
-            self._load_preview_outputs()
+            loaded = self._load_preview_outputs()
+            if loaded is not None:
+                original = self._preview_source_frame_path or self._snapshot_fallback_path
+                if original and Path(original).exists():
+                    self._show_comparison(original, str(loaded))
         else:
             Toast.show(self, message or "Processing failed", "error")
             if message and message != "Cancelled.":
@@ -828,8 +1068,8 @@ class MainWindow(QMainWindow):
     def _show_about_dialog(self) -> None:
         QMessageBox.information(
             self,
-            "About 1Click SeedVR2.5",
-            "1Click SeedVR2.5 v1.8b\n\nPySide6 GUI rebuild for SeedVR2 processing and export.",
+            f"About {APP_NAME}",
+            f"{APP_NAME}\n\nPySide6 GUI rebuild for SeedVR2 processing and export.",
         )
 
     def closeEvent(self, event) -> None:  # noqa: N802
@@ -842,6 +1082,22 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         super().closeEvent(event)
+
+
+def _find_app_icon() -> QIcon:
+    candidates = [
+        Path(_APP_DIR) / "assets" / "icon.ico",
+        Path(_APP_DIR) / "assets" / "icon.png",
+        Path(_APP_DIR) / "assets" / "logo.png",
+        Path(_APP_ROOT) / "icon.ico",
+        Path(_APP_ROOT) / "icon.png",
+    ]
+    for path in candidates:
+        if path.exists():
+            icon = QIcon(str(path))
+            if not icon.isNull():
+                return icon
+    return QIcon()
 
 
 def main() -> int:
@@ -865,11 +1121,16 @@ def main() -> int:
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-    app.setApplicationName("1Click SeedVR2.5 v1.8b")
+    app.setApplicationName(APP_NAME)
     app.setOrganizationName("SeedVR2")
+    icon = _find_app_icon()
+    if not icon.isNull():
+        app.setWindowIcon(icon)
     app.setStyleSheet(generate_stylesheet())
 
     window = MainWindow()
+    if not icon.isNull():
+        window.setWindowIcon(icon)
     window.show()
     return app.exec()
 

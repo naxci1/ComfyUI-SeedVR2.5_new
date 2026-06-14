@@ -8,7 +8,7 @@ from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QWidget
 
 from ..theme import Colors, Dims, Fonts
 
-_APP_TITLE = "1Click SeedVR2.5"
+_APP_TITLE = "1-Click SeedVR2.5 (by Naxci1)"
 _APP_VERSION = "v1.7b"
 
 

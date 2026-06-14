@@ -21,11 +21,12 @@ class _ThumbnailWorker(QObject):
 
     ready = Signal(list)  # list[QImage]
 
-    def __init__(self, path: str, fps: float, frame_count: int) -> None:
+    def __init__(self, path: str, fps: float, frame_count: int, seconds_per_thumb: float) -> None:
         super().__init__()
         self._path = path
         self._fps = fps if fps > 0 else 25.0
         self._frame_count = frame_count
+        self._seconds_per_thumb = max(0.25, float(seconds_per_thumb))
 
     def run(self) -> None:
         thumbs: List[QImage] = []
@@ -33,7 +34,7 @@ class _ThumbnailWorker(QObject):
             try:
                 cap = cv2.VideoCapture(self._path)
                 if cap.isOpened():
-                    step = max(1, int(self._fps * 2))
+                    step = max(1, int(self._fps * self._seconds_per_thumb))
                     idx = 0
                     while idx < self._frame_count:
                         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
@@ -72,6 +73,8 @@ class TrimTimeline(QWidget):
         self._in = 0
         self._out = 0
         self._playhead = 0
+        self._path = ""
+        self._seconds_per_thumb = 2.0
         self._thumbs: List[QImage] = []
         self._drag: Optional[str] = None  # "in" | "out" | "playhead"
 
@@ -83,6 +86,7 @@ class TrimTimeline(QWidget):
         self._thumbs = []
         self._frame_count = 0
         self._fps = 0.0
+        self._path = path or ""
         if cv2 is not None and path:
             try:
                 cap = cv2.VideoCapture(path)
@@ -103,7 +107,7 @@ class TrimTimeline(QWidget):
             return
         self._stop_thumbnails()
         self._thumb_thread = QThread()
-        self._thumb_worker = _ThumbnailWorker(path, self._fps, self._frame_count)
+        self._thumb_worker = _ThumbnailWorker(path, self._fps, self._frame_count, self._seconds_per_thumb)
         self._thumb_worker.moveToThread(self._thumb_thread)
         self._thumb_thread.started.connect(self._thumb_worker.run)
         self._thumb_worker.ready.connect(self._on_thumbs_ready)
@@ -219,6 +223,18 @@ class TrimTimeline(QWidget):
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         self._drag = None
+
+    def wheelEvent(self, event) -> None:  # noqa: N802
+        if self._frame_count <= 0 or not self._path:
+            super().wheelEvent(event)
+            return
+        delta = event.angleDelta().y()
+        if delta > 0:
+            self._seconds_per_thumb = max(0.25, self._seconds_per_thumb * 0.8)
+        elif delta < 0:
+            self._seconds_per_thumb = min(12.0, self._seconds_per_thumb * 1.25)
+        self._start_thumbnails(self._path)
+        event.accept()
 
     # ---------------------------------------------------------------- paint
     def paintEvent(self, event) -> None:  # noqa: N802
