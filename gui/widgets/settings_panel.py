@@ -272,7 +272,7 @@ class SettingsPanel(QWidget):
         self.settings_changed.connect(self._last_used_timer.start)
         self._tooltip_timer = QTimer(self)
         self._tooltip_timer.setSingleShot(True)
-        self._tooltip_timer.setInterval(3000)
+        self._tooltip_timer.setInterval(700)
         self._tooltip_timer.timeout.connect(self._show_delayed_tooltip)
 
         outer = QVBoxLayout(self)
@@ -554,6 +554,13 @@ class SettingsPanel(QWidget):
                 self.resolution_scale_combo.setCurrentText(str(settings["resolution_scale"]))
             if "resolution_presets" in settings:
                 self.resolution_presets_combo.setCurrentText(str(settings["resolution_presets"]))
+            if "max_resolution" in settings:
+                max_res = int(settings["max_resolution"])
+                if max_res > 0:
+                    self.max_resolution_toggle.setChecked(True)
+                    self.max_resolution_spin.setValue(max_res)
+                else:
+                    self.max_resolution_toggle.setChecked(False)
             if "pre_downscale" in settings:
                 raw_downscale = str(settings["pre_downscale"]).strip()
                 if raw_downscale in {"0", "1", "1:1"}:
@@ -563,18 +570,71 @@ class SettingsPanel(QWidget):
                     if ratio in {"1:2", "1:3", "1:4", "1:5"}:
                         self.pre_downscale_combo.setCurrentText(ratio)
                         self.pre_downscale_toggle.setChecked(True)
-            if "batch_size" in settings:
-                self.batch_size_spin.setValue(int(settings["batch_size"]))
+            if "dit_model" in settings:
+                display = _display_name(str(settings["dit_model"]))
+                idx = self.dit_model_combo.findText(display)
+                if idx >= 0:
+                    self.dit_model_combo.setCurrentIndex(idx)
+                else:
+                    self.dit_model_combo.setCurrentText(display)
+            if "attention_mode" in settings:
+                self.attention_mode_combo.setCurrentText(str(settings["attention_mode"]))
             if "auto_tune" in settings:
                 self.auto_tune_toggle.setChecked(bool(settings["auto_tune"]))
             if "cache_dit" in settings:
                 self.cache_dit_toggle.setChecked(bool(settings["cache_dit"]))
             if "cache_vae" in settings:
                 self.cache_vae_toggle.setChecked(bool(settings["cache_vae"]))
-            if "temporal_overlap" in settings:
-                self.temporal_overlap_spin.setValue(int(settings["temporal_overlap"]))
+            if "use_10bit" in settings:
+                self.use_10bit_toggle.setChecked(bool(settings["use_10bit"]))
+            if "debug" in settings:
+                self.debug_toggle.setChecked(bool(settings["debug"]))
+            if "uniform_batch_size" in settings:
+                self.uniform_batch_toggle.setChecked(bool(settings["uniform_batch_size"]))
+            if "batch_size" in settings:
+                self.batch_size_spin.setValue(int(settings["batch_size"]))
+            if "only_frames" in settings:
+                self.only_frames_edit.setText(str(settings["only_frames"]))
+            if "vae_encode_tiled" in settings:
+                self.vae_encode_tiled_toggle.setChecked(bool(settings["vae_encode_tiled"]))
+            if "vae_encode_tile_size" in settings:
+                self.vae_encode_tile_size_spin.setValue(int(settings["vae_encode_tile_size"]))
+            if "vae_encode_tile_overlap" in settings:
+                self.vae_encode_tile_overlap_spin.setValue(int(settings["vae_encode_tile_overlap"]))
+            if "vae_decode_tiled" in settings:
+                self.vae_decode_tiled_toggle.setChecked(bool(settings["vae_decode_tiled"]))
+            if "vae_decode_tile_size" in settings:
+                self.vae_decode_tile_size_spin.setValue(int(settings["vae_decode_tile_size"]))
+            if "vae_decode_tile_overlap" in settings:
+                self.vae_decode_tile_overlap_spin.setValue(int(settings["vae_decode_tile_overlap"]))
             if "color_correction" in settings:
                 self.color_correction_combo.setCurrentText(str(settings["color_correction"]))
+            if "input_noise_scale" in settings:
+                self.input_noise_slider.setValue(int(round(float(settings["input_noise_scale"]) * 100)))
+            if "latent_noise_scale" in settings:
+                self.latent_noise_slider.setValue(int(round(float(settings["latent_noise_scale"]) * 100)))
+            if "temporal_overlap" in settings:
+                self.temporal_overlap_spin.setValue(int(settings["temporal_overlap"]))
+            if "prepend_frames" in settings:
+                self.prepend_frames_spin.setValue(int(settings["prepend_frames"]))
+            if "dit_offload_device" in settings:
+                self.dit_offload_device_combo.setCurrentText(str(settings["dit_offload_device"]))
+            if "vae_offload_device" in settings:
+                self.vae_offload_device_combo.setCurrentText(str(settings["vae_offload_device"]))
+            if "tensor_offload_device" in settings:
+                self.tensor_offload_device_combo.setCurrentText(str(settings["tensor_offload_device"]))
+            if "blocks_to_swap" in settings:
+                self.blocks_to_swap_spin.setValue(int(settings["blocks_to_swap"]))
+            if "swap_io_components" in settings:
+                self.swap_io_components_check.setChecked(bool(settings["swap_io_components"]))
+            if "compile_dit" in settings:
+                self.compile_dit_check.setChecked(bool(settings["compile_dit"]))
+            if "compile_vae" in settings:
+                self.compile_vae_check.setChecked(bool(settings["compile_vae"]))
+            if "compile_backend" in settings:
+                self.compile_backend_combo.setCurrentText(str(settings["compile_backend"]))
+            if "compile_mode" in settings:
+                self.compile_mode_combo.setCurrentText(str(settings["compile_mode"]))
         except Exception:
             pass
         self._emit_settings_changed()

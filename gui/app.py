@@ -295,14 +295,18 @@ class MainWindow(QMainWindow):
         self.view_single_btn = Button3D("Single View", variant="primary", parent=widget)
         self.view_split_btn = Button3D("Split View", variant="default", parent=widget)
         self.view_sidebyside_btn = Button3D("Side by Side", variant="default", parent=widget)
+        self.view_fullscreen_btn = Button3D("⛶ Full Screen", variant="ghost", parent=widget)
+        self.view_fullscreen_btn.setToolTip("Show split view fullscreen")
 
         self.view_single_btn.clicked.connect(lambda: self._set_preview_mode("single"))
         self.view_split_btn.clicked.connect(lambda: self._set_preview_mode("split"))
         self.view_sidebyside_btn.clicked.connect(lambda: self._set_preview_mode("sidebyside"))
+        self.view_fullscreen_btn.clicked.connect(self._toggle_split_fullscreen)
 
         layout.addWidget(self.view_single_btn)
         layout.addWidget(self.view_split_btn)
         layout.addWidget(self.view_sidebyside_btn)
+        layout.addWidget(self.view_fullscreen_btn)
         layout.addStretch(1)
         return widget
 
@@ -373,6 +377,34 @@ class MainWindow(QMainWindow):
                 self.center_stack.setCurrentWidget(self.drop_zone)
         elif mode in ("split", "sidebyside"):
             self._refresh_comparison_view()
+
+    def _toggle_split_fullscreen(self) -> None:
+        """Show the split view widget in a fullscreen window with an Exit button."""
+        if not self.split_view_widget.has_images():
+            Toast.show(self, "No split view to show fullscreen", "warning")
+            return
+        # Create a frameless fullscreen container.
+        fs_win = QWidget(None, Qt.Window | Qt.FramelessWindowHint)
+        fs_win.setStyleSheet(f"background: {Colors.PREVIEW_BG};")
+        layout = QVBoxLayout(fs_win)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # Clone images into a new SplitViewWidget for the fullscreen overlay.
+        fs_split = SplitViewWidget(fs_win)
+        if self.split_view_widget._original and self.split_view_widget._processed:
+            fs_split.set_images(
+                self.split_view_widget._original,
+                self.split_view_widget._processed,
+            )
+        layout.addWidget(fs_split, 1)
+
+        exit_btn = Button3D("✕  Exit Full Screen", variant="danger", parent=fs_win)
+        exit_btn.setFixedHeight(36)
+        exit_btn.clicked.connect(fs_win.close)
+        layout.addWidget(exit_btn)
+
+        fs_win.showFullScreen()
 
     def _refresh_comparison_view(self) -> None:
         """Refresh split or side-by-side view with current images."""
@@ -501,6 +533,7 @@ class MainWindow(QMainWindow):
         self.playback_controls.play_pause_toggled.connect(self._toggle_playback)
         self.playback_controls.prev_frame_requested.connect(self.preview_widget.step_backward)
         self.playback_controls.next_frame_requested.connect(self.preview_widget.step_forward)
+        self.playback_controls.mute_toggled.connect(self._on_mute_toggled)
         self.playback_controls.snapshot_requested.connect(self._request_preview)
         self.playback_controls.trim_in_requested.connect(self._set_trim_in)
         self.playback_controls.trim_out_requested.connect(self._set_trim_out)
@@ -755,6 +788,15 @@ class MainWindow(QMainWindow):
         else:
             self.preview_widget.pause()
 
+    def _on_mute_toggled(self, muted: bool) -> None:
+        """Propagate mute state to the video preview widget's audio output."""
+        ao = getattr(self.preview_widget, "_audio_output", None)
+        if ao is not None:
+            try:
+                ao.setMuted(muted)
+            except Exception:
+                pass
+
     def _request_preview(self) -> None:
         if not self._current_file:
             Toast.show(self, "Import a file first", "warning")
@@ -814,6 +856,14 @@ class MainWindow(QMainWindow):
             env["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
         return env
 
+    def _get_output_path(self, input_path: str, suffix: str = "_sv2", ext: Optional[str] = None) -> str:
+        """Output always goes to the same directory as the input file."""
+        inp = Path(input_path)
+        if ext is None:
+            ext = inp.suffix
+        output = inp.parent / f"{inp.stem}{suffix}{ext}"
+        return str(output)
+
     def _with_sv2_suffix(self, output_path: str) -> str:
         if not output_path:
             return output_path
@@ -826,9 +876,8 @@ class MainWindow(QMainWindow):
 
     def _preview_output_path(self) -> str:
         source = Path(self._current_file)
-        out_dir = self._resolve_output_dir()
         frame = self.preview_widget.current_frame()
-        return str(out_dir / f"{source.stem}_preview_f{frame:06d}_sv2.tiff")
+        return str(source.parent / f"{source.stem}_preview_f{frame:06d}_sv2.tiff")
 
     def _build_cli_args(self, payload: dict) -> list[str]:
         settings = payload.get("settings", {})
@@ -945,7 +994,18 @@ class MainWindow(QMainWindow):
             return
 
         export_settings = dict(payload.get("export", {}))
-        output_path = self._with_sv2_suffix(str(export_settings.get("output_path", "")))
+        # Always write output to the same directory as the input file (Fix #6 / P1).
+        if self._current_file:
+            source = Path(self._current_file)
+            if export_settings.get("output_type") == "image_sequence":
+                container = ""
+                ext = "." + str(export_settings.get("image_format", "tiff")).lower()
+            else:
+                container = str(export_settings.get("container", "mp4")).lower()
+                ext = f".{container}"
+            output_path = self._get_output_path(self._current_file, "_sv2", ext)
+        else:
+            output_path = self._with_sv2_suffix(str(export_settings.get("output_path", "")))
         export_settings["output_path"] = output_path
         payload = dict(payload)
         payload["export"] = export_settings
@@ -960,9 +1020,8 @@ class MainWindow(QMainWindow):
         # Fix 5 — capture snapshot of current frame for split view after export
         frame_image = self.preview_widget.current_frame_image()
         if not frame_image.isNull():
-            out_dir = self._resolve_output_dir()
             source = Path(self._current_file)
-            snap_path = str(out_dir / f"{source.stem}_export_snapshot.tiff")
+            snap_path = str(source.parent / f"{source.stem}_export_snapshot.tiff")
             self._save_qimage_as_tiff16(frame_image, snap_path)
             self._snapshot_fallback_path = snap_path
         else:
@@ -991,7 +1050,7 @@ class MainWindow(QMainWindow):
             Toast.show(self, "No preview frame available", "warning")
             return
 
-        out_dir = self._resolve_output_dir()
+        out_dir = Path(self._current_file).parent
         source = Path(self._current_file)
         frame_idx = int(payload.get("frame_index", 0))
         input_frame_path = out_dir / f"{source.stem}_preview_source_f{frame_idx:06d}.tiff"

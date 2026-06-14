@@ -1,21 +1,25 @@
 """Split-view comparison widget with a draggable vertical divider.
 
 Left of the divider shows the original; right shows the processed result.
+Supports mouse-wheel zoom and click-drag pan when zoomed in.
 """
 
 from __future__ import annotations
 
 from typing import Optional
 
-from PySide6.QtCore import Qt, QRectF
-from PySide6.QtGui import QColor, QCursor, QPainter, QPen, QPixmap
+from PySide6.QtCore import Qt, QPoint, QRectF
+from PySide6.QtGui import QColor, QCursor, QPainter, QPen, QPixmap, QWheelEvent
 from PySide6.QtWidgets import QWidget
 
 from ..theme import Colors
 
 
 class SplitViewWidget(QWidget):
-    """Overlay comparison: drag the vertical line to reveal original vs processed."""
+    """Overlay comparison: drag the vertical line to reveal original vs processed.
+
+    Mouse wheel zooms both images together; click-drag pans when zoomed in.
+    """
 
     _HANDLE_W = 10  # px half-width of the drag zone
 
@@ -28,32 +32,66 @@ class SplitViewWidget(QWidget):
         self.setMouseTracking(True)
         self.setCursor(Qt.ArrowCursor)
 
+        # Zoom & pan state
+        self._zoom = 1.0
+        self._pan_offset = QPoint(0, 0)
+        self._panning = False
+        self._last_mouse_pos = QPoint()
+
     # ---------------------------------------------------------------- api
     def set_images(self, original: QPixmap, processed: QPixmap) -> None:
         self._original = original
         self._processed = processed
+        self._zoom = 1.0
+        self._pan_offset = QPoint(0, 0)
         self.update()
 
     def clear(self) -> None:
         self._original = None
         self._processed = None
+        self._zoom = 1.0
+        self._pan_offset = QPoint(0, 0)
         self.update()
 
     def has_images(self) -> bool:
         return self._original is not None and self._processed is not None
 
     # ---------------------------------------------------------------- events
+    def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802
+        delta = event.angleDelta().y()
+        if delta > 0:
+            self._zoom = min(8.0, self._zoom * 1.15)
+        else:
+            self._zoom = max(0.1, self._zoom / 1.15)
+        if self._zoom <= 1.0:
+            self._pan_offset = QPoint(0, 0)
+        self.update()
+        event.accept()
+
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.LeftButton:
             split_x = int(self._split_frac * self.width())
-            if abs(event.position().x() - split_x) <= self._HANDLE_W * 2:
+            near_divider = abs(event.position().x() - split_x) <= self._HANDLE_W * 2
+            if near_divider and self._zoom <= 1.0:
                 self._dragging = True
+            elif self._zoom > 1.0 and not near_divider:
+                self._panning = True
+                self._last_mouse_pos = event.pos()
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
         split_x = int(self._split_frac * self.width())
         near = abs(event.position().x() - split_x) <= self._HANDLE_W * 2
-        self.setCursor(Qt.SplitHCursor if near or self._dragging else Qt.ArrowCursor)
+        if self._panning:
+            delta = event.pos() - self._last_mouse_pos
+            self._pan_offset += delta
+            self._last_mouse_pos = event.pos()
+            self.update()
+            return
+        if self._zoom > 1.0:
+            self.setCursor(Qt.OpenHandCursor if not self._panning else Qt.ClosedHandCursor)
+        else:
+            self.setCursor(Qt.SplitHCursor if near or self._dragging else Qt.ArrowCursor)
         if self._dragging and self.width() > 0:
             frac = event.position().x() / self.width()
             self._split_frac = max(0.01, min(0.99, frac))
@@ -62,6 +100,7 @@ class SplitViewWidget(QWidget):
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         self._dragging = False
+        self._panning = False
         super().mouseReleaseEvent(event)
 
     # ---------------------------------------------------------------- paint
@@ -82,9 +121,13 @@ class SplitViewWidget(QWidget):
         def _draw_scaled(pix: QPixmap, clip_left: int, clip_right: int) -> None:
             if pix is None or pix.isNull():
                 return
-            scaled = pix.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            x = (w - scaled.width()) // 2
-            y = (h - scaled.height()) // 2
+            # Base fit-to-widget size, then apply zoom.
+            base = pix.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            zoomed_w = int(base.width() * self._zoom)
+            zoomed_h = int(base.height() * self._zoom)
+            scaled = pix.scaled(zoomed_w, zoomed_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            x = (w - scaled.width()) // 2 + self._pan_offset.x()
+            y = (h - scaled.height()) // 2 + self._pan_offset.y()
             painter.save()
             painter.setClipRect(clip_left, 0, clip_right - clip_left, h)
             painter.setRenderHint(QPainter.SmoothPixmapTransform, True)

@@ -15,7 +15,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
-    QPushButton,
     QVBoxLayout,
     QWidget,
 )
@@ -104,14 +103,9 @@ class _FileItemWidget(QWidget):
         self._icon_lbl.setFixedSize(64, 36)
         layout.insertWidget(0, self._icon_lbl)
 
-        btn = QPushButton("×", self)
-        btn.setFixedSize(18, 18)
+        btn = Button3D("✕", variant="danger", parent=self)
+        btn.setFixedSize(28, 28)
         btn.setToolTip("Remove from list")
-        btn.setStyleSheet(
-            f"QPushButton {{ background: transparent; color: {Colors.TEXT_SECONDARY};"
-            f" border: none; font-size: 14px; padding: 0; }}"
-            f"QPushButton:hover {{ color: {Colors.DANGER}; }}"
-        )
         btn.clicked.connect(lambda: self.remove_requested.emit(self._path))
         layout.addWidget(btn)
 

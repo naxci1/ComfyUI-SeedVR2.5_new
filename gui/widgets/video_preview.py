@@ -287,6 +287,12 @@ class VideoPreviewWidget(QWidget):
             self._frame_h = pixmap.height()
         self.update()
 
+    def clear(self) -> None:
+        """Clear the preview and stop playback."""
+        self.stop()
+        self._pixmap = None
+        self.update()
+
     def cleanup(self) -> None:
         self.pause()
         if self._media_player is not None:
