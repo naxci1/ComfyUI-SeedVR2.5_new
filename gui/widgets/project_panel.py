@@ -11,9 +11,11 @@ from PySide6.QtCore import Qt, Signal, QObject, QThread, QSize
 from PySide6.QtGui import QIcon, QImage, QPixmap
 from PySide6.QtWidgets import (
     QFileDialog,
+    QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QPushButton,
     QVBoxLayout,
     QWidget,
 )
@@ -26,6 +28,11 @@ try:
 except Exception:  # pragma: no cover
     cv2 = None  # type: ignore
 
+try:
+    import numpy as np  # type: ignore
+except Exception:  # pragma: no cover
+    np = None  # type: ignore
+
 _FILTER = "Media (*.mp4 *.mov *.mkv *.avi *.webm *.png *.jpg *.jpeg *.tif *.tiff *.exr *.dpx);;All files (*)"
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 _VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".flv", ".wmv", ".m4v"}
@@ -33,12 +40,13 @@ _VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".flv", ".wmv", ".m4v"}
 
 def _extract_metadata(path: str):
     """Return (thumbnail QImage|None, meta_string)."""
-    if cv2 is None or not os.path.isfile(path):
+    if cv2 is None or np is None or not os.path.isfile(path):
         return None, ""
     ext = os.path.splitext(path)[1].lower()
     try:
         if ext in _IMAGE_EXTS:
-            frame = cv2.imread(path, cv2.IMREAD_COLOR)
+            raw = np.fromfile(path, dtype=np.uint8)
+            frame = cv2.imdecode(raw, cv2.IMREAD_COLOR)
             if frame is None:
                 return None, ""
             h, w = frame.shape[:2]
@@ -76,10 +84,52 @@ class _ThumbWorker(QObject):
         self.done.emit(self._path, img, meta)
 
 
+class _FileItemWidget(QWidget):
+    """List item widget showing filename + remove (×) button."""
+
+    remove_requested = Signal(str)
+
+    def __init__(self, path: str, parent=None) -> None:
+        super().__init__(parent)
+        self._path = path
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 2, 4, 2)
+        layout.setSpacing(4)
+
+        self._label = QLabel(os.path.basename(path), self)
+        self._label.setStyleSheet(f"color: {Colors.TEXT_PRIMARY};")
+        layout.addWidget(self._label, 1)
+
+        self._icon_lbl = QLabel(self)
+        self._icon_lbl.setFixedSize(64, 36)
+        layout.insertWidget(0, self._icon_lbl)
+
+        btn = QPushButton("×", self)
+        btn.setFixedSize(18, 18)
+        btn.setToolTip("Remove from list")
+        btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {Colors.TEXT_SECONDARY};"
+            f" border: none; font-size: 14px; padding: 0; }}"
+            f"QPushButton:hover {{ color: {Colors.DANGER}; }}"
+        )
+        btn.clicked.connect(lambda: self.remove_requested.emit(self._path))
+        layout.addWidget(btn)
+
+    def set_icon(self, pixmap: QPixmap) -> None:
+        self._icon_lbl.setPixmap(
+            pixmap.scaled(64, 36, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        )
+
+    def set_meta(self, meta: str) -> None:
+        name = os.path.basename(self._path)
+        self._label.setText(f"{name}\n{meta}" if meta else name)
+
+
 class ProjectPanel(QWidget):
     """Project navigator listing imported media with thumbnails."""
 
     file_selected = Signal(str)
+    file_removed = Signal(str)
     input_folder_selected = Signal(str)
     output_folder_requested = Signal()
 
@@ -88,6 +138,7 @@ class ProjectPanel(QWidget):
         self.setFixedWidth(Dims.PANEL_WIDTH_LEFT)
         self._threads: List[QThread] = []
         self._output_dir: str = ""
+        self._item_widgets: dict = {}  # path → (QListWidgetItem, _FileItemWidget)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -128,25 +179,39 @@ class ProjectPanel(QWidget):
 
     def add_file(self, path: str, select: bool = True) -> None:
         # Avoid duplicates.
-        for i in range(self._list.count()):
-            if self._list.item(i).data(Qt.UserRole) == path:
-                if select:
-                    self._list.setCurrentRow(i)
-                return
-        item = QListWidgetItem(os.path.basename(path))
+        if path in self._item_widgets:
+            if select:
+                item, _ = self._item_widgets[path]
+                self._list.setCurrentItem(item)
+            return
+        item = QListWidgetItem()
         item.setData(Qt.UserRole, path)
-        item.setSizeHint(QSize(Dims.PANEL_WIDTH_LEFT - 12, 44))
+        item.setSizeHint(QSize(Dims.PANEL_WIDTH_LEFT - 12, 54))
         self._list.addItem(item)
+
+        widget = _FileItemWidget(path, self._list)
+        widget.remove_requested.connect(self._on_remove_file)
+        self._list.setItemWidget(item, widget)
+        self._item_widgets[path] = (item, widget)
+
         if select:
             self._list.setCurrentItem(item)
-        self._load_thumb(path, item)
+        self._load_thumb(path, widget)
 
     def add_files(self, paths: Iterable[str], select_last: bool = True) -> None:
         files = [path for path in paths if path]
         for index, path in enumerate(files):
             self.add_file(path, select=select_last and index == len(files) - 1)
 
-    def _load_thumb(self, path: str, item: QListWidgetItem) -> None:
+    def _on_remove_file(self, path: str) -> None:
+        if path not in self._item_widgets:
+            return
+        item, _ = self._item_widgets.pop(path)
+        row = self._list.row(item)
+        self._list.takeItem(row)
+        self.file_removed.emit(path)
+
+    def _load_thumb(self, path: str, widget: _FileItemWidget) -> None:
         if cv2 is None:
             return
         thread = QThread()
@@ -154,11 +219,11 @@ class ProjectPanel(QWidget):
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
 
-        def _apply(p, img, meta, _item=item) -> None:
+        def _apply(p, img, meta, _widget=widget) -> None:
             if img is not None and not img.isNull():
-                _item.setIcon(QIcon(QPixmap.fromImage(img)))
+                _widget.set_icon(QPixmap.fromImage(img))
             if meta:
-                _item.setText(f"{os.path.basename(p)}\n{meta}")
+                _widget.set_meta(meta)
             thread.quit()
 
         worker.done.connect(_apply)

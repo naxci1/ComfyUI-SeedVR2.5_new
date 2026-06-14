@@ -95,7 +95,8 @@ class VideoPreviewWidget(QWidget):
         ext = os.path.splitext(path)[1].lower()
         image_exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
         if ext in image_exts:
-            frame = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+            _raw = np.fromfile(path, dtype=np.uint8) if np is not None else None
+            frame = cv2.imdecode(_raw, cv2.IMREAD_UNCHANGED) if _raw is not None else None
             if frame is None:
                 return False
             if frame.dtype != "uint8" and np is not None:

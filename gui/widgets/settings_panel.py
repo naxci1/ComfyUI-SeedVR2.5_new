@@ -264,6 +264,12 @@ class SettingsPanel(QWidget):
         self._vram_timer.setInterval(300)
         self._vram_timer.timeout.connect(self._update_vram_prediction)
         self.settings_changed.connect(self._vram_timer.start)
+        # Debounce last_used saves so we don't write on every slider tick.
+        self._last_used_timer = QTimer(self)
+        self._last_used_timer.setSingleShot(True)
+        self._last_used_timer.setInterval(1000)
+        self._last_used_timer.timeout.connect(self.save_last_used)
+        self.settings_changed.connect(self._last_used_timer.start)
         self._tooltip_timer = QTimer(self)
         self._tooltip_timer.setSingleShot(True)
         self._tooltip_timer.setInterval(3000)
@@ -326,10 +332,20 @@ class SettingsPanel(QWidget):
                 break
         widget.setVisible(visible)
 
+    @staticmethod
+    def _presets_dir() -> Path:
+        """Return the directory where preset JSON files are stored."""
+        import sys as _sys
+        if _sys.platform == "win32":
+            base = Path("C:/1Click_SeedVR2.5/presets")
+        else:
+            base = Path(os.path.expanduser("~")) / ".seedvr2" / "presets"
+        base.mkdir(parents=True, exist_ok=True)
+        return base
+
     def _build_presets_group(self) -> None:
         """Presets section: save/load named settings presets."""
         self._advanced_only_widgets: List[QWidget] = []
-        self._presets_file = Path(os.path.expanduser("~")) / ".seedvr2_presets.json"
         self._presets: Dict[str, Any] = self._load_presets()
 
         box = QGroupBox("PRESETS", self)
@@ -379,21 +395,78 @@ class SettingsPanel(QWidget):
         vlay.addWidget(del_lbl)
 
         self._refresh_preset_list()
+        self._apply_last_used_settings()
 
     def _load_presets(self) -> Dict[str, Any]:
+        """Load all presets from the presets directory (one JSON file each)."""
+        presets: Dict[str, Any] = {}
         try:
-            if self._presets_file.exists():
-                with open(self._presets_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    return data if isinstance(data, dict) else {}
+            d = self._presets_dir()
+            for f in d.glob("*.json"):
+                if f.stem == "last_used":
+                    continue
+                try:
+                    with open(f, "r", encoding="utf-8") as fh:
+                        data = json.load(fh)
+                        if isinstance(data, dict):
+                            presets[f.stem] = data
+                except Exception:
+                    pass
         except Exception:
             pass
-        return {}
+        return presets
 
-    def _save_presets_to_disk(self) -> None:
+    def _save_preset_to_disk(self, name: str, settings: Dict[str, Any]) -> None:
+        """Save a single preset as {name}.json in the presets directory."""
         try:
-            with open(self._presets_file, "w", encoding="utf-8") as f:
-                json.dump(self._presets, f, indent=2)
+            d = self._presets_dir()
+            # Sanitise name for use as a filename.
+            safe = "".join(c if c.isalnum() or c in " _-." else "_" for c in name).strip()
+            if not safe:
+                safe = "preset"
+            path = d / f"{safe}.json"
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(settings, fh, indent=2)
+        except Exception:
+            pass
+
+    def _delete_preset_from_disk(self, name: str) -> None:
+        """Remove the preset JSON file for *name*."""
+        try:
+            d = self._presets_dir()
+            safe = "".join(c if c.isalnum() or c in " _-." else "_" for c in name).strip()
+            path = d / f"{safe}.json"
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
+
+    def save_last_used(self) -> None:
+        """Persist current settings as last_used.json."""
+        try:
+            d = self._presets_dir()
+            with open(d / "last_used.json", "w", encoding="utf-8") as fh:
+                json.dump(self.get_all_settings(), fh, indent=2)
+        except Exception:
+            pass
+
+    def _apply_last_used_settings(self) -> None:
+        """Restore settings from last_used.json if it exists."""
+        try:
+            d = self._presets_dir()
+            last = d / "last_used.json"
+            if not last.exists():
+                return
+            with open(last, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict):
+                # Reuse the preset load logic.
+                class _FakeItem:
+                    def data(self, _role):
+                        return "__last_used__"
+                self._presets["__last_used__"] = data
+                self._on_load_preset(_FakeItem())  # type: ignore[arg-type]
+                self._presets.pop("__last_used__", None)
         except Exception:
             pass
 
@@ -410,10 +483,11 @@ class SettingsPanel(QWidget):
         if not name:
             return
         try:
-            self._presets[name] = self.get_all_settings()
+            settings = self.get_all_settings()
+            self._presets[name] = settings
+            self._save_preset_to_disk(name, settings)
         except Exception:
             return
-        self._save_presets_to_disk()
         self._refresh_preset_list()
         self._preset_name_edit.clear()
 
@@ -438,10 +512,11 @@ class SettingsPanel(QWidget):
         if not name:
             return
         try:
-            self._presets[name] = self.get_all_settings()
+            settings = self.get_all_settings()
+            self._presets[name] = settings
+            self._save_preset_to_disk(name, settings)
         except Exception:
             return
-        self._save_presets_to_disk()
         self._refresh_preset_list()
 
     def _rename_preset(self, item: QListWidgetItem) -> None:
@@ -450,8 +525,10 @@ class SettingsPanel(QWidget):
         new_name = new_name.strip()
         if not ok or not new_name or new_name == current_name:
             return
-        self._presets[new_name] = self._presets.pop(current_name)
-        self._save_presets_to_disk()
+        settings = self._presets.pop(current_name)
+        self._delete_preset_from_disk(current_name)
+        self._presets[new_name] = settings
+        self._save_preset_to_disk(new_name, settings)
         self._refresh_preset_list()
 
     def _delete_preset(self, item: QListWidgetItem) -> None:
@@ -459,7 +536,7 @@ class SettingsPanel(QWidget):
         if QMessageBox.question(self, "Delete preset", f"Delete preset '{name}'?") != QMessageBox.Yes:
             return
         self._presets.pop(name, None)
-        self._save_presets_to_disk()
+        self._delete_preset_from_disk(name)
         self._refresh_preset_list()
 
     def _on_load_preset(self, item: QListWidgetItem) -> None:
@@ -585,19 +662,23 @@ class SettingsPanel(QWidget):
 
     def _populate_cuda_devices(self) -> None:
         self.cuda_device_list.clear()
-        items = ["0"]
+        gpu_ids = ["0"]
         try:
             import torch  # type: ignore
 
             if torch.cuda.is_available():
                 count = torch.cuda.device_count()
-                items = [str(index) for index in range(max(1, count))]
+                gpu_ids = [str(index) for index in range(max(1, count))]
         except Exception:
-            items = ["0"]
-        for value in items:
+            gpu_ids = ["0"]
+        for value in gpu_ids:
             item = QListWidgetItem(f"GPU {value}")
             item.setData(Qt.UserRole, value)
             self.cuda_device_list.addItem(item)
+        # Add CPU option
+        cpu_item = QListWidgetItem("CPU (slow, for testing)")
+        cpu_item.setData(Qt.UserRole, "cpu")
+        self.cuda_device_list.addItem(cpu_item)
         if self.cuda_device_list.count() > 0:
             self.cuda_device_list.item(0).setSelected(True)
 
@@ -701,7 +782,7 @@ class SettingsPanel(QWidget):
     def _build_model_group(self) -> None:
         form = self._group("MODEL & PERFORMANCE", advanced_only=True)
         models = self._discover_models()
-        default_display = _display_name("seedvr2_ema_3b_fp8_e4m3fn.safetensors")
+        default_display = "3B Q8"
         self.dit_model_combo = self._combo(models, default_display if default_display in models else (models[0] if models else ""))
         self.attention_mode_combo = self._combo(
             ["sdpa", "flash_attn_2", "flash_attn_3", "sage_attn_2", "sage_attn_3"],
@@ -966,9 +1047,9 @@ class SettingsPanel(QWidget):
         )
         self._add_row(
             form,
-            "CUDA device(s)",
+            "GPU Device(s)",
             self.cuda_device_list,
-            "Select one or more CUDA devices used for processing.",
+            "Select one or more GPU devices used for processing. Select CPU for CPU-only processing.",
         )
 
     def _build_vram_group(self) -> None:
@@ -1064,6 +1145,19 @@ class SettingsPanel(QWidget):
 
     def update_vram_estimate(self) -> None:
         self._update_vram_prediction()
+
+    def set_image_mode(self) -> None:
+        """Force settings appropriate for single-image processing."""
+        self.batch_size_spin.blockSignals(True)
+        self.batch_size_spin.setValue(1)
+        self.batch_size_spin.blockSignals(False)
+        self.load_cap_spin.blockSignals(True)
+        self.load_cap_spin.setValue(0)
+        self.load_cap_spin.blockSignals(False)
+        self.skip_first_frames_spin.blockSignals(True)
+        self.skip_first_frames_spin.setValue(0)
+        self.skip_first_frames_spin.blockSignals(False)
+        self._emit_settings_changed()
 
     def set_enabled_state(self, enabled: bool) -> None:
         self.setEnabled(enabled)

@@ -182,6 +182,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(APP_NAME)
         self.resize(1440, 900)
         self.setMinimumSize(1180, 760)
+        self.setAcceptDrops(True)
 
         self._config = load_config()
         self._current_file = ""
@@ -230,6 +231,7 @@ class MainWindow(QMainWindow):
 
         center_layout.addWidget(self._build_header())
         self.io_bar = self._build_io_bar()
+        self.io_bar.setVisible(False)  # Hidden — paths tracked internally
         center_layout.addWidget(self.io_bar)
         self.view_mode_bar = self._build_view_mode_bar()
         center_layout.addWidget(self.view_mode_bar)
@@ -485,6 +487,7 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self) -> None:
         self.project_panel.file_selected.connect(self.load_file)
+        self.project_panel.file_removed.connect(self._on_file_removed)
         self.project_panel.input_folder_selected.connect(self._on_input_folder_selected)
         self.project_panel.output_folder_requested.connect(self._on_output_folder_requested)
         self.drop_zone.file_dropped.connect(self._on_file_dropped)
@@ -521,6 +524,31 @@ class MainWindow(QMainWindow):
         self.input_path_edit.editingFinished.connect(self._on_input_path_edited)
         self.output_path_edit.editingFinished.connect(self._on_output_path_edited)
 
+    # ---------------------------------------------------------------- drag & drop on main window
+    _VALID_DROP_EXTS = {
+        ".mp4", ".mov", ".mkv", ".avi", ".webm",
+        ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".exr", ".dpx", ".bmp",
+    }
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        if not event.mimeData().hasUrls():
+            event.ignore()
+            return
+        last_path = None
+        for url in event.mimeData().urls():
+            path = url.toLocalFile()
+            if path and os.path.splitext(path)[1].lower() in self._VALID_DROP_EXTS:
+                self.project_panel.add_file(path, select=False)
+                last_path = path
+        if last_path:
+            self.load_file(last_path)
+        event.acceptProposedAction()
 
     def _clear_trim(self) -> None:
         """Reset IN/OUT to full range (fix #8 — X clear button)."""
@@ -659,6 +687,17 @@ class MainWindow(QMainWindow):
         self.project_panel.add_file(path)
         self.load_file(path)
 
+    def _on_file_removed(self, path: str) -> None:
+        """Handle X-button removal of a file from the project panel."""
+        if path == self._current_file:
+            self._current_file = ""
+            self.preview_widget.clear()
+            self.input_path_edit.setText("")
+            self._preview_source_frame_path = ""
+            self._last_processed_preview_path = ""
+
+    _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+
     def load_file(self, path: str) -> None:
         if not path or not os.path.isfile(path):
             return
@@ -670,6 +709,9 @@ class MainWindow(QMainWindow):
         self.trim_timeline.load_video(path)
         self.settings_panel.set_trim_range(0, 0, self.preview_widget.get_frame_count(), False)
         self._set_preview_mode("single")
+        # Fix 4 — auto-set image mode for image files
+        if os.path.splitext(path)[1].lower() in self._IMAGE_EXTS:
+            self.settings_panel.set_image_mode()
         self._update_trim_labels()
         self._update_video_info()
         out_dir = self.output_path_edit.text().strip() or str(Path(path).parent)
@@ -915,6 +957,17 @@ class MainWindow(QMainWindow):
                 else str(export_settings.get("container", "MP4")).lower()
             )
 
+        # Fix 5 — capture snapshot of current frame for split view after export
+        frame_image = self.preview_widget.current_frame_image()
+        if not frame_image.isNull():
+            out_dir = self._resolve_output_dir()
+            source = Path(self._current_file)
+            snap_path = str(out_dir / f"{source.stem}_export_snapshot.tiff")
+            self._save_qimage_as_tiff16(frame_image, snap_path)
+            self._snapshot_fallback_path = snap_path
+        else:
+            self._snapshot_fallback_path = ""
+
         args = self._build_cli_args(payload)
         self._start_worker(cli_script, python_exe, args, "export", output_path)
 
@@ -1022,7 +1075,8 @@ class MainWindow(QMainWindow):
         self._current_phase_index = current
         bounded_phase_progress = max(0.0, min(1.0, float(phase_progress)))
         self.progress.setTotalLabel(f"{current}/{total} {phase_name}")
-        self.progress.setTotalValue(100.0 * ((current - 1) + bounded_phase_progress) / total)
+        # Fix 8 — jump total bar to phase start immediately when phase begins
+        self.progress.setTotalValue(100.0 * current / total)
         self.progress.setValue(100.0 * bounded_phase_progress)
         self.status_label.setText(phase_name)
 
@@ -1123,13 +1177,12 @@ class MainWindow(QMainWindow):
             self._play_success_sound()
             Toast.show(self, "Completed successfully", "success")
             loaded = self._load_preview_outputs()
-            if loaded is not None:
-                original = self._preview_source_frame_path or self._snapshot_fallback_path
-                if original and Path(original).exists():
-                    # Use split view by default after processing.
-                    self._preview_source_frame_path = original
-                    self._last_processed_preview_path = str(loaded)
-                    self._set_preview_mode("split")
+            original = self._preview_source_frame_path or self._snapshot_fallback_path
+            if loaded is not None and original and Path(original).exists():
+                # Fix 5 — auto-add to split view after both preview and export
+                self._preview_source_frame_path = original
+                self._last_processed_preview_path = str(loaded)
+                self._set_preview_mode("split")
         else:
             Toast.show(self, message or "Processing failed", "error")
             if message and message != "Cancelled.":
@@ -1177,7 +1230,10 @@ class MainWindow(QMainWindow):
             array = array.reshape((height, width, 3))
             rgb16 = array.astype(np.uint16) * 257
             bgr16 = cv2.cvtColor(rgb16, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(str(target), bgr16)
+            _ext = os.path.splitext(str(target))[1]
+            _success, _buf = cv2.imencode(_ext, bgr16)
+            if _success:
+                _buf.tofile(str(target))
         except Exception:
             image.save(str(target), "TIFF")
 

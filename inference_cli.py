@@ -510,8 +510,9 @@ def extract_frames_from_image(image_path: str) -> Tuple[torch.Tensor, float]:
     if not os.path.exists(image_path):
         raise FileNotFoundError(f"Image file not found: {image_path}")
     
-    # Read image with alpha channel preserved
-    frame = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+    # Read image with alpha channel preserved (use fromfile+imdecode for Unicode path support)
+    _raw = np.fromfile(image_path, dtype=np.uint8)
+    frame = cv2.imdecode(_raw, cv2.IMREAD_UNCHANGED)
     if frame is None:
         raise ValueError(f"Cannot open image file: {image_path}")
     
@@ -1066,7 +1067,8 @@ def _probe_input_short_side(input_path: str) -> Optional[int]:
             cap.release()
             return min(width, height) if width and height else None
         if itype == "image":
-            img = cv2.imread(input_path)
+            _raw = np.fromfile(input_path, dtype=np.uint8)
+            img = cv2.imdecode(_raw, cv2.IMREAD_COLOR)
             if img is None:
                 return None
             height, width = img.shape[:2]
@@ -1630,9 +1632,15 @@ def _save_image_bgr(frame: np.ndarray, file_path: str) -> None:
 
     if sixteen_bit:
         # IMWRITE_TIFF_COMPRESSION = 1 → no compression (uncompressed TIFF).
-        cv2.imwrite(file_path, out, [int(cv2.IMWRITE_TIFF_COMPRESSION), 1])
+        _ext = os.path.splitext(file_path)[1]
+        _success, _buf = cv2.imencode(_ext, out, [int(cv2.IMWRITE_TIFF_COMPRESSION), 1])
+        if _success:
+            _buf.tofile(file_path)
     else:
-        cv2.imwrite(file_path, out)
+        _ext = os.path.splitext(file_path)[1]
+        _success, _buf = cv2.imencode(_ext, out)
+        if _success:
+            _buf.tofile(file_path)
 
 
 def _emit_gui_queue_status(file_path: str, current: int, total: int) -> None:
