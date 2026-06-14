@@ -53,7 +53,6 @@ import time
 import shlex
 import hashlib
 import platform
-import tempfile
 import threading
 import multiprocessing as mp
 from collections import deque
@@ -154,14 +153,41 @@ from src.optimization.memory_manager import clear_memory, get_gpu_backend, is_cu
 debug = Debug(enabled=False)  # Will be enabled via --debug CLI flag
 
 
-def _seedvr_temp_dir() -> str:
-    if os.name == "nt":
-        return os.path.join("C:\\1Click_SeedVR2.5", "temp")
-    return os.path.join(tempfile.gettempdir(), "1Click_SeedVR2.5", "temp")
+if getattr(sys, "frozen", False):
+    APP_ROOT = os.path.dirname(sys.executable)
+else:
+    APP_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+DEFAULT_TEMP_DIR = os.path.join(APP_ROOT, "temp")
+CONFIG_PATH = os.path.join(APP_ROOT, "config.json")
 
 
-TEMP_DIR = _seedvr_temp_dir()
-os.makedirs(TEMP_DIR, exist_ok=True)
+def _load_temp_dir_from_config() -> str:
+    config: Dict[str, Any] = {}
+    if os.path.isfile(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                config = loaded
+        except Exception:
+            config = {}
+
+    temp_dir = str(config.get("temp_dir", "")).strip()
+    if not temp_dir:
+        temp_dir = DEFAULT_TEMP_DIR
+        config["temp_dir"] = temp_dir
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
+                json.dump(config, fh, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    os.makedirs(temp_dir, exist_ok=True)
+    return temp_dir
+
+
+TEMP_DIR = _load_temp_dir_from_config()
 
 
 # =============================================================================
@@ -1284,6 +1310,8 @@ def _run_with_auto_tune(
         if is_image:
             args.batch_size = 1
             args.uniform_batch_size = False
+            args.prepend_frames = 0
+            args.temporal_overlap = 0
         else:
             args.batch_size = params["batch_size"]
         tile_size = params["tile_size"]
@@ -1390,6 +1418,10 @@ def process_single_file(input_path: str, args: "argparse.Namespace", device_list
             _force_disable_cudagraphs_for_safe_mode(args, "Preview mode")
         if input_type == "image":
             _force_disable_cudagraphs_for_safe_mode(args, "Single-image mode")
+            args.prepend_frames = 0
+            args.temporal_overlap = 0
+            args.batch_size = 1
+            args.uniform_batch_size = False
         
         debug.log(f"Processing {input_type}: {Path(input_path).name}", category="generation", force=True)
         

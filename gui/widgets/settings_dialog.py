@@ -54,6 +54,7 @@ class SettingsDialog(QDialog):
         self.seedvr2_edit = QLineEdit(self._config.get("seedvr2_folder", ""), self)
         self.ffmpeg_edit = QLineEdit(self._config.get("ffmpeg_path", ""), self)
         self.models_edit = QLineEdit(self._config.get("models_dir", ""), self)
+        self.temp_edit = QLineEdit(self._config.get("temp_dir", ""), self)
         alarm_enabled = str(self._config.get("alarm_enabled", "true")).strip().lower() not in {"0", "false", "no", "off"}
         self.alarm_toggle = ToggleSwitch("", alarm_enabled, self)
 
@@ -61,6 +62,7 @@ class SettingsDialog(QDialog):
         form.addRow("SeedVR2 folder", self._browse_row(self.seedvr2_edit, False))
         form.addRow("FFmpeg binary", self._browse_row(self.ffmpeg_edit, True))
         form.addRow("Models directory", self._browse_row(self.models_edit, False))
+        form.addRow("Temp directory", self._browse_row(self.temp_edit, False))
         form.addRow("Alarm sounds", self.alarm_toggle)
         layout.addWidget(form_widget)
 
@@ -100,6 +102,7 @@ class SettingsDialog(QDialog):
                 "seedvr2_folder": self.seedvr2_edit.text().strip(),
                 "ffmpeg_path": self.ffmpeg_edit.text().strip(),
                 "models_dir": self.models_edit.text().strip(),
+                "temp_dir": self.temp_edit.text().strip(),
                 "alarm_enabled": "true" if self.alarm_toggle.isChecked() else "false",
             }
         )

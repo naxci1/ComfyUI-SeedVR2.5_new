@@ -11,12 +11,12 @@ import sys
 import traceback
 import webbrowser
 import json
-import tempfile
 from pathlib import Path
 from typing import Optional
 
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 _APP_ROOT = os.path.dirname(_APP_DIR)
+APP_ROOT = _APP_ROOT
 for _p in (_APP_ROOT, _APP_DIR):
     if os.path.isdir(_p) and _p not in sys.path:
         sys.path.insert(0, _p)
@@ -110,16 +110,19 @@ except ImportError:  # pragma: no cover - direct-script execution fallback
 
 APP_NAME = "1-Click SeedVR2.5 v.1.8b (by Naxci1)"
 GITHUB_URL = "https://github.com/naxci1/1Click_SeedVR2.5"
+DEFAULT_TEMP_DIR = os.path.join(APP_ROOT, "temp")
+TEMP_DIR = DEFAULT_TEMP_DIR
 
 
-def _seedvr_temp_dir() -> str:
-    if os.name == "nt":
-        return os.path.join("C:\\1Click_SeedVR2.5", "temp")
-    return os.path.join(tempfile.gettempdir(), "1Click_SeedVR2.5", "temp")
-
-
-TEMP_DIR = _seedvr_temp_dir()
-os.makedirs(TEMP_DIR, exist_ok=True)
+def _sync_temp_dir_from_config(config: Optional[dict] = None) -> str:
+    cfg = config if isinstance(config, dict) else load_config()
+    temp_dir = str(cfg.get("temp_dir", "")).strip()
+    if not temp_dir:
+        temp_dir = DEFAULT_TEMP_DIR
+        cfg["temp_dir"] = temp_dir
+        save_config(cfg)
+    os.makedirs(temp_dir, exist_ok=True)
+    return temp_dir
 
 try:
     import psutil  # type: ignore
@@ -209,6 +212,8 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
 
         self._config = load_config()
+        global TEMP_DIR
+        TEMP_DIR = _sync_temp_dir_from_config(self._config)
         self._current_file = ""
         self._processing = False
         self._thread: Optional[QThread] = None
@@ -1009,10 +1014,20 @@ class MainWindow(QMainWindow):
         return str(path.with_name(name))
 
     def _preview_output_path(self) -> str:
-        return str(Path(TEMP_DIR) / "preview_result.tiff")
+        return str(Path(self._temp_dir()) / "preview_result.tiff")
+
+    def _temp_dir(self) -> str:
+        global TEMP_DIR
+        TEMP_DIR = _sync_temp_dir_from_config(self._config)
+        return TEMP_DIR
 
     def _build_cli_args(self, payload: dict) -> list[str]:
-        settings = payload.get("settings", {})
+        settings = dict(payload.get("settings", {}))
+        if Path(str(payload.get("input", ""))).suffix.lower() in self._IMAGE_EXTS:
+            settings["prepend_frames"] = 0
+            settings["temporal_overlap"] = 0
+            settings["batch_size"] = 1
+            settings["uniform_batch_size"] = False
         args: list[str] = [payload["input"]]
 
         output_path = payload.get("output_path") or payload.get("export", {}).get("output_path", "")
@@ -1156,7 +1171,7 @@ class MainWindow(QMainWindow):
         # Fix 5 — capture snapshot of current frame for split view after export
         frame_image = self.preview_widget.current_frame_image()
         if not frame_image.isNull():
-            snap_path = str(Path(TEMP_DIR) / "export_snapshot.tiff")
+            snap_path = str(Path(self._temp_dir()) / "export_snapshot.tiff")
             self._save_qimage_as_tiff16(frame_image, snap_path)
             self._snapshot_fallback_path = snap_path
         else:
@@ -1185,8 +1200,7 @@ class MainWindow(QMainWindow):
             Toast.show(self, "No preview frame available", "warning")
             return
 
-        os.makedirs(TEMP_DIR, exist_ok=True)
-        input_frame_path = Path(TEMP_DIR) / "preview_source.tiff"
+        input_frame_path = Path(self._temp_dir()) / "preview_source.tiff"
         preview_output = Path(self._preview_output_path())
 
         self._save_qimage_as_tiff16(frame_image, str(input_frame_path))
@@ -1205,7 +1219,7 @@ class MainWindow(QMainWindow):
             "output_format": "tiff",
         }
         self._snapshot_fallback_path = str(
-            Path(TEMP_DIR) / "preview_fallback.tiff"
+            Path(self._temp_dir()) / "preview_fallback.tiff"
         )
         self._save_qimage_as_tiff16(frame_image, self._snapshot_fallback_path)
         args = self._build_cli_args(preview_payload)
@@ -1488,6 +1502,7 @@ class MainWindow(QMainWindow):
         dialog = SettingsDialog(self)
         if dialog.exec():
             self._config = load_config()
+            self._temp_dir()
             self.settings_panel.reload_models()
             self._start_codec_probe()
             Toast.show(self, "Settings saved", "success")

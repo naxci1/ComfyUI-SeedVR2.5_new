@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 
 from ..theme import Colors, Dims, Fonts
 from .button3d import Button3D
+from .device_info import DeviceInfoPanel
 from .toggle_switch import ToggleSwitch
 
 try:
@@ -1138,25 +1139,9 @@ class SettingsPanel(QWidget):
         )
 
     def _build_vram_group(self) -> None:
-        box = QGroupBox("DEVICE INFO", self)
-        layout = QVBoxLayout(box)
-        layout.setContentsMargins(Dims.PADDING_MD, Dims.PADDING_LG, Dims.PADDING_MD, Dims.PADDING_MD)
-        box.setStyleSheet(
-            f"QGroupBox {{ color: {Colors.TEXT_PRIMARY}; font-size: {Fonts.SIZE_SMALL + 1}px; "
-            f"font-weight: {Fonts.WEIGHT_BOLD}; border: 1px solid {Colors.BORDER}; "
-            f"border-radius: {Dims.CORNER_RADIUS_MD}px; margin-top: 8px; padding-top: 8px; }}"
-        )
-        self._device_info_labels: List[QLabel] = []
-        for _ in range(7):
-            lbl = QLabel("—", box)
-            lbl.setStyleSheet(
-                f"color: {Colors.TEXT_PRIMARY}; font-size: {Fonts.SIZE_SMALL + 1}px; "
-                f"font-weight: {Fonts.WEIGHT_MEDIUM};"
-            )
-            layout.addWidget(lbl)
-            self._device_info_labels.append(lbl)
-        self._layout.addWidget(box)
-        self._advanced_only_widgets.append(box)
+        self.device_info = DeviceInfoPanel(gpu_index=0, parent=self)
+        self._layout.addWidget(self.device_info)
+        self._advanced_only_widgets.append(self.device_info)
 
     def _snap_batch_size(self, value: int) -> None:
         snapped = round((value - 1) / 4) * 4 + 1

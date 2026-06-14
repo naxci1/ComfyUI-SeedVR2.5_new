@@ -31,13 +31,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 if getattr(sys, "frozen", False):
-    # PyInstaller bundle: the EXE is typically two levels inside the root
-    # (e.g. ROOT\dist\SeedVR2_GUI.exe or ROOT\python_embeded\SeedVR2_GUI.exe).
-    # Going up two dirname levels reaches the true installation root without
-    # ever hard-coding the 'dist' folder name.
-    ROOT_DIR: Path = Path(
-        os.path.dirname(os.path.dirname(os.path.abspath(sys.executable)))
-    )
+    ROOT_DIR: Path = Path(os.path.dirname(os.path.abspath(sys.executable)))
 else:
     # Development / editable install: this file is gui/config_manager.py,
     # so its parent is gui/, and its grandparent is the repo root.
@@ -46,6 +40,7 @@ else:
     )
 
 CONFIG_PATH: Path = ROOT_DIR / "config.json"
+DEFAULT_TEMP_DIR: str = os.path.normpath(os.path.join(str(ROOT_DIR), "temp"))
 
 _IS_WIN: bool = sys.platform == "win32"
 
@@ -67,6 +62,7 @@ DEFAULT_PATHS: dict[str, str] = {
     "ffmpeg_path": os.path.normpath(os.path.join(str(ROOT_DIR), _REL_FFMPEG)),
     "models_dir": os.path.normpath(os.path.join(str(ROOT_DIR), _REL_MODELS)),
     "seedvr2_folder": str(ROOT_DIR),
+    "temp_dir": DEFAULT_TEMP_DIR,
     # Session I/O – populated at runtime
     "input_path": "",
     "input_mode": "File",
@@ -176,6 +172,8 @@ def load_config() -> dict[str, str]:
     # Start from defaults then overlay saved values.
     cfg: dict[str, str] = dict(DEFAULT_PATHS)
     cfg.update({k: str(v) for k, v in saved.items() if isinstance(v, str)})
+    if "temp_dir" not in cfg or not str(cfg.get("temp_dir", "")).strip():
+        cfg["temp_dir"] = DEFAULT_TEMP_DIR
 
     # Re-verify system paths after a potential folder move.
     for key in ("python_exe", "ffmpeg_path", "models_dir", "seedvr2_folder"):
@@ -187,6 +185,16 @@ def load_config() -> dict[str, str]:
 
     # Backtracking validation for any path still missing.
     INVALID_PATHS = validate_paths(cfg)
+
+    # Ensure writable temp directory exists.
+    try:
+        os.makedirs(cfg.get("temp_dir", DEFAULT_TEMP_DIR), exist_ok=True)
+    except OSError:
+        cfg["temp_dir"] = DEFAULT_TEMP_DIR
+        try:
+            os.makedirs(cfg["temp_dir"], exist_ok=True)
+        except OSError:
+            pass
 
     save_config(cfg)
     return cfg

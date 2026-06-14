@@ -18,6 +18,7 @@ from .settings_dialog import SettingsDialog
 from .error_dialog import ErrorDialog
 from .log_viewer import LogViewer
 from .split_view import SplitViewWidget
+from .device_info import DeviceInfoPanel
 
 __all__ = [
     "Button3D",
@@ -38,4 +39,5 @@ __all__ = [
     "ErrorDialog",
     "LogViewer",
     "SplitViewWidget",
+    "DeviceInfoPanel",
 ]
