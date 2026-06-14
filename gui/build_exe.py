@@ -90,23 +90,15 @@ def main() -> None:
         "--onefile",
         "--noconsole",
         "--noupx",  # disable UPX compression – avoids "This app can't run on your PC"
-        # Bundle GUI Python modules (styles, settings window, split view)
-        "--add-data", f"{gui_dir / 'styles.py'}{os.pathsep}gui",
-        "--add-data", f"{gui_dir / 'settings_window.py'}{os.pathsep}gui",
-        "--add-data", f"{gui_dir / 'split_view.py'}{os.pathsep}gui",
-        # Core hidden imports (PyQt6 + multimedia for the comparison player)
-        "--hidden-import", "PyQt6",
-        "--hidden-import", "PyQt6.QtWidgets",
-        "--hidden-import", "PyQt6.QtCore",
-        "--hidden-import", "PyQt6.QtGui",
-        "--hidden-import", "PyQt6.QtMultimedia",
-        "--hidden-import", "PyQt6.QtMultimediaWidgets",
+        # Core hidden imports (PySide6)
+        "--hidden-import", "PySide6",
+        "--hidden-import", "PySide6.QtWidgets",
+        "--hidden-import", "PySide6.QtCore",
+        "--hidden-import", "PySide6.QtGui",
         # Exclude heavy ML / AI libraries – they live in the user's python_embeded
         "--exclude-module", "torch",
         "--exclude-module", "torchvision",
         "--exclude-module", "torchaudio",
-        "--exclude-module", "numpy",
-        "--exclude-module", "cv2",
         "--exclude-module", "onnxruntime",
         "--exclude-module", "transformers",
         "--exclude-module", "safetensors",

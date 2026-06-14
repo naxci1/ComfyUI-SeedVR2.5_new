@@ -298,8 +298,7 @@ class FFMPEGVideoWriter:
         return None  # Will use software encoding fallback
     
     def __init__(self, path: str, width: int, height: int, fps: float, use_10bit: bool = False,
-                 custom_video_args: Optional[List[str]] = None,
-                 lut_path: Optional[str] = None):
+                 custom_video_args: Optional[List[str]] = None):
         if custom_video_args:
             video_enc_args = custom_video_args
         else:
@@ -320,14 +319,10 @@ class FFMPEGVideoWriter:
                                   '-pix_fmt', 'yuv420p10le' if use_10bit else 'yuv420p']
         video_enc_args = self._normalize_video_encoder_args(video_enc_args)
         
-        filter_args: List[str] = []
-        if lut_path:
-            filter_args = ['-vf', f'lut3d={lut_path}']
-
         ffmpeg_cmd = [
             'ffmpeg', '-y', '-f', 'rawvideo', '-pix_fmt', 'rgb24',
             '-s', f'{width}x{height}', '-r', str(fps), '-i', '-',
-            *filter_args, *video_enc_args, path
+            *video_enc_args, path
         ]
         if debug.enabled:
             debug.log(
@@ -340,7 +335,7 @@ class FFMPEGVideoWriter:
         # (instead of discarding it) and drain it on a background daemon thread
         # into a bounded ring buffer. This is what makes long exports debuggable:
         # when the pipe breaks after minutes of streaming, the OS only tells us
-        # "broken pipe" — the *reason* (codec rejection, disk full, bad LUT) is
+        # "broken pipe" — the *reason* (codec rejection, disk full, bad args) is
         # only ever written by ffmpeg to stderr. Buffering the tail lets us report
         # the real cause instead of an opaque error.
         self._stderr_tail: "deque[str]" = deque(maxlen=50)
@@ -1350,8 +1345,7 @@ def process_single_file(input_path: str, args: "argparse.Namespace", device_list
                 else:
                     video_writer = save_frames_to_video(result, output_path, fps,
                         video_backend=args.video_backend, use_10bit=args.use_10bit,
-                        custom_video_args=custom_video_args,
-                        lut_path=getattr(args, "lut", None))
+                        custom_video_args=custom_video_args)
 
                 frames_written = result.shape[0]
 
@@ -1383,8 +1377,7 @@ def process_single_file(input_path: str, args: "argparse.Namespace", device_list
                     else:
                         video_writer = save_frames_to_video(result, output_path, fps, writer=video_writer,
                             video_backend=args.video_backend, use_10bit=args.use_10bit,
-                            custom_video_args=custom_video_args,
-                            lut_path=getattr(args, "lut", None))
+                            custom_video_args=custom_video_args)
 
                     frames_written += result.shape[0]
                     del result
@@ -1725,7 +1718,6 @@ def save_frames_to_video(
     video_backend: str = "ffmpeg",
     use_10bit: bool = False,
     custom_video_args: Optional[List[str]] = None,
-    lut_path: Optional[str] = None,
 ) -> Optional[cv2.VideoWriter]:
     """
     Save frames tensor to a video file.
@@ -1785,8 +1777,7 @@ def save_frames_to_video(
                 raise ValueError(f"cv2.VideoWriter cannot open: {output_path}")
         else:
             writer = FFMPEGVideoWriter(output_path, W, H, fps, use_10bit,
-                                       custom_video_args=custom_video_args,
-                                       lut_path=lut_path)
+                                       custom_video_args=custom_video_args)
             if not writer.isOpened():
                 raise ValueError(f"Cannot create video writer for: {output_path}")
 
@@ -2468,8 +2459,6 @@ Examples:
                         help="JSON array of custom FFmpeg video encoding args, e.g. "
                              '\'["-c:v","prores_ks","-profile:v","3","-pix_fmt","yuv422p10le"]\'. '
                              "When supplied, implies --video_backend ffmpeg and overrides --10bit codec defaults.")
-    io_group.add_argument("--lut", type=str, default=None,
-                        help="Optional LUT file path passed to ffmpeg (uses lut3d filter when writing video).")
     io_group.add_argument("--model_dir", type=str, default=None,
                         help=f"Model directory (default: ./models/{SEEDVR2_FOLDER_NAME})")
     io_group.add_argument("--pre_downscale", type=int, default=1, choices=[1, 2, 3],
