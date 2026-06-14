@@ -13,6 +13,10 @@ from .project_panel import ProjectPanel
 from .settings_panel import SettingsPanel
 from .export_dialog import ExportDialog
 from .title_bar import CustomTitleBar
+from .playback_controls import PlaybackControls
+from .settings_dialog import SettingsDialog
+from .error_dialog import ErrorDialog
+from .log_viewer import LogViewer
 
 __all__ = [
     "Button3D",
@@ -28,4 +32,8 @@ __all__ = [
     "SettingsPanel",
     "ExportDialog",
     "CustomTitleBar",
+    "PlaybackControls",
+    "SettingsDialog",
+    "ErrorDialog",
+    "LogViewer",
 ]

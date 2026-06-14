@@ -1,58 +1,69 @@
 #!/usr/bin/env python3
-"""
-1Click_SeedVR2.5 — PySide6 GUI (Topaz-style dark video enhancement UI).
-
-Entry point and :class:`MainWindow`.  Run directly::
-
-    python gui/app.py
-
-or as a package::
-
-    python -m gui.app
-"""
+"""PySide6 application entry-point for 1Click SeedVR2.5 v1.8b."""
 
 from __future__ import annotations
 
 import os
 import platform
+import shutil
+import subprocess
 import sys
+import traceback
+import webbrowser
+from pathlib import Path
 from typing import Optional
 
-# ---------------------------------------------------------------------------
-# Runtime sys.path bootstrap
-# ---------------------------------------------------------------------------
-# When frozen into an executable (PyInstaller / cx_Freeze) the import system
-# may not know about the ``gui`` package or its sibling modules (``theme`` …).
-# Explicitly add this script's own directory and its parent (the project root)
-# to ``sys.path`` so ``import gui.app`` and the legacy ``import theme`` both
-# resolve regardless of how the executable is launched.
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 _APP_ROOT = os.path.dirname(_APP_DIR)
 for _p in (_APP_ROOT, _APP_DIR):
     if os.path.isdir(_p) and _p not in sys.path:
         sys.path.insert(0, _p)
 
-from PySide6.QtCore import Qt, QThread, QObject, Signal, QTimer
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QImage, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QStackedWidget,
     QStatusBar,
     QVBoxLayout,
     QWidget,
 )
 
+
+def _custom_exception_hook(exctype, value, tb):
+    error_msg = "".join(traceback.format_exception(exctype, value, tb))
+    try:
+        with open("crash_log.txt", "a", encoding="utf-8") as f:
+            f.write(error_msg + "\n")
+    except Exception:
+        pass
+    app = QApplication.instance()
+    if app:
+        from gui.widgets.error_dialog import ErrorDialog
+
+        dlg = ErrorDialog(None, "Unhandled Exception", error_msg)
+        dlg.exec()
+
+
+sys.excepthook = _custom_exception_hook
+
 try:
+    from gui.config_manager import load_config, save_config
     from gui.theme import Colors, Dims, Fonts, generate_stylesheet
     from gui.widgets import (
         AnimatedProgressBar,
         Button3D,
         DropZone,
+        ErrorDialog,
         ExportDialog,
-        FrameScrubber,
+        LogViewer,
+        PlaybackControls,
         ProjectPanel,
+        SettingsDialog,
         SettingsPanel,
         Toast,
         TrimTimeline,
@@ -60,14 +71,18 @@ try:
     )
     from gui.workers import create_worker_thread, resolve_paths
 except ImportError:  # pragma: no cover - direct-script execution fallback
+    from config_manager import load_config, save_config  # type: ignore[no-redef]
     from theme import Colors, Dims, Fonts, generate_stylesheet  # type: ignore
     from widgets import (  # type: ignore
         AnimatedProgressBar,
         Button3D,
         DropZone,
+        ErrorDialog,
         ExportDialog,
-        FrameScrubber,
+        LogViewer,
+        PlaybackControls,
         ProjectPanel,
+        SettingsDialog,
         SettingsPanel,
         Toast,
         TrimTimeline,
@@ -76,12 +91,8 @@ except ImportError:  # pragma: no cover - direct-script execution fallback
     from workers import create_worker_thread, resolve_paths  # type: ignore
 
 
-# ---------------------------------------------------------------------------
-# Hardware detection (background thread, never blocks the GUI)
-# ---------------------------------------------------------------------------
-
 class _HardwareProbe(QObject):
-    detected = Signal(str, str)  # gpu_name, vram_text
+    detected = Signal(str, str)
 
     def run(self) -> None:
         name, vram = "CPU", "—"
@@ -98,92 +109,163 @@ class _HardwareProbe(QObject):
         self.detected.emit(name, vram)
 
 
-def _section_label(text: str) -> QLabel:
-    lbl = QLabel(text)
-    lbl.setProperty("role", "muted")
-    return lbl
+class _CodecProbe(QObject):
+    detected = Signal(dict)
+
+    def __init__(self, ffmpeg_path: str = "") -> None:
+        super().__init__()
+        self._ffmpeg_path = ffmpeg_path
+
+    def run(self) -> None:
+        result = {"nvenc": False, "qsv": False, "amf": False}
+        ffmpeg = self._ffmpeg_path if self._ffmpeg_path and Path(self._ffmpeg_path).exists() else shutil.which("ffmpeg")
+        if ffmpeg:
+            try:
+                out = subprocess.run(
+                    [ffmpeg, "-hide_banner", "-encoders"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    creationflags=0x08000000 if sys.platform == "win32" else 0,
+                ).stdout.lower()
+                result["nvenc"] = "nvenc" in out
+                result["qsv"] = "_qsv" in out
+                result["amf"] = "_amf" in out
+            except Exception:
+                pass
+        self.detected.emit(result)
 
 
 class MainWindow(QMainWindow):
-    """Three-column main window matching the Topaz Video AI layout."""
+    """Main application window."""
 
     export_requested = Signal(dict)
     preview_requested = Signal(dict)
     cancel_requested = Signal()
 
+    _PRESET_TO_RESOLUTION = {
+        "720p (HD)": 720,
+        "1080p (FHD)": 1080,
+        "2K (1440p)": 1440,
+        "4K (2160p)": 2160,
+    }
+
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("1Click SeedVR2.5")
-        self.setMinimumSize(1100, 750)
-        self.resize(1280, 850)
+        self.setWindowTitle("1Click SeedVR2.5 v1.8b")
+        self.resize(1440, 900)
+        self.setMinimumSize(1180, 760)
 
-        self._current_file: str = ""
+        self._config = load_config()
+        self._current_file = ""
+        self._processing = False
         self._thread: Optional[QThread] = None
         self._worker = None
-        self._processing = False
+        self._active_mode = ""
+        self._active_output_path = ""
+        self._snapshot_fallback_path = ""
+        self._codec_cache = {"nvenc": False, "qsv": False, "amf": False}
+        self._gpu_name = "CPU"
+        self._gpu_vram = "—"
+        self._log_viewer: Optional[LogViewer] = None
 
         self._build_ui()
         self._connect_signals()
         self._start_hardware_probe()
+        self._start_codec_probe()
+        self._apply_view_mode("advanced")
+        self._update_status_summary()
 
-        # Self-wire the high-level signals to the worker pipeline so the app is
-        # usable standalone while keeping the decoupled signal contract.
         self.export_requested.connect(self._spawn_worker)
-        self.preview_requested.connect(self._spawn_worker)
+        self.preview_requested.connect(self._spawn_preview)
         self.cancel_requested.connect(self._abort_worker)
 
-    # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
-        central = QWidget()
+        central = QWidget(self)
         self.setCentralWidget(central)
         root = QHBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # Left panel.
-        self.project_panel = ProjectPanel()
+        self.project_panel = ProjectPanel(self)
         root.addWidget(self.project_panel)
 
-        # Center column.
-        center = QWidget()
+        center = QWidget(self)
         center_layout = QVBoxLayout(center)
         center_layout.setContentsMargins(Dims.PADDING_MD, Dims.PADDING_MD, Dims.PADDING_MD, Dims.PADDING_MD)
         center_layout.setSpacing(Dims.PADDING_MD)
         root.addWidget(center, 1)
 
-        # Stacked: drop zone (no file) vs. preview (file loaded).
-        self.center_stack = QStackedWidget()
-        self.drop_zone = DropZone()
-        self.preview = VideoPreviewWidget()
+        center_layout.addWidget(self._build_header())
+
+        self.center_stack = QStackedWidget(self)
+        self.drop_zone = DropZone(self)
+        self.preview_widget = VideoPreviewWidget(self)
         self.center_stack.addWidget(self.drop_zone)
-        self.center_stack.addWidget(self.preview)
+        self.center_stack.addWidget(self.preview_widget)
         center_layout.addWidget(self.center_stack, 1)
 
-        # Frame scrubber.
-        self.scrubber = FrameScrubber()
-        center_layout.addWidget(self.scrubber)
-
-        # Trim timeline.
-        self.trim_timeline = TrimTimeline()
+        self.trim_timeline = TrimTimeline(self)
         center_layout.addWidget(self.trim_timeline)
 
-        # Trim info bar.
-        center_layout.addLayout(self._build_trim_info_bar())
+        center_layout.addWidget(self._build_trim_bar())
 
-        # Playback bar.
-        center_layout.addLayout(self._build_playback_bar())
+        self.playback_controls = PlaybackControls(self)
+        center_layout.addWidget(self.playback_controls)
 
-        # Action bar.
-        center_layout.addLayout(self._build_action_bar())
+        center_layout.addWidget(self._build_action_bar())
 
-        # Right panel.
-        self.settings_panel = SettingsPanel()
+        self.settings_panel = SettingsPanel(self)
         root.addWidget(self.settings_panel)
 
         self._build_status_bar()
+        self._build_shortcuts()
 
-    def _build_trim_info_bar(self) -> QHBoxLayout:
-        bar = QHBoxLayout()
+    def _build_header(self) -> QWidget:
+        header = QWidget(self)
+        layout = QHBoxLayout(header)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(Dims.PADDING_SM)
+
+        title = QLabel("1Click SeedVR2.5 v1.8b", header)
+        title.setProperty("role", "h1")
+        layout.addWidget(title)
+
+        layout.addStretch(1)
+        self.view_toggle_stack = QStackedWidget(header)
+        self.view_toggle_stack.addWidget(self._build_view_toggle_page("simple"))
+        self.view_toggle_stack.addWidget(self._build_view_toggle_page("advanced"))
+        layout.addWidget(self.view_toggle_stack)
+
+        self.show_log_btn = Button3D("Show Log", variant="ghost", parent=header)
+        self.settings_btn = Button3D("Settings", variant="ghost", parent=header)
+        self.about_btn = Button3D("About", variant="ghost", parent=header)
+        self.github_btn = Button3D("GitHub", variant="ghost", parent=header)
+        for button in (self.show_log_btn, self.settings_btn, self.about_btn, self.github_btn):
+            layout.addWidget(button)
+        return header
+
+    def _build_view_toggle_page(self, selected: str) -> QWidget:
+        widget = QWidget(self)
+        layout = QHBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(Dims.PADDING_XS)
+        simple_variant = "primary" if selected == "simple" else "default"
+        advanced_variant = "primary" if selected == "advanced" else "default"
+        simple_btn = Button3D("Simple", variant=simple_variant, parent=widget)
+        advanced_btn = Button3D("Advanced", variant=advanced_variant, parent=widget)
+        simple_btn.clicked.connect(lambda: self._apply_view_mode("simple"))
+        advanced_btn.clicked.connect(lambda: self._apply_view_mode("advanced"))
+        layout.addWidget(simple_btn)
+        layout.addWidget(advanced_btn)
+        return widget
+
+    def _build_trim_bar(self) -> QWidget:
+        widget = QWidget(self)
+        layout = QHBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(Dims.PADDING_MD)
+
         self.in_label = QLabel("IN 00:00:00")
         self.in_label.setStyleSheet(f"color: {Colors.TRIM_HANDLE_IN};")
         self.out_label = QLabel("OUT 00:00:00")
@@ -191,113 +273,127 @@ class MainWindow(QMainWindow):
         self.duration_label = QLabel("Duration 00:00:00 (0 frames)")
         self.duration_label.setStyleSheet(f"color: {Colors.TEXT_ACCENT};")
 
-        self.set_in_btn = Button3D("Set In [I]", variant="default")
-        self.set_out_btn = Button3D("Set Out [O]", variant="default")
-        self.full_range_btn = Button3D("Full Range", variant="ghost")
+        layout.addWidget(self.in_label)
+        layout.addWidget(self.duration_label)
+        layout.addWidget(self.out_label)
+        layout.addStretch(1)
+        return widget
 
-        bar.addWidget(self.in_label)
-        bar.addWidget(self.duration_label)
-        bar.addWidget(self.out_label)
-        bar.addStretch(1)
-        bar.addWidget(self.set_in_btn)
-        bar.addWidget(self.set_out_btn)
-        bar.addWidget(self.full_range_btn)
-        return bar
+    def _build_action_bar(self) -> QWidget:
+        widget = QWidget(self)
+        layout = QHBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(Dims.PADDING_MD)
 
-    def _build_playback_bar(self) -> QHBoxLayout:
-        bar = QHBoxLayout()
-        self.prev_btn = Button3D("◀◀", variant="ghost")
-        self.play_btn = Button3D("▶", variant="ghost")
-        self.next_btn = Button3D("▶▶", variant="ghost")
-        self.timecode_label = QLabel("00:00:00")
-        self.timecode_label.setStyleSheet(
-            f"color: {Colors.TEXT_PRIMARY}; font-family: '{Fonts.FAMILY_MONO}';"
-        )
-        self.preview5s_btn = Button3D("▶ Preview 5s", variant="default")
-
-        for b in (self.prev_btn, self.play_btn, self.next_btn):
-            b.setFixedWidth(48)
-        bar.addWidget(self.prev_btn)
-        bar.addWidget(self.play_btn)
-        bar.addWidget(self.next_btn)
-        bar.addWidget(self.timecode_label)
-        bar.addStretch(1)
-        bar.addWidget(self.preview5s_btn)
-        return bar
-
-    def _build_action_bar(self) -> QHBoxLayout:
-        bar = QHBoxLayout()
-        self.export_btn = Button3D("Export", variant="primary")
-        self.export_btn.setMinimumHeight(Dims.BUTTON_HEIGHT_LG)
-        self.cancel_btn = Button3D("Cancel", variant="danger")
+        self.preview_btn = Button3D("Preview 1 Frame", variant="default", parent=widget)
+        self.export_btn = Button3D("Export", variant="primary", parent=widget)
+        self.cancel_btn = Button3D("Cancel", variant="danger", parent=widget)
         self.cancel_btn.setEnabled(False)
-        self.progress = AnimatedProgressBar()
+        self.progress = AnimatedProgressBar(widget)
 
-        bar.addWidget(self.export_btn)
-        bar.addWidget(self.progress, 1)
-        bar.addWidget(self.cancel_btn)
-        return bar
+        layout.addWidget(self.preview_btn)
+        layout.addWidget(self.export_btn)
+        layout.addWidget(self.progress, 1)
+        layout.addWidget(self.cancel_btn)
+        return widget
 
     def _build_status_bar(self) -> None:
-        status = QStatusBar()
+        status = QStatusBar(self)
         self.setStatusBar(status)
+        self.status_label = QLabel("Ready", self)
+        self.status_label.setStyleSheet(f"color: {Colors.TEXT_SECONDARY};")
+        self.gpu_label = QLabel("GPU: detecting…", self)
+        self.gpu_label.setStyleSheet(f"color: {Colors.TEXT_SECONDARY};")
+        self.vram_label = QLabel("VRAM: —", self)
+        self.vram_label.setStyleSheet(f"color: {Colors.TEXT_SECONDARY};")
+        self.codec_label = QLabel("Encoders: probing…", self)
+        self.codec_label.setStyleSheet(f"color: {Colors.TEXT_SECONDARY};")
+        self.settings_summary_label = QLabel("", self)
+        self.settings_summary_label.setStyleSheet(f"color: {Colors.TEXT_SECONDARY};")
+        status.addWidget(self.status_label, 1)
+        status.addPermanentWidget(self.gpu_label)
+        status.addPermanentWidget(self.vram_label)
+        status.addPermanentWidget(self.codec_label)
+        status.addPermanentWidget(self.settings_summary_label)
 
-        self.queue_label = QLabel("Preview Queue  •  Sources  •  Export Queue")
-        self.queue_label.setStyleSheet(f"color: {Colors.TEXT_SECONDARY};")
-        status.addWidget(self.queue_label)
+    def _build_shortcuts(self) -> None:
+        QShortcut(QKeySequence("I"), self, activated=self._set_trim_in)
+        QShortcut(QKeySequence("O"), self, activated=self._set_trim_out)
 
-        self.gpu_label = QLabel("GPU: detecting…")
-        self.vram_label = QLabel("VRAM: —")
-        self.status_text = QLabel("Ready")
-        for lbl in (self.gpu_label, self.vram_label, self.status_text):
-            lbl.setStyleSheet(f"color: {Colors.TEXT_SECONDARY};")
-            status.addPermanentWidget(lbl)
-
-    # ------------------------------------------------------------------ wiring
     def _connect_signals(self) -> None:
         self.project_panel.file_selected.connect(self.load_file)
-        self.drop_zone.file_dropped.connect(self._on_dropped)
+        self.drop_zone.file_dropped.connect(self._on_file_dropped)
 
-        self.trim_timeline.in_point_changed.connect(self._on_trim_changed)
-        self.trim_timeline.out_point_changed.connect(self._on_trim_changed)
-        self.trim_timeline.playhead_moved.connect(self._on_playhead_moved)
+        self.trim_timeline.in_point_changed.connect(lambda _=0: self._update_trim_labels())
+        self.trim_timeline.out_point_changed.connect(lambda _=0: self._update_trim_labels())
+        self.trim_timeline.playhead_moved.connect(self.preview_widget.seek_frame)
+        self.trim_timeline.playhead_moved.connect(self._update_current_timecode)
+        self.preview_widget.frame_changed.connect(self._on_preview_frame_changed)
 
-        self.scrubber.frame_changed.connect(self.preview.seek_frame)
-        self.preview.frame_changed.connect(self._on_preview_frame)
+        self.playback_controls.play_pause_toggled.connect(self._toggle_playback)
+        self.playback_controls.prev_frame_requested.connect(self.preview_widget.step_backward)
+        self.playback_controls.next_frame_requested.connect(self.preview_widget.step_forward)
+        self.playback_controls.snapshot_requested.connect(self._request_preview)
+        self.playback_controls.trim_in_requested.connect(self._set_trim_in)
+        self.playback_controls.trim_out_requested.connect(self._set_trim_out)
 
-        self.prev_btn.clicked.connect(self.preview.step_backward)
-        self.next_btn.clicked.connect(self.preview.step_forward)
-        self.play_btn.clicked.connect(self.preview.toggle_play)
-
-        self.set_in_btn.clicked.connect(
-            lambda: self.trim_timeline.set_in_point(self.preview.current_frame())
-        )
-        self.set_out_btn.clicked.connect(
-            lambda: self.trim_timeline.set_out_point(self.preview.current_frame())
-        )
-        self.full_range_btn.clicked.connect(self.trim_timeline.set_full_range)
-
-        self.preview5s_btn.clicked.connect(self._on_preview5s)
+        self.preview_btn.clicked.connect(self._request_preview)
         self.export_btn.clicked.connect(self._on_export_clicked)
         self.cancel_btn.clicked.connect(self.cancel_requested.emit)
 
-        self.settings_panel.settings_changed.connect(self.settings_panel.update_vram_estimate)
+        self.show_log_btn.clicked.connect(self._show_log_viewer)
+        self.settings_btn.clicked.connect(self._open_settings_dialog)
+        self.about_btn.clicked.connect(self._show_about_dialog)
+        self.github_btn.clicked.connect(lambda: webbrowser.open("https://github.com/naxci1/ComfyUI-SeedVR2.5_new"))
+
+        self.settings_panel.settings_changed.connect(self._update_status_summary)
+
+    def _apply_view_mode(self, mode: str) -> None:
+        advanced = mode == "advanced"
+        self.view_toggle_stack.setCurrentIndex(1 if advanced else 0)
+        self.settings_panel.setVisible(advanced)
 
     def _start_hardware_probe(self) -> None:
-        self._hw_thread = QThread()
-        self._hw_probe = _HardwareProbe()
-        self._hw_probe.moveToThread(self._hw_thread)
-        self._hw_thread.started.connect(self._hw_probe.run)
-        self._hw_probe.detected.connect(self._on_hardware_detected)
-        self._hw_probe.detected.connect(self._hw_thread.quit)
+        self._hw_thread = QThread(self)
+        self._hw_worker = _HardwareProbe()
+        self._hw_worker.moveToThread(self._hw_thread)
+        self._hw_thread.started.connect(self._hw_worker.run)
+        self._hw_worker.detected.connect(self._on_hardware_detected)
+        self._hw_worker.detected.connect(self._hw_thread.quit)
         self._hw_thread.start()
 
+    def _start_codec_probe(self) -> None:
+        ffmpeg_path = self._config.get("ffmpeg_path", "")
+        self._codec_thread = QThread(self)
+        self._codec_worker = _CodecProbe(ffmpeg_path)
+        self._codec_worker.moveToThread(self._codec_thread)
+        self._codec_thread.started.connect(self._codec_worker.run)
+        self._codec_worker.detected.connect(self._on_codec_detected)
+        self._codec_worker.detected.connect(self._codec_thread.quit)
+        self._codec_thread.start()
+
     def _on_hardware_detected(self, name: str, vram: str) -> None:
+        self._gpu_name = name
+        self._gpu_vram = vram
         self.gpu_label.setText(f"GPU: {name}")
         self.vram_label.setText(f"VRAM: {vram}")
 
-    # ------------------------------------------------------------------ file
-    def _on_dropped(self, path: str) -> None:
+    def _on_codec_detected(self, result: dict) -> None:
+        self._codec_cache = result
+        available = [name.upper() for name, enabled in result.items() if enabled]
+        self.codec_label.setText(
+            f"Encoders: {', '.join(available)}" if available else "Encoders: software"
+        )
+
+    def _update_status_summary(self) -> None:
+        settings = self.settings_panel.get_all_settings()
+        summary = (
+            f"Mode {settings['resolution_mode']} • Batch {settings['batch_size']} • "
+            f"Auto Tune {'On' if settings['auto_tune'] else 'Off'}"
+        )
+        self.settings_summary_label.setText(summary)
+
+    def _on_file_dropped(self, path: str) -> None:
         self.project_panel.add_file(path)
         self.load_file(path)
 
@@ -305,72 +401,75 @@ class MainWindow(QMainWindow):
         if not path or not os.path.isfile(path):
             return
         self._current_file = path
-        self.preview.load_file(path)
+        self.preview_widget.load_file(path)
         self.trim_timeline.load_video(path)
-        self.scrubber.set_frame_count(self.preview.get_frame_count())
-        self.center_stack.setCurrentWidget(self.preview)
+        self.center_stack.setCurrentWidget(self.preview_widget)
         self._update_trim_labels()
-        self.status_text.setText(f"Loaded {os.path.basename(path)}")
+        self.status_label.setText(f"Loaded {os.path.basename(path)}")
+        self._config["input_path"] = path
+        save_config(self._config)
 
-    # ------------------------------------------------------------------ trim
-    def _on_trim_changed(self, _frame: int) -> None:
-        self._update_trim_labels()
+    def _on_preview_frame_changed(self, frame: int) -> None:
+        self.trim_timeline.set_playhead(frame)
+        self._update_current_timecode(frame)
 
-    def _on_playhead_moved(self, frame: int) -> None:
-        self.preview.seek_frame(frame)
-        self.scrubber.set_frame(frame)
-        self.timecode_label.setText(self.trim_timeline.frame_to_timecode(frame))
-
-    def _on_preview_frame(self, frame: int) -> None:
-        self.scrubber.set_frame(frame)
-        self.timecode_label.setText(self.trim_timeline.frame_to_timecode(frame))
+    def _update_current_timecode(self, frame: int) -> None:
+        self.status_label.setText(f"Frame {frame} • {self.trim_timeline.frame_to_timecode(frame)}")
 
     def _update_trim_labels(self) -> None:
-        in_f, out_f = self.trim_timeline.get_selected_range()
-        self.in_label.setText(f"IN {self.trim_timeline.frame_to_timecode(in_f)}")
-        self.out_label.setText(f"OUT {self.trim_timeline.frame_to_timecode(out_f)}")
+        in_frame, out_frame = self.trim_timeline.get_selected_range()
+        self.in_label.setText(f"IN {self.trim_timeline.frame_to_timecode(in_frame)}")
+        self.out_label.setText(f"OUT {self.trim_timeline.frame_to_timecode(out_frame)}")
         count = self.trim_timeline.get_selected_frame_count()
-        dur = self.trim_timeline.frame_to_timecode(count)
-        self.duration_label.setText(f"Duration {dur} ({count} frames)")
+        self.duration_label.setText(
+            f"Duration {self.trim_timeline.frame_to_timecode(count)} ({count} frames)"
+        )
 
-    # ------------------------------------------------------------------ run
-    def _on_preview5s(self) -> None:
+    def _set_trim_in(self) -> None:
+        self.trim_timeline.set_in_point(self.preview_widget.current_frame())
+
+    def _set_trim_out(self) -> None:
+        self.trim_timeline.set_out_point(self.preview_widget.current_frame())
+
+    def _toggle_playback(self, playing: bool) -> None:
+        if playing:
+            self.preview_widget.play()
+        else:
+            self.preview_widget.pause()
+
+    def _request_preview(self) -> None:
         if not self._current_file:
             Toast.show(self, "Import a file first", "warning")
             return
-        settings = self.settings_panel.get_all_settings()
-        fps = self.preview.get_fps() or 25.0
-        start = self.preview.current_frame()
-        payload = {
-            "mode": "preview",
-            "input": self._current_file,
-            "settings": settings,
-            "start_frame": start,
-            "frame_cap": int(fps * 5),
-        }
-        self.preview_requested.emit(payload)
+        self.preview_requested.emit(
+            {
+                "mode": "preview",
+                "input": self._current_file,
+                "settings": self.settings_panel.get_all_settings(),
+                "frame_index": self.preview_widget.current_frame(),
+            }
+        )
 
     def _on_export_clicked(self) -> None:
         if not self._current_file:
             Toast.show(self, "Import a file first", "warning")
             return
-        in_f, out_f = self.trim_timeline.get_selected_range()
-        # Treat 0 -> last_frame as "full video" (no trim).
+        input_path = Path(self._current_file)
+        default_dir = str(input_path.parent)
+        default_name = input_path.stem
+        in_frame, out_frame = self.trim_timeline.get_selected_range()
         if self.trim_timeline.is_full_range():
-            in_f, out_f = 0, 0
-        default_dir = os.path.dirname(self._current_file)
-        default_name = f"seedvr2_{os.path.splitext(os.path.basename(self._current_file))[0]}"
-
+            in_frame, out_frame = 0, 0
         dialog = ExportDialog(
             self,
             default_dir=default_dir,
             default_name=default_name,
-            frame_count=self.preview.get_frame_count(),
-            width=self.preview.get_frame_width(),
-            height=self.preview.get_frame_height(),
-            fps=self.preview.get_fps(),
-            trim_in=in_f,
-            trim_out=out_f,
+            frame_count=self.preview_widget.get_frame_count(),
+            width=self.preview_widget.get_frame_width(),
+            height=self.preview_widget.get_frame_height(),
+            fps=self.preview_widget.get_fps(),
+            trim_in=in_frame,
+            trim_out=out_frame,
         )
         dialog.export_confirmed.connect(self._on_export_confirmed)
         dialog.exec()
@@ -384,81 +483,121 @@ class MainWindow(QMainWindow):
         }
         self.export_requested.emit(payload)
 
-    # ------------------------------------------------------------------ worker
-    def _build_cli_args(self, payload: dict) -> list:
-        s = payload.get("settings", {})
-        args: list = [payload["input"]]
+    def _config_alarm_enabled(self) -> bool:
+        raw = str(self._config.get("alarm_enabled", "true")).strip().lower()
+        return raw not in {"0", "false", "no", "off"}
 
-        export = payload.get("export", {})
-        if payload.get("mode") == "export" and export.get("output_path"):
-            args += ["--output", export["output_path"]]
-            if export.get("output_type") == "image_sequence":
-                args += ["--output_format", export.get("image_format", "tiff").lower()]
-            else:
-                args += ["--output_format", export.get("container", "mp4").lower()]
+    def _build_worker_env(self) -> dict:
+        env: dict = {}
+        ffmpeg_path = self._config.get("ffmpeg_path", "")
+        if ffmpeg_path:
+            ffmpeg_dir = str(Path(ffmpeg_path).parent)
+            env["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
+        return env
 
-        # Resolution.
-        if s.get("resolution_mode") == "X-Times":
-            scale = {"50%": 1, "75%": 1, "100%": 1, "150%": 2, "200%": 2,
-                     "300%": 3, "400%": 4}.get(s.get("scale", "100%"), 2)
-            args += ["--resolution_mode", "xtimes", "--resolution_scale", str(scale)]
+    def _with_sv2_suffix(self, output_path: str) -> str:
+        if not output_path:
+            return output_path
+        path = Path(output_path)
+        if path.suffix:
+            stem = path.stem if path.stem.endswith("_sv2") else f"{path.stem}_sv2"
+            return str(path.with_name(stem + path.suffix))
+        name = path.name if path.name.endswith("_sv2") else f"{path.name}_sv2"
+        return str(path.with_name(name))
+
+    def _preview_output_path(self) -> str:
+        source = Path(self._current_file)
+        return str(source.with_name(f"{source.stem}_preview_sv2.tiff"))
+
+    def _build_cli_args(self, payload: dict) -> list[str]:
+        settings = payload.get("settings", {})
+        args: list[str] = [payload["input"]]
+
+        output_path = payload.get("output_path") or payload.get("export", {}).get("output_path", "")
+        if output_path:
+            args += ["--output", output_path]
+        output_format = payload.get("output_format")
+        if not output_format:
+            export = payload.get("export", {})
+            if export:
+                if export.get("output_type") == "image_sequence":
+                    output_format = str(export.get("image_format", "TIFF")).lower()
+                else:
+                    output_format = str(export.get("container", "MP4")).lower()
+        if output_format:
+            args += ["--output_format", output_format]
+
+        resolution_mode = settings.get("resolution_mode", "pixel")
+        if resolution_mode == "xtimes":
+            args += ["--resolution_mode", "xtimes", "--resolution_scale", str(settings.get("resolution_scale", "2"))]
         else:
-            short = {"480p": 480, "720p": 720, "1080p": 1080,
-                     "1440p": 1440, "2K": 1440, "4K": 2160}.get(s.get("target_short_side", "1080p"), 1080)
-            args += ["--resolution", str(short)]
+            resolution = int(settings.get("resolution", 720))
+            if resolution_mode == "presets":
+                resolution = self._PRESET_TO_RESOLUTION.get(settings.get("resolution_presets", "720p (HD)"), resolution)
+            args += ["--resolution_mode", "pixel", "--resolution", str(resolution)]
 
-        if s.get("pre_downscale", "").startswith("2"):
-            args += ["--pre_downscale", "2"]
+        args += ["--max_resolution", str(int(settings.get("max_resolution", 3840)))]
+        args += ["--pre_downscale", str(settings.get("pre_downscale", "1"))]
+        args += ["--dit_model", str(settings.get("dit_model", "seedvr2_ema_3b_fp8_e4m3fn.safetensors"))]
+        args += ["--attention_mode", str(settings.get("attention_mode", "sage_attn_3")).replace("sage_attn", "sageattn")]
+        args += ["--batch_size", str(int(settings.get("batch_size", 81)))]
+        args += ["--load_cap", str(int(settings.get("load_cap", 0)))]
+        args += ["--skip_first_frames", str(int(settings.get("skip_first_frames", 0)))]
+        args += ["--vae_encode_tile_size", str(int(settings.get("vae_encode_tile_size", 1024)))]
+        args += ["--vae_encode_tile_overlap", str(int(settings.get("vae_encode_tile_overlap", 64)))]
+        args += ["--vae_decode_tile_size", str(int(settings.get("vae_decode_tile_size", 1024)))]
+        args += ["--vae_decode_tile_overlap", str(int(settings.get("vae_decode_tile_overlap", 64)))]
+        args += ["--color_correction", str(settings.get("color_correction", "none"))]
+        args += ["--input_noise_scale", f"{float(settings.get('input_noise_scale', 0.0)):.2f}"]
+        args += ["--latent_noise_scale", f"{float(settings.get('latent_noise_scale', 0.0)):.2f}"]
+        args += ["--temporal_overlap", str(int(settings.get("temporal_overlap", 8)))]
+        args += ["--prepend_frames", str(int(settings.get("prepend_frames", 4)))]
+        args += ["--chunk_size", str(int(settings.get("chunk_size", 0)))]
+        args += ["--chunk_duration_minutes", str(settings.get("chunk_duration_minutes", "0"))]
+        args += ["--dit_offload_device", str(settings.get("dit_offload_device", "none"))]
+        args += ["--vae_offload_device", str(settings.get("vae_offload_device", "cpu"))]
+        args += ["--tensor_offload_device", str(settings.get("tensor_offload_device", "none"))]
+        args += ["--blocks_to_swap", str(int(settings.get("blocks_to_swap", 0)))]
+        args += ["--seed", str(int(settings.get("seed", 313)))]
+        args += ["--video_backend", str(settings.get("video_backend", "ffmpeg"))]
+        args += ["--tile_debug", str(settings.get("tile_debug", "false"))]
 
-        args += ["--batch_size", str(s.get("batch_size", 1))]
-        if s.get("uniform_batch_size"):
+        only_frames = str(settings.get("only_frames", "")).strip()
+        if only_frames:
+            args += ["--only_frames", only_frames]
+        cuda_device = str(settings.get("cuda_device", "")).strip()
+        if cuda_device:
+            args += ["--cuda_device", cuda_device]
+        model_dir = self._config.get("models_dir", "")
+        if model_dir:
+            args += ["--model_dir", model_dir]
+
+        if settings.get("uniform_batch_size"):
             args.append("--uniform_batch_size")
-        args += ["--seed", str(s.get("seed", 313))]
-
-        if s.get("temporal_overlap"):
-            args += ["--temporal_overlap", str(s["temporal_overlap"])]
-
-        cc = s.get("color_correction", "None").lower()
-        if cc and cc != "none":
-            args += ["--color_correction", cc]
-
-        attn = {"Auto Best": "sdpa", "SDPA Safe": "sdpa",
-                "Flash Attn 2": "flash_attn", "Flash Attn 3": "flash_attn"}.get(
-            s.get("attention", "Auto Best"), "sdpa")
-        if attn != "sdpa":
-            args += ["--attention_mode", attn]
-
-        args += ["--dit_model", s.get("dit_model", "SeedVR2 3B Q8")]
-
-        if s.get("ten_bit_output"):
-            args.append("--10bit")
-        if s.get("cache_dit"):
-            args.append("--cache_dit")
-        if s.get("cache_vae"):
-            args.append("--cache_vae")
-        if s.get("auto_tune"):
+        if settings.get("auto_tune"):
             args.append("--auto_tune")
-        if s.get("debug_mode"):
+        if settings.get("cache_dit"):
+            args.append("--cache_dit")
+        if settings.get("cache_vae"):
+            args.append("--cache_vae")
+        if settings.get("use_10bit"):
+            args.append("--10bit")
+        if settings.get("debug"):
             args.append("--debug")
-
-        if s.get("enable_tiling"):
+        if settings.get("vae_encode_tiled"):
             args.append("--vae_encode_tiled")
-            args += ["--vae_encode_tile_size", str(s.get("encode_tile_size", 1024))]
-            args += ["--vae_encode_tile_overlap", str(s.get("encode_overlap", 64))]
+        if settings.get("vae_decode_tiled"):
             args.append("--vae_decode_tiled")
-            args += ["--vae_decode_tile_size", str(s.get("decode_tile_size", 1024))]
-            args += ["--vae_decode_tile_overlap", str(s.get("decode_overlap", 64))]
-
-        if s.get("input_noise"):
-            args += ["--input_noise_scale", f"{s['input_noise'] / 100.0:.2f}"]
-        if s.get("latent_noise"):
-            args += ["--latent_noise_scale", f"{s['latent_noise'] / 100.0:.2f}"]
-
-        # Preview: cap frames + start offset.
-        if payload.get("mode") == "preview":
-            if payload.get("start_frame"):
-                args += ["--skip_first_frames", str(payload["start_frame"])]
-            args += ["--load_cap", str(payload.get("frame_cap", 120))]
+        if settings.get("swap_io_components"):
+            args.append("--swap_io_components")
+        if settings.get("compile_dit"):
+            args.append("--compile_dit")
+        if settings.get("compile_vae"):
+            args.append("--compile_vae")
+        if settings.get("compile_backend"):
+            args += ["--compile_backend", str(settings.get("compile_backend"))]
+        if settings.get("compile_mode"):
+            args += ["--compile_mode", str(settings.get("compile_mode"))]
 
         return args
 
@@ -466,87 +605,231 @@ class MainWindow(QMainWindow):
         if self._processing:
             Toast.show(self, "A job is already running", "warning")
             return
-        python_exe, cli_script = resolve_paths()
+        self._config = load_config()
+        python_exe, cli_script = resolve_paths(
+            self._config.get("seedvr2_folder", ""),
+            self._config.get("python_exe", ""),
+        )
         if not os.path.isfile(cli_script):
             Toast.show(self, "inference_cli.py not found", "error")
             return
-        args = self._build_cli_args(payload)
-        self._thread, self._worker = create_worker_thread(cli_script, args, python_exe)
-        self._worker.log_line.connect(self._on_log)
-        self._worker.progress_update.connect(self._on_progress)
-        self._worker.finished.connect(
-            lambda ok, msg: self.on_export_finished(ok, msg)
+
+        export_settings = dict(payload.get("export", {}))
+        output_path = self._with_sv2_suffix(str(export_settings.get("output_path", "")))
+        export_settings["output_path"] = output_path
+        payload = dict(payload)
+        payload["export"] = export_settings
+        payload["output_path"] = output_path
+        payload["output_format"] = (
+            str(export_settings.get("image_format", "TIFF")).lower()
+            if export_settings.get("output_type") == "image_sequence"
+            else str(export_settings.get("container", "MP4")).lower()
         )
+
+        args = self._build_cli_args(payload)
+        self._start_worker(cli_script, python_exe, args, "export", output_path)
+
+    def _spawn_preview(self, payload: dict) -> None:
+        if self._processing:
+            Toast.show(self, "A job is already running", "warning")
+            return
+        if not self._current_file:
+            return
+        self._config = load_config()
+        python_exe, cli_script = resolve_paths(
+            self._config.get("seedvr2_folder", ""),
+            self._config.get("python_exe", ""),
+        )
+        if not os.path.isfile(cli_script):
+            Toast.show(self, "inference_cli.py not found", "error")
+            return
+
+        preview_settings = dict(payload.get("settings", {}))
+        preview_settings["skip_first_frames"] = int(payload.get("frame_index", 0))
+        preview_settings["load_cap"] = 1
+        preview_payload = {
+            "mode": "preview",
+            "input": self._current_file,
+            "settings": preview_settings,
+            "output_path": self._preview_output_path(),
+            "output_format": "tiff",
+        }
+        self._snapshot_fallback_path = str(Path(self._preview_output_path()).with_name(Path(self._preview_output_path()).stem + "_fallback.tiff"))
+        self._save_qimage_as_tiff16(self.preview_widget.grab().toImage(), self._snapshot_fallback_path)
+        args = self._build_cli_args(preview_payload)
+        self._start_worker(cli_script, python_exe, args, "preview", preview_payload["output_path"])
+
+    def _start_worker(self, cli_script: str, python_exe: str, args: list[str], mode: str, output_path: str) -> None:
+        self._active_mode = mode
+        self._active_output_path = output_path
+        self._thread, self._worker = create_worker_thread(
+            cli_script,
+            args,
+            python_exe,
+            self._build_worker_env(),
+        )
+        self._worker.alarm_enabled = self._config_alarm_enabled()
+        self._worker.log_line.connect(self._on_log_line)
+        self._worker.progress_update.connect(self._on_progress)
+        self._worker.batch_progress_update.connect(self._on_batch_progress)
+        self._worker.queue_status_update.connect(self._on_queue_status)
+        self._worker.oom_detected.connect(self._on_oom_detected)
         self._worker.started_signal.connect(lambda: self._set_processing(True))
+        self._worker.finished.connect(self._on_finished)
         self.progress.reset()
         self._thread.start()
+
+    def _set_processing(self, processing: bool) -> None:
+        self._processing = processing
+        self.preview_btn.setEnabled(not processing)
+        self.export_btn.setEnabled(not processing)
+        self.cancel_btn.setEnabled(processing)
+        self.settings_panel.set_enabled_state(not processing)
+        self.status_label.setText("Processing…" if processing else "Ready")
 
     def _abort_worker(self) -> None:
         if self._worker is not None:
             self._worker.request_abort()
-            self.status_text.setText("Cancelling…")
+            self.status_label.setText("Cancelling…")
 
-    def _on_log(self, line: str) -> None:
-        # Surface the latest log line in the status bar.
-        self.status_text.setText(line.strip()[:80])
+    def _on_log_line(self, line: str) -> None:
+        message = line.strip()
+        if message:
+            self.status_label.setText(message[:120])
+        if self._log_viewer is not None:
+            self._log_viewer.append_line(line)
 
     def _on_progress(self, current: int, total: int) -> None:
         if total > 0:
-            self.update_progress(100.0 * current / total)
+            self.progress.setValue(100.0 * current / total)
 
-    def _set_processing(self, processing: bool) -> None:
-        self._processing = processing
-        self.settings_panel.set_enabled_state(not processing)
-        self.export_btn.setEnabled(not processing)
-        self.preview5s_btn.setEnabled(not processing)
-        self.cancel_btn.setEnabled(processing)
-        self.status_text.setText("Processing…" if processing else "Ready")
+    def _on_batch_progress(self, current: int, total: int) -> None:
+        if total > 0:
+            self.status_label.setText(f"Batch progress {current}/{total}")
 
-    # ------------------------------------------------------------------ public callbacks
-    def update_progress(self, value: float, eta: str = "", status: str = "") -> None:
-        self.progress.setValue(value, eta)
-        if status:
-            self.status_text.setText(status)
+    def _on_queue_status(self, file_path: str, current: int, total: int, done: int, remaining: int) -> None:
+        name = os.path.basename(file_path) if file_path else "queue"
+        self.status_label.setText(f"{name} • {current}/{total} • done {done} • left {remaining}")
 
-    def on_export_finished(self, success: bool, message: str) -> None:
+    def _on_oom_detected(self, retry_count: int, max_retries: int, new_batch_size: int) -> None:
+        self.status_label.setText(
+            f"CUDA OOM detected • retry {retry_count}/{max_retries} • suggested batch {new_batch_size}"
+        )
+        Toast.show(
+            self,
+            f"CUDA OOM: retry {retry_count}/{max_retries}, batch {new_batch_size}",
+            "warning",
+            4000,
+        )
+
+    def _load_preview_outputs(self) -> None:
+        candidates: list[Path] = []
+        output = Path(self._active_output_path) if self._active_output_path else None
+        if output is not None:
+            if output.exists():
+                candidates.append(output)
+            parent = output.parent
+            stem = output.stem if output.suffix else output.name
+            for pattern in (f"{stem}*.tif", f"{stem}*.tiff", f"{stem}*.png", f"{stem}*.jpg", f"{stem}*.jpeg"):
+                candidates.extend(sorted(parent.glob(pattern)))
+        for extra in (self._snapshot_fallback_path,):
+            if extra and Path(extra).exists():
+                candidates.append(Path(extra))
+
+        seen = set()
+        for candidate in candidates:
+            if candidate in seen or not candidate.exists():
+                continue
+            seen.add(candidate)
+            pixmap = QPixmap(str(candidate))
+            if pixmap.isNull():
+                image = QImage(str(candidate))
+                if image.isNull():
+                    continue
+                pixmap = QPixmap.fromImage(image)
+            self.preview_widget.set_pixmap(pixmap)
+            self.center_stack.setCurrentWidget(self.preview_widget)
+            self.status_label.setText(f"Preview loaded: {candidate.name}")
+            return
+
+    def _on_finished(self, success: bool, message: str) -> None:
         self._set_processing(False)
+        self.playback_controls.set_playing(False)
         if success:
-            self.update_progress(100.0)
-            self.status_text.setText("Export complete")
-            Toast.show(self, "Export complete", "success")
+            self.progress.setValue(100.0)
+            self._play_success_sound()
+            Toast.show(self, "Completed successfully", "success")
+            self._load_preview_outputs()
         else:
-            self.status_text.setText(message)
-            Toast.show(self, message or "Export failed", "error")
+            Toast.show(self, message or "Processing failed", "error")
+            if message and message != "Cancelled.":
+                dlg = ErrorDialog(self, "Processing failed", message)
+                dlg.show()
         if self._thread is not None:
             self._thread.quit()
             self._thread.wait(500)
         self._thread = None
         self._worker = None
+        self._active_mode = ""
 
-    def on_preview_ready(self, frames_tensor) -> None:
-        """Display preview output frames in the preview widget."""
+    def _play_success_sound(self) -> None:
+        if not self._config_alarm_enabled():
+            return
         try:
-            import numpy as np  # type: ignore
-            from PySide6.QtGui import QImage, QPixmap
+            import winsound
 
-            frame = frames_tensor
-            if hasattr(frame, "detach"):
-                frame = frame.detach().cpu().numpy()
-            frame = np.asarray(frame)
-            if frame.ndim == 4:
-                frame = frame[0]
-            if frame.dtype != np.uint8:
-                frame = (np.clip(frame, 0.0, 1.0) * 255).astype(np.uint8)
-            h, w = frame.shape[:2]
-            img = QImage(frame.data, w, h, 3 * w, QImage.Format_RGB888).copy()
-            self.preview.set_pixmap(QPixmap.fromImage(img))
+            winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS | winsound.SND_ASYNC)
         except Exception:
             pass
 
-    # ------------------------------------------------------------------ close
+    def _save_qimage_as_tiff16(self, image: QImage, path: str) -> None:
+        if image.isNull() or not path:
+            return
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            import cv2  # type: ignore
+            import numpy as np  # type: ignore
+
+            converted = image.convertToFormat(QImage.Format_RGB888)
+            width = converted.width()
+            height = converted.height()
+            buffer = converted.bits()
+            array = np.frombuffer(buffer, dtype=np.uint8, count=converted.sizeInBytes())
+            array = array.reshape((height, width, 3))
+            rgb16 = array.astype(np.uint16) * 257
+            bgr16 = cv2.cvtColor(rgb16, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(str(target), bgr16)
+        except Exception:
+            image.save(str(target), "TIFF")
+
+    def _show_log_viewer(self) -> None:
+        if self._log_viewer is None:
+            self._log_viewer = LogViewer(self)
+        self._log_viewer.show()
+        self._log_viewer.raise_()
+        self._log_viewer.activateWindow()
+
+    def _open_settings_dialog(self) -> None:
+        dialog = SettingsDialog(self)
+        if dialog.exec():
+            self._config = load_config()
+            self.settings_panel.reload_models()
+            self._start_codec_probe()
+            Toast.show(self, "Settings saved", "success")
+
+    def _show_about_dialog(self) -> None:
+        QMessageBox.information(
+            self,
+            "About 1Click SeedVR2.5",
+            "1Click SeedVR2.5 v1.8b\n\nPySide6 GUI rebuild for SeedVR2 processing and export.",
+        )
+
     def closeEvent(self, event) -> None:  # noqa: N802
         try:
-            self.preview.cleanup()
+            if self._worker is not None:
+                self._worker.request_abort()
+            self.preview_widget.cleanup()
             self.trim_timeline.cleanup()
             self.project_panel.cleanup()
         except Exception:
@@ -555,6 +838,14 @@ class MainWindow(QMainWindow):
 
 
 def main() -> int:
+    if hasattr(Qt, "AA_EnableHighDpiScaling"):
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    if hasattr(Qt, "AA_UseHighDpiPixmaps"):
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
+
     if platform.system() == "Windows":
         try:
             import ctypes
@@ -565,13 +856,9 @@ def main() -> int:
         except Exception:
             pass
 
-    QApplication.setHighDpiScaleFactorRoundingPolicy(
-        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
-    )
-
     app = QApplication(sys.argv)
-    app.setStyle("Fusion")  # MUST be set before the stylesheet.
-    app.setApplicationName("1Click SeedVR2.5")
+    app.setStyle("Fusion")
+    app.setApplicationName("1Click SeedVR2.5 v1.8b")
     app.setOrganizationName("SeedVR2")
     app.setStyleSheet(generate_stylesheet())
 

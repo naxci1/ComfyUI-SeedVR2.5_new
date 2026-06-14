@@ -2,21 +2,15 @@
 PySide6 async worker that runs ``inference_cli.py`` as a subprocess and forwards
 its stdout / stderr to the GUI thread via Qt signals.
 
-This worker preserves the original signal *contract* so existing consumers
-keep working:
-
-    log_line(str)
-    progress_update(int, int)
-    batch_progress_update(int, int)
-    queue_status_update(str, int, int, int, int)
-    finished(bool, str)
-    started_signal()
+This worker preserves the original signal *contract* so existing consumers keep
+working, while also surfacing Auto Tune OOM retries to the GUI.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -25,21 +19,28 @@ from typing import List, Optional
 
 from PySide6.QtCore import QObject, QThread, Signal
 
-# Suppress the console window that would appear on Windows when launching a
-# subprocess from a windowed app.
+try:
+    import winsound
+except Exception:  # pragma: no cover - Windows only
+    winsound = None  # type: ignore[assignment]
+
 _CREATE_NO_WINDOW: int = 0x08000000 if sys.platform == "win32" else 0
 _CREATE_NEW_PROCESS_GROUP: int = 0x00000200 if sys.platform == "win32" else 0
+_AUTOTUNE_MAX_STAGES = 14
+_OOM_LINE_RE = re.compile(r"cuda out of memory", re.IGNORECASE)
+_STAGE_RE = re.compile(r"stage\s+(\d+)\s*/\s*(\d+)", re.IGNORECASE)
+_BATCH_RE = re.compile(r"batch_size(?:=|→)(\d+)", re.IGNORECASE)
 
 try:
     from gui.config_manager import (
-        load_config as _load_config,
         DEFAULT_PATHS as _DEFAULT_PATHS,
+        load_config as _load_config,
     )
 except ImportError:  # pragma: no cover - direct-script execution fallback
     try:
         from config_manager import (  # type: ignore[no-redef]
-            load_config as _load_config,
             DEFAULT_PATHS as _DEFAULT_PATHS,
+            load_config as _load_config,
         )
     except ImportError:
         _load_config = None  # type: ignore[assignment]
@@ -97,6 +98,7 @@ class InferenceWorker(QObject):
     queue_status_update = Signal(str, int, int, int, int)
     finished = Signal(bool, str)
     started_signal = Signal()
+    oom_detected = Signal(int, int, int)
 
     _BATCH_TOKENS = ("step ", "steps: ", "steps ")
     _GLOBAL_TOKENS = ("batch ", "frame ", "chunk ")
@@ -117,12 +119,16 @@ class InferenceWorker(QObject):
         self._env = env
         self._process: Optional[subprocess.Popen] = None
         self._abort = False
+        self.retry_count = 0
+        self.max_retries = _AUTOTUNE_MAX_STAGES
+        self.alarm_enabled = True
+        self._current_batch_size = self._extract_initial_batch_size(args)
+        self._pending_oom = False
 
-    # ------------------------------------------------------------------
     def run(self) -> None:
         """Entry-point called by ``QThread.started``."""
         cmd = [self._python_exe, self._cli_script] + self._args
-        self.log_line.emit(f"▶  {' '.join(cmd)}\n")
+        self.log_line.emit(f"▶  {' '.join(cmd)}")
 
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
@@ -144,9 +150,7 @@ class InferenceWorker(QObject):
                 start_new_session=(sys.platform != "win32"),
             )
         except FileNotFoundError:
-            self.log_line.emit(
-                f"❌  Python executable not found: {self._python_exe}\n"
-            )
+            self.log_line.emit(f"❌  Python executable not found: {self._python_exe}")
             self.finished.emit(False, "Python executable not found.")
             return
 
@@ -172,6 +176,7 @@ class InferenceWorker(QObject):
                     self.log_line.emit(line)
                 continue
 
+            self._inspect_oom_output(line)
             self.log_line.emit(line)
             self._parse_progress(line)
 
@@ -183,13 +188,15 @@ class InferenceWorker(QObject):
         rc = self._process.returncode
 
         if self._abort:
-            self.log_line.emit("\n⏹  Processing cancelled by user.\n")
+            self.log_line.emit("⏹  Processing cancelled by user.")
             self.finished.emit(False, "Cancelled.")
         elif rc == 0:
-            self.log_line.emit("\n✅  Processing completed successfully.\n")
+            self._play_success_sound()
+            self.log_line.emit("✅  Processing completed successfully.")
             self.finished.emit(True, "Done.")
         else:
-            self.log_line.emit(f"\n❌  Process exited with code {rc}.\n")
+            self._play_failure_sound()
+            self.log_line.emit(f"❌  Process exited with code {rc}.")
             self.finished.emit(False, f"Exit code {rc}.")
 
     def _parse_progress(self, line: str) -> None:
@@ -207,14 +214,78 @@ class InferenceWorker(QObject):
                 if "/" in rest:
                     try:
                         cur, tot = rest.split("/")
-                        c, t = int(cur), int(tot)
+                        current, total = int(cur), int(tot)
                         if is_batch:
-                            self.batch_progress_update.emit(c, t)
+                            self.batch_progress_update.emit(current, total)
                         else:
-                            self.progress_update.emit(c, t)
+                            self.progress_update.emit(current, total)
                     except ValueError:
                         pass
                 break
+
+    def _inspect_oom_output(self, line: str) -> None:
+        lower = line.lower()
+        if _OOM_LINE_RE.search(line):
+            self._pending_oom = True
+            self.retry_count = min(self.retry_count + 1, self.max_retries)
+            suggested = self._suggest_batch_size(self.retry_count)
+            self._current_batch_size = suggested
+            self.oom_detected.emit(self.retry_count, self.max_retries, suggested)
+            return
+
+        if "auto tune: cuda oom caught" in lower or "critical memory error" in lower:
+            stage_match = _STAGE_RE.search(line)
+            if stage_match:
+                try:
+                    self.retry_count = max(self.retry_count, int(stage_match.group(1)))
+                    self.max_retries = int(stage_match.group(2))
+                except ValueError:
+                    pass
+            batch_match = _BATCH_RE.search(line)
+            if batch_match:
+                try:
+                    self._current_batch_size = int(batch_match.group(1))
+                except ValueError:
+                    pass
+            self._pending_oom = False
+
+    def _extract_initial_batch_size(self, args: List[str]) -> int:
+        try:
+            idx = args.index("--batch_size")
+            return max(1, int(args[idx + 1]))
+        except (ValueError, IndexError):
+            return 81
+
+    def _suggest_batch_size(self, retry_count: int) -> int:
+        current = max(1, self._current_batch_size)
+        if retry_count <= 1:
+            return 77 if current > 77 else max(1, round((current - 1) / 4) * 4 + 1)
+        if retry_count == 4 and current > 45:
+            return 45
+        if retry_count >= 5:
+            snapped = max(1, current - 4)
+            return max(1, round((snapped - 1) / 4) * 4 + 1)
+        return current
+
+    def _play_success_sound(self) -> None:
+        if not self.alarm_enabled or winsound is None:
+            return
+        try:
+            winsound.PlaySound(
+                "SystemAsterisk",
+                winsound.SND_ALIAS | winsound.SND_ASYNC,
+            )
+        except Exception:
+            pass
+
+    def _play_failure_sound(self) -> None:
+        if not self.alarm_enabled or winsound is None:
+            return
+        try:
+            for _ in range(3):
+                winsound.Beep(1000, 250)
+        except Exception:
+            pass
 
     def request_abort(self) -> None:
         """Force-kill the subprocess tree and signal the worker to stop."""

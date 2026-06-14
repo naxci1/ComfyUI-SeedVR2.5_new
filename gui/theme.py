@@ -52,7 +52,7 @@ class Colors:
     TRIM_HANDLE_OUT = "#f87171"
     WHITE = "#ffffff"
     BLACK = "#000000"
-    SUCCESS_TEXT = "#06281d"
+    SUCCESS_TEXT = "#059669"
 
 
 class Fonts:
@@ -194,7 +194,7 @@ QPushButton[variant="danger"]:hover {{
 QPushButton[variant="success"] {{
     background-color: {c.SUCCESS};
     border-color: {c.SUCCESS};
-    color: #06281d;
+    color: {c.SUCCESS_TEXT};
 }}
 QPushButton[variant="ghost"] {{
     background-color: transparent;
