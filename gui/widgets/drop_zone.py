@@ -46,12 +46,15 @@ class DropZone(QWidget):
         if not event.mimeData().hasUrls():
             event.ignore()
             return
+        dropped = False
         for url in event.mimeData().urls():
             path = url.toLocalFile()
             if path and self._is_valid(path):
-                event.acceptProposedAction()
                 self.file_dropped.emit(path)
-                return
+                dropped = True
+        if dropped:
+            event.acceptProposedAction()
+            return
         event.ignore()
 
     def mousePressEvent(self, event) -> None:  # noqa: N802

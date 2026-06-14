@@ -120,7 +120,7 @@ class AnimatedProgressBar(QWidget):
         self._total_label.setStyleSheet(
             f"color: {Colors.TEXT_SECONDARY}; font-size: {Fonts.SIZE_SMALL}px;"
         )
-        self._total_label.setFixedWidth(38)
+        self._total_label.setFixedWidth(110)
         self._total_bar = _SingleBar(self)
 
         self._process_label = QLabel("Process", self)
@@ -144,6 +144,10 @@ class AnimatedProgressBar(QWidget):
         """Set the Total (phase) progress."""
         self._total_bar.setValue(value, eta)
 
+    def setTotalLabel(self, text: str) -> None:  # noqa: N802
+        self._total_label.setText(text or "Total")
+
     def reset(self) -> None:
+        self._total_label.setText("Total")
         self._total_bar.reset()
         self._process_bar.reset()

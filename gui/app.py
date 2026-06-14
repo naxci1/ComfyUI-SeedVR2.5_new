@@ -10,6 +10,7 @@ import subprocess
 import sys
 import traceback
 import webbrowser
+import json
 from pathlib import Path
 from typing import Optional
 
@@ -164,10 +165,12 @@ class MainWindow(QMainWindow):
     cancel_requested = Signal()
 
     _PRESET_TO_RESOLUTION = {
-        "720p (HD)": 720,
-        "1080p (FHD)": 1080,
-        "2K (1440p)": 1440,
-        "4K (2160p)": 2160,
+        "480p": 480,
+        "720p": 720,
+        "1080p": 1080,
+        "1440p": 1440,
+        "2K": 2048,
+        "4K": 2160,
     }
 
     def __init__(self) -> None:
@@ -193,6 +196,7 @@ class MainWindow(QMainWindow):
         self._gpu_vram = "—"
         self._log_viewer: Optional[LogViewer] = None
         self._preview_mode = "single"
+        self._current_phase_index = 0
 
         self._build_ui()
         # Build hidden io_bar for path tracking.
@@ -497,7 +501,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(Dims.PADDING_MD)
 
-        self.preview_btn = Button3D("Preview 1 Frame", variant="default", parent=widget)
+        self.preview_btn = Button3D("Preview", variant="default", parent=widget)
         self.export_btn = Button3D("Export", variant="primary", parent=widget)
         self.cancel_btn = Button3D("Cancel", variant="danger", parent=widget)
         self.cancel_btn.setEnabled(False)
@@ -534,6 +538,7 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self) -> None:
         self.project_panel.file_selected.connect(self.load_file)
+        self.project_panel.input_folder_selected.connect(self._on_input_folder_selected)
         self.project_panel.output_folder_requested.connect(self._on_output_folder_requested)
         self.drop_zone.file_dropped.connect(self._on_file_dropped)
 
@@ -586,9 +591,124 @@ class MainWindow(QMainWindow):
     def _apply_view_mode(self, mode: str) -> None:
         advanced = mode == "advanced"
         self.view_toggle_stack.setCurrentIndex(1 if advanced else 0)
-        self.settings_panel.setVisible(advanced)
+        self.settings_panel.setVisible(True)
         self.settings_panel.set_simple_mode(not advanced)
-        self.simple_mode_controls.setVisible(not advanced)
+        self.simple_mode_controls.setVisible(False)
+
+    def _select_video_encoder(self, codec: str) -> tuple[str, str]:
+        if codec == "H264":
+            if self._codec_cache.get("nvenc"):
+                return "h264_nvenc", "NVENC"
+            if self._codec_cache.get("qsv"):
+                return "h264_qsv", "QSV"
+            if self._codec_cache.get("amf"):
+                return "h264_amf", "AMF"
+            return "libx264", "SW"
+        if self._codec_cache.get("nvenc"):
+            return "hevc_nvenc", "NVENC"
+        if self._codec_cache.get("qsv"):
+            return "hevc_qsv", "QSV"
+        if self._codec_cache.get("amf"):
+            return "hevc_amf", "AMF"
+        return "libx265", "SW"
+
+    @staticmethod
+    def _quality_level_index(level: str) -> int:
+        return {"Low": 0, "Medium": 1, "High": 2}.get(level, 1)
+
+    def _build_export_ffmpeg_args(self, export_settings: dict, settings: dict) -> list[str]:
+        codec = str(export_settings.get("codec", "H265"))
+        profile = str(export_settings.get("profile", "")).strip()
+        bitrate_mode = str(export_settings.get("bitrate_mode", "dynamic"))
+        bitrate_mbps = int(export_settings.get("bitrate_mbps", 20))
+        quality_level = str(export_settings.get("quality_level", "Medium"))
+        quality_index = self._quality_level_index(quality_level)
+        use_10bit = bool(settings.get("use_10bit", True))
+
+        args: list[str] = []
+        if codec == "ProRes":
+            profile_map = {
+                "Proxy": "0",
+                "LT": "1",
+                "Standard": "2",
+                "HQ": "3",
+                "4444": "4",
+                "4444 XQ": "5",
+            }
+            args += ["-c:v", "prores_ks", "-profile:v", profile_map.get(profile, "2"), "-pix_fmt", "yuv422p10le", "-vendor", "apl0"]
+        elif codec == "DNxHR":
+            profile_map = {
+                "LB": "dnxhr_lb",
+                "SQ": "dnxhr_sq",
+                "HQ": "dnxhr_hq",
+                "HQX": "dnxhr_hqx",
+                "444": "dnxhr_444",
+            }
+            args += ["-c:v", "dnxhd", "-profile:v", profile_map.get(profile, "dnxhr_sq")]
+        elif codec == "H264":
+            encoder, variant = self._select_video_encoder(codec)
+            profile_map = {"Baseline": "baseline", "Main": "main", "High": "high"}
+            args += ["-c:v", encoder, "-profile:v", profile_map.get(profile, "main"), "-pix_fmt", "yuv420p"]
+            if bitrate_mode == "constant":
+                args += ["-b:v", f"{bitrate_mbps}M"]
+            elif variant == "NVENC":
+                args += ["-cq", str((28, 23, 18)[quality_index])]
+            elif variant == "QSV":
+                args += ["-global_quality", str((28, 23, 18)[quality_index])]
+            elif variant == "AMF":
+                qp = str((28, 23, 18)[quality_index])
+                args += ["-rc", "cqp", "-qp_i", qp, "-qp_p", qp]
+            else:
+                args += ["-crf", str((28, 23, 18)[quality_index])]
+        elif codec == "H265":
+            encoder, variant = self._select_video_encoder(codec)
+            profile_map = {"Main": "main", "Main10": "main10", "Main12": "main12"}
+            pix_fmt = "yuv420p10le" if use_10bit or profile in {"Main10", "Main12"} else "yuv420p"
+            args += ["-c:v", encoder, "-profile:v", profile_map.get(profile, "main"), "-pix_fmt", pix_fmt]
+            if bitrate_mode == "constant":
+                args += ["-b:v", f"{bitrate_mbps}M"]
+            elif variant == "NVENC":
+                args += ["-cq", str((28, 23, 18)[quality_index])]
+            elif variant == "QSV":
+                args += ["-global_quality", str((28, 23, 18)[quality_index])]
+            elif variant == "AMF":
+                qp = str((28, 23, 18)[quality_index])
+                args += ["-rc", "cqp", "-qp_i", qp, "-qp_p", qp]
+            else:
+                args += ["-crf", str((28, 23, 18)[quality_index])]
+        elif codec == "AV1":
+            args += ["-c:v", "libsvtav1", "-pix_fmt", "yuv420p10le" if use_10bit else "yuv420p"]
+            if bitrate_mode == "constant":
+                args += ["-b:v", f"{bitrate_mbps}M"]
+            else:
+                args += ["-crf", str((35, 25, 18)[quality_index])]
+        elif codec == "VP9":
+            args += ["-c:v", "libvpx-vp9", "-pix_fmt", "yuv420p10le" if use_10bit else "yuv420p"]
+            if bitrate_mode == "constant":
+                args += ["-b:v", f"{bitrate_mbps}M"]
+            else:
+                args += ["-crf", str((35, 25, 18)[quality_index])]
+        elif codec == "FFV1":
+            level_map = {"Low": "1", "Medium": "3", "High": "4"}
+            args += ["-c:v", "ffv1", "-level", level_map.get(quality_level, "3")]
+        elif codec == "QuickTime V210":
+            args += ["-c:v", "v210", "-pix_fmt", "yuv422p10le"]
+        elif codec == "QuickTime R210":
+            args += ["-c:v", "r210", "-pix_fmt", "rgb48be"]
+        elif codec == "QuickTime Animation":
+            args += ["-c:v", "qtrle"]
+        return args
+
+    def _on_input_folder_selected(self, folder: str) -> None:
+        if not folder or self._processing:
+            return
+        payload = {
+            "mode": "batch_folder",
+            "input": folder,
+            "settings": self.settings_panel.get_all_settings(),
+            "processing_list_file": str(Path(folder) / "seedvr2_processing_list.txt"),
+        }
+        self.export_requested.emit(payload)
 
     def _resolve_output_dir(self) -> Path:
         raw = self.output_path_edit.text().strip() if hasattr(self, "output_path_edit") else ""
@@ -634,7 +754,7 @@ class MainWindow(QMainWindow):
         try:
             settings = self.settings_panel.get_all_settings()
             if settings.get("resolution_mode") == "presets":
-                self.simple_resolution_combo.setCurrentText(settings.get("resolution_presets", "720p (HD)"))
+                self.simple_resolution_combo.setCurrentText(settings.get("resolution_presets", "720p"))
             elif settings.get("resolution_mode") == "pixel":
                 resolution = int(settings.get("resolution", 720))
                 nearest = min(self._PRESET_TO_RESOLUTION.items(), key=lambda item: abs(item[1] - resolution))[0]
@@ -819,6 +939,7 @@ class MainWindow(QMainWindow):
     def _on_export_confirmed(self, export_settings: dict) -> None:
         if not export_settings.get("container"):
             export_settings["container"] = self._simple_container_value
+        export_settings["source_fps"] = self.preview_widget.get_fps()
         payload = {
             "mode": "export",
             "input": self._current_file,
@@ -872,6 +993,12 @@ class MainWindow(QMainWindow):
                     output_format = str(export.get("container", "MP4")).lower()
         if output_format:
             args += ["--output_format", output_format]
+        source_fps = float(payload.get("export", {}).get("source_fps", 0.0) or 0.0)
+        if source_fps > 0:
+            args += ["--source_fps", f"{source_fps:.6f}"]
+        processing_list_file = str(payload.get("processing_list_file", "")).strip()
+        if processing_list_file:
+            args += ["--processing_list_file", processing_list_file, "--video_only_directory"]
 
         resolution_mode = settings.get("resolution_mode", "pixel")
         if resolution_mode == "xtimes":
@@ -944,6 +1071,11 @@ class MainWindow(QMainWindow):
             args += ["--compile_backend", str(settings.get("compile_backend"))]
         if settings.get("compile_mode"):
             args += ["--compile_mode", str(settings.get("compile_mode"))]
+        export = payload.get("export", {})
+        if export and export.get("output_type") == "video":
+            ffmpeg_args = self._build_export_ffmpeg_args(export, settings)
+            if ffmpeg_args:
+                args += ["--ffmpeg_video_args", json.dumps(ffmpeg_args)]
 
         return args
 
@@ -966,11 +1098,12 @@ class MainWindow(QMainWindow):
         payload = dict(payload)
         payload["export"] = export_settings
         payload["output_path"] = output_path
-        payload["output_format"] = (
-            str(export_settings.get("image_format", "TIFF")).lower()
-            if export_settings.get("output_type") == "image_sequence"
-            else str(export_settings.get("container", "MP4")).lower()
-        )
+        if export_settings:
+            payload["output_format"] = (
+                str(export_settings.get("image_format", "TIFF")).lower()
+                if export_settings.get("output_type") == "image_sequence"
+                else str(export_settings.get("container", "MP4")).lower()
+            )
 
         args = self._build_cli_args(payload)
         self._start_worker(cli_script, python_exe, args, "export", output_path)
@@ -1035,10 +1168,12 @@ class MainWindow(QMainWindow):
         self._worker.progress_update.connect(self._on_progress)
         self._worker.batch_progress_update.connect(self._on_batch_progress)
         self._worker.queue_status_update.connect(self._on_queue_status)
+        self._worker.phase_update.connect(self._on_phase_update)
         self._worker.oom_detected.connect(self._on_oom_detected)
         self._worker.started_signal.connect(lambda: self._set_processing(True))
         self._worker.finished.connect(self._on_finished)
         self.progress.reset()
+        self._current_phase_index = 0
         self._thread.start()
 
     def _set_processing(self, processing: bool) -> None:
@@ -1067,14 +1202,22 @@ class MainWindow(QMainWindow):
             self.progress.setValue(100.0 * current / total)
 
     def _on_batch_progress(self, current: int, total: int) -> None:
-        """Total (phase) progress — left bar."""
+        """Legacy per-step progress updates from CLI."""
         if total > 0:
-            self.progress.setTotalValue(100.0 * current / total)
-            self.status_label.setText(f"Batch progress {current}/{total}")
+            self.progress.setValue(100.0 * current / total)
+
+    def _on_phase_update(self, phase_name: str, current: int, total: int) -> None:
+        if total <= 0 or current <= 0:
+            return
+        self._current_phase_index = current
+        self.progress.setTotalLabel(phase_name)
+        self.progress.setTotalValue(100.0 * (current - 1) / total)
+        self.progress.setValue(0.0)
+        self.status_label.setText(phase_name)
 
     def _on_queue_status(self, file_path: str, current: int, total: int, done: int, remaining: int) -> None:
         name = os.path.basename(file_path) if file_path else "queue"
-        self.status_label.setText(f"{name} • {current}/{total} • done {done} • left {remaining}")
+        self.status_label.setText(f"Processing {current}/{total}: {name}")
 
     def _on_oom_detected(self, retry_count: int, max_retries: int, new_batch_size: int) -> None:
         self.status_label.setText(

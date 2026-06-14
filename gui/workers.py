@@ -96,6 +96,7 @@ class InferenceWorker(QObject):
     progress_update = Signal(int, int)
     batch_progress_update = Signal(int, int)
     queue_status_update = Signal(str, int, int, int, int)
+    phase_update = Signal(str, int, int)
     finished = Signal(bool, str)
     started_signal = Signal()
     oom_detected = Signal(int, int, int)
@@ -103,6 +104,7 @@ class InferenceWorker(QObject):
     _BATCH_TOKENS = ("step ", "steps: ", "steps ")
     _GLOBAL_TOKENS = ("batch ", "frame ", "chunk ")
     _QUEUE_STATUS_PREFIX = "__SEEDVR2_GUI_STATUS__|"
+    _PHASE_STATUS_PREFIX = "__SEEDVR2_GUI_PHASE__|"
 
     def __init__(
         self,
@@ -171,6 +173,17 @@ class InferenceWorker(QObject):
                         int(payload.get("total", 0)),
                         int(payload.get("done", 0)),
                         int(payload.get("remaining", 0)),
+                    )
+                except Exception:
+                    self.log_line.emit(line)
+                continue
+            if line.startswith(self._PHASE_STATUS_PREFIX):
+                try:
+                    payload = json.loads(line[len(self._PHASE_STATUS_PREFIX):])
+                    self.phase_update.emit(
+                        str(payload.get("phase_name", "")),
+                        int(payload.get("phase_index", 0)),
+                        int(payload.get("phase_total", 0)),
                     )
                 except Exception:
                     self.log_line.emit(line)

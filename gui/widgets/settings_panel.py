@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List
 
-from PySide6.QtCore import Qt, Signal, QTimer
+from PySide6.QtCore import QSize, Qt, Signal, QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -16,18 +16,22 @@ from PySide6.QtWidgets import (
     QFrame,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QListView,
+    QMenu,
+    QMessageBox,
     QScrollArea,
     QSlider,
-    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
 from ..theme import Colors, Dims, Fonts
+from .button3d import Button3D
 from .toggle_switch import ToggleSwitch
 
 try:
@@ -90,6 +94,123 @@ class _FrameListLineEdit(QLineEdit):
         super().focusOutEvent(event)
 
 
+class _ClickableLabel(QLabel):
+    clicked = Signal()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
+class NumericSlider(QWidget):
+    valueChanged = Signal(int)
+
+    def __init__(
+        self,
+        minimum: int,
+        maximum: int,
+        value: int,
+        step: int = 1,
+        formatter=None,
+        parser=None,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._minimum = minimum
+        self._maximum = maximum
+        self._step = max(1, int(step))
+        self._formatter = formatter or (lambda v: str(v))
+        self._parser = parser or (lambda text: int(round(float(text.strip()))))
+        self._editing = False
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(Dims.PADDING_SM)
+
+        self._slider = QSlider(Qt.Horizontal, self)
+        self._slider.setRange(0, max(0, (self._maximum - self._minimum) // self._step))
+        self._label = _ClickableLabel("", self)
+        self._label.setMinimumWidth(58)
+        self._label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._label.setCursor(Qt.PointingHandCursor)
+        self._editor = QLineEdit(self)
+        self._editor.setMinimumWidth(58)
+        self._editor.setAlignment(Qt.AlignRight)
+        self._editor.hide()
+
+        layout.addWidget(self._slider, 1)
+        layout.addWidget(self._label)
+        layout.addWidget(self._editor)
+
+        self._slider.valueChanged.connect(self._on_slider_changed)
+        self._label.clicked.connect(self._begin_edit)
+        self._editor.returnPressed.connect(self._commit_edit)
+        self._editor.editingFinished.connect(self._commit_edit)
+        self.setValue(value)
+
+    def _snap(self, value: int) -> int:
+        snapped = self._minimum + round((value - self._minimum) / self._step) * self._step
+        return max(self._minimum, min(self._maximum, snapped))
+
+    def _value_from_position(self, position: int) -> int:
+        return self._snap(self._minimum + position * self._step)
+
+    def _position_from_value(self, value: int) -> int:
+        return max(0, min(self._slider.maximum(), (self._snap(value) - self._minimum) // self._step))
+
+    def _update_label(self, value: int) -> None:
+        self._label.setText(self._formatter(value))
+
+    def _on_slider_changed(self, position: int) -> None:
+        value = self._value_from_position(position)
+        self._update_label(value)
+        if not self.signalsBlocked():
+            self.valueChanged.emit(value)
+
+    def _begin_edit(self) -> None:
+        if not self.isEnabled():
+            return
+        self._editing = True
+        self._editor.setText(self._formatter(self.value()))
+        self._label.hide()
+        self._editor.show()
+        self._editor.selectAll()
+        self._editor.setFocus()
+
+    def _commit_edit(self) -> None:
+        if not self._editing:
+            return
+        self._editing = False
+        try:
+            parsed = self._parser(self._editor.text())
+            self.setValue(parsed)
+        except Exception:
+            self._update_label(self.value())
+        self._editor.hide()
+        self._label.show()
+
+    def value(self) -> int:
+        return self._value_from_position(self._slider.value())
+
+    def setValue(self, value: int) -> None:  # noqa: N802
+        snapped = self._snap(int(value))
+        position = self._position_from_value(snapped)
+        changed = snapped != self.value()
+        self._slider.blockSignals(True)
+        self._slider.setValue(position)
+        self._slider.blockSignals(False)
+        self._update_label(snapped)
+        if changed and not self.signalsBlocked():
+            self.valueChanged.emit(snapped)
+
+    def setEnabled(self, enabled: bool) -> None:  # noqa: N802
+        super().setEnabled(enabled)
+        self._slider.setEnabled(enabled)
+        self._label.setEnabled(enabled)
+        self._editor.setEnabled(enabled)
+
+
 def _separator() -> QFrame:
     line = QFrame()
     line.setFrameShape(QFrame.HLine)
@@ -105,20 +226,23 @@ class SettingsPanel(QWidget):
     settings_changed = Signal()
 
     _PRESET_RESOLUTIONS = {
-        "720p (HD)": 720,
-        "1080p (FHD)": 1080,
-        "2K (1440p)": 1440,
-        "4K (2160p)": 2160,
+        "480p": 480,
+        "720p": 720,
+        "1080p": 1080,
+        "1440p": 1440,
+        "2K": 2048,
+        "4K": 2160,
     }
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.setFixedWidth(max(Dims.PANEL_WIDTH_RIGHT, 280))
+        self.setFixedWidth(max(Dims.PANEL_WIDTH_RIGHT + 96, 356))
         self._trim_in_frame = 0
         self._trim_out_frame = 0
         self._trim_frame_count = 0
         self._trim_active = False
         self._simple_mode = False
+        self._forms: List[QFormLayout] = []
         self._model_fallback = [
             "seedvr2_ema_3b_fp8_e4m3fn.safetensors",
             "seedvr2_ema_3b_fp16.safetensors",
@@ -139,7 +263,7 @@ class SettingsPanel(QWidget):
         self.settings_changed.connect(self._vram_timer.start)
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setContentsMargins(0, 0, Dims.PADDING_LG, 0)
         outer.setSpacing(0)
 
         scroll = QScrollArea(self)
@@ -149,7 +273,7 @@ class SettingsPanel(QWidget):
 
         body = QWidget()
         self._layout = QVBoxLayout(body)
-        self._layout.setContentsMargins(Dims.PADDING_MD, Dims.PADDING_MD, Dims.PADDING_MD, Dims.PADDING_MD)
+        self._layout.setContentsMargins(Dims.PADDING_MD, Dims.PADDING_MD, Dims.PADDING_LG, Dims.PADDING_MD)
         self._layout.setSpacing(Dims.PADDING_MD)
         scroll.setWidget(body)
 
@@ -170,12 +294,43 @@ class SettingsPanel(QWidget):
 
     # ---------------------------------------------------------------- simple mode
     def set_simple_mode(self, simple: bool) -> None:
-        """Show only Resolution + Quality groups when simple=True."""
+        """Show only resolution preset + quality chunk controls when simple=True."""
         self._simple_mode = simple
         advanced = not simple
-        # Groups to hide in simple mode (everything except resolution and batch/quality).
         for widget in self._advanced_only_widgets:
             widget.setVisible(advanced)
+        self._preset_group_box.setVisible(advanced)
+        self._resolution_group_box.setVisible(True)
+        self._batch_group_box.setVisible(True)
+
+        self._set_field_visible(self.resolution_mode_combo, advanced)
+        self._set_field_visible(self.resolution_spin, advanced and self.resolution_mode_combo.currentText() == "pixel")
+        self._set_field_visible(self.resolution_scale_combo, advanced and self.resolution_mode_combo.currentText() == "xtimes")
+        self._set_field_visible(self.resolution_presets_combo, True)
+        self._set_field_visible(self.max_resolution_spin, advanced)
+        self._set_field_visible(self.pre_downscale_combo, advanced)
+
+        self._set_field_visible(self.color_correction_combo, advanced)
+        self._set_field_visible(self.input_noise_slider, advanced)
+        self._set_field_visible(self.latent_noise_slider, advanced)
+        self._set_field_visible(self.temporal_overlap_spin, advanced)
+        self._set_field_visible(self.prepend_frames_spin, advanced)
+        self._set_field_visible(self.chunk_duration_combo, advanced)
+        self._set_field_visible(self.chunk_size_spin, True)
+
+        if simple:
+            self.resolution_mode_combo.setCurrentText("presets")
+            label = self._batch_form.labelForField(self.chunk_size_spin)
+            if label is not None:
+                label.setText("Quality chunk")
+            res_label = self._resolution_form.labelForField(self.resolution_presets_combo)
+            if res_label is not None:
+                res_label.setText("Resolution")
+        else:
+            label = self._batch_form.labelForField(self.chunk_size_spin)
+            if label is not None:
+                label.setText("Chunk size")
+            self._update_resolution_mode()
 
     def set_trim_range(self, trim_in: int, trim_out: int, frame_count: int, active: bool) -> None:
         self._trim_in_frame = max(0, int(trim_in))
@@ -192,7 +347,16 @@ class SettingsPanel(QWidget):
         self._layout.addWidget(box)
         if advanced_only:
             self._advanced_only_widgets.append(box)
+        self._forms.append(form)
         return form
+
+    def _set_field_visible(self, widget: QWidget, visible: bool) -> None:
+        for form in self._forms:
+            label = form.labelForField(widget)
+            if label is not None:
+                label.setVisible(visible)
+                break
+        widget.setVisible(visible)
 
     def _build_presets_group(self) -> None:
         """Presets section: save/load named settings presets."""
@@ -201,6 +365,7 @@ class SettingsPanel(QWidget):
         self._presets: Dict[str, Any] = self._load_presets()
 
         box = QGroupBox("PRESETS", self)
+        self._preset_group_box = box
         vlay = QVBoxLayout(box)
         vlay.setContentsMargins(Dims.PADDING_MD, Dims.PADDING_LG, Dims.PADDING_MD, Dims.PADDING_MD)
         vlay.setSpacing(Dims.PADDING_SM)
@@ -210,22 +375,26 @@ class SettingsPanel(QWidget):
         btn_row = QHBoxLayout()
         self._preset_name_edit = QLineEdit(box)
         self._preset_name_edit.setPlaceholderText("Preset name…")
-        self._save_preset_btn = QLabel("💾 Save", box)
-        self._save_preset_btn.setStyleSheet(
-            f"color: {Colors.TEXT_ACCENT}; font-size: {Fonts.SIZE_SMALL}px; cursor: pointer;"
-        )
-        self._save_preset_btn.mousePressEvent = self._on_save_preset  # type: ignore[method-assign]
+        self._save_preset_btn = Button3D("Save", variant="default", parent=box)
+        self._save_preset_btn.clicked.connect(self._on_save_preset)
         btn_row.addWidget(self._preset_name_edit, 1)
         btn_row.addWidget(self._save_preset_btn)
         vlay.addLayout(btn_row)
 
-        # Preset list.
         self._preset_list = QListWidget(box)
-        self._preset_list.setMaximumHeight(80)
+        self._preset_list.setViewMode(QListView.IconMode)
+        self._preset_list.setFlow(QListView.LeftToRight)
+        self._preset_list.setWrapping(True)
+        self._preset_list.setResizeMode(QListView.Adjust)
+        self._preset_list.setMovement(QListView.Static)
+        self._preset_list.setSpacing(Dims.PADDING_XS)
+        self._preset_list.setMaximumHeight(110)
+        self._preset_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._preset_list.customContextMenuRequested.connect(self._on_preset_context_menu)
         self._preset_list.itemDoubleClicked.connect(self._on_load_preset)
         vlay.addWidget(self._preset_list)
 
-        del_lbl = QLabel("(double-click to load)", box)
+        del_lbl = QLabel("(double-click to load • right-click to edit)", box)
         del_lbl.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; font-size: {Fonts.SIZE_TINY}px;")
         vlay.addWidget(del_lbl)
 
@@ -253,6 +422,7 @@ class SettingsPanel(QWidget):
         for name in sorted(self._presets.keys()):
             item = QListWidgetItem(name)
             item.setData(Qt.UserRole, name)
+            item.setSizeHint(QSize(92, 28))
             self._preset_list.addItem(item)
 
     def _on_save_preset(self, _event=None) -> None:
@@ -266,6 +436,38 @@ class SettingsPanel(QWidget):
         self._save_presets_to_disk()
         self._refresh_preset_list()
         self._preset_name_edit.clear()
+
+    def _on_preset_context_menu(self, pos) -> None:
+        item = self._preset_list.itemAt(pos)
+        if item is None:
+            return
+        menu = QMenu(self)
+        edit_action = menu.addAction("Edit")
+        rename_action = menu.addAction("Rename")
+        delete_action = menu.addAction("Delete")
+        action = menu.exec(self._preset_list.viewport().mapToGlobal(pos))
+        if action in (edit_action, rename_action):
+            self._rename_preset(item)
+        elif action == delete_action:
+            self._delete_preset(item)
+
+    def _rename_preset(self, item: QListWidgetItem) -> None:
+        current_name = str(item.data(Qt.UserRole))
+        new_name, ok = QInputDialog.getText(self, "Rename preset", "Preset name:", text=current_name)
+        new_name = new_name.strip()
+        if not ok or not new_name or new_name == current_name:
+            return
+        self._presets[new_name] = self._presets.pop(current_name)
+        self._save_presets_to_disk()
+        self._refresh_preset_list()
+
+    def _delete_preset(self, item: QListWidgetItem) -> None:
+        name = str(item.data(Qt.UserRole))
+        if QMessageBox.question(self, "Delete preset", f"Delete preset '{name}'?") != QMessageBox.Yes:
+            return
+        self._presets.pop(name, None)
+        self._save_presets_to_disk()
+        self._refresh_preset_list()
 
     def _on_load_preset(self, item: QListWidgetItem) -> None:
         name = item.data(Qt.UserRole)
@@ -301,11 +503,8 @@ class SettingsPanel(QWidget):
     def _label(self, text: str) -> QLabel:
         return QLabel(text)
 
-    def _spin(self, minimum: int, maximum: int, value: int, step: int = 1) -> QSpinBox:
-        spin = QSpinBox(self)
-        spin.setRange(minimum, maximum)
-        spin.setSingleStep(step)
-        spin.setValue(value)
+    def _spin(self, minimum: int, maximum: int, value: int, step: int = 1, formatter=None, parser=None) -> NumericSlider:
+        spin = NumericSlider(minimum, maximum, value, step=step, formatter=formatter, parser=parser)
         spin.valueChanged.connect(self._emit_settings_changed)
         return spin
 
@@ -328,21 +527,14 @@ class SettingsPanel(QWidget):
         check.toggled.connect(lambda _=False: self._emit_settings_changed())
         return check
 
-    def _slider_row(self, value: int) -> tuple[QWidget, QSlider, QLabel]:
-        container = QWidget(self)
-        layout = QHBoxLayout(container)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(Dims.PADDING_SM)
-        slider = QSlider(Qt.Horizontal, container)
-        slider.setRange(0, 100)
-        slider.setValue(value)
-        label = QLabel(f"{value / 100.0:.2f}", container)
-        label.setMinimumWidth(40)
-        layout.addWidget(slider, 1)
-        layout.addWidget(label)
-        slider.valueChanged.connect(lambda v, lbl=label: lbl.setText(f"{v / 100.0:.2f}"))
-        slider.valueChanged.connect(self._emit_settings_changed)
-        return container, slider, label
+    def _slider_row(self, value: int) -> NumericSlider:
+        return self._spin(
+            0,
+            100,
+            value,
+            formatter=lambda v: f"{v / 100.0:.2f}",
+            parser=lambda text: int(round(float(text.strip()) * 100.0)),
+        )
 
     def _populate_cuda_devices(self) -> None:
         self.cuda_device_list.clear()
@@ -370,7 +562,11 @@ class SettingsPanel(QWidget):
             models_dir = cfg.get("models_dir", "")
             if models_dir and os.path.isdir(models_dir):
                 for name in sorted(os.listdir(models_dir)):
-                    if name.lower().endswith((".safetensors", ".gguf", ".pt", ".pth", ".bin")):
+                    lowered = name.lower()
+                    if (
+                        lowered.startswith("seedvr2_ema_")
+                        and lowered.endswith((".safetensors", ".gguf"))
+                    ):
                         discovered.append(name)
         except Exception:
             discovered = []
@@ -392,12 +588,14 @@ class SettingsPanel(QWidget):
 
     def _build_resolution_group(self) -> None:
         form = self._group("RESOLUTION")  # always visible
+        self._resolution_form = form
+        self._resolution_group_box = form.parentWidget()
         self.resolution_mode_combo = self._combo(["pixel", "xtimes", "presets"], "pixel")
         self.resolution_mode_combo.currentTextChanged.connect(self._update_resolution_mode)
-        self.resolution_spin = self._spin(128, 7680, 720, 8)
+        self.resolution_spin = self._spin(128, 7680, 720, 1)
         self.resolution_scale_combo = self._combo(["2", "3", "4", "5"], "2")
-        self.resolution_presets_combo = self._combo(list(self._PRESET_RESOLUTIONS.keys()), "720p (HD)")
-        self.max_resolution_spin = self._spin(128, 7680, 3840, 8)
+        self.resolution_presets_combo = self._combo(list(self._PRESET_RESOLUTIONS.keys()), "720p")
+        self.max_resolution_spin = self._spin(128, 7680, 3840, 1)
         self.pre_downscale_combo = self._combo(["1", "2"], "1")
 
         self._resolution_label = self._label("Resolution")
@@ -437,8 +635,7 @@ class SettingsPanel(QWidget):
     def _build_runtime_group(self) -> None:
         form = self._group("RUNTIME", advanced_only=True)
         self.uniform_batch_toggle = self._toggle(True)
-        self.batch_size_spin = self._spin(1, 999999, 81, 4)
-        self.batch_size_spin.valueChanged.connect(self._snap_batch_size)
+        self.batch_size_spin = self._spin(1, 200, 81, 4)
         self.load_cap_spin = self._spin(0, 999999, 0)
         self.skip_first_frames_spin = self._spin(0, 999999, 0)
         self.only_frames_edit = _FrameListLineEdit(self)
@@ -454,20 +651,22 @@ class SettingsPanel(QWidget):
 
     def _build_batch_group(self) -> None:
         form = self._group("QUALITY & CHUNKING")  # always visible — chunk_size = "Quality/chunk"
+        self._batch_form = form
+        self._batch_group_box = form.parentWidget()
         self.color_correction_combo = self._combo(
             ["none", "lab", "wavelet", "wavelet_adaptive", "hsv", "adain"],
             "none",
         )
-        input_row, self.input_noise_slider, self.input_noise_label = self._slider_row(0)
-        latent_row, self.latent_noise_slider, self.latent_noise_label = self._slider_row(0)
+        self.input_noise_slider = self._slider_row(0)
+        self.latent_noise_slider = self._slider_row(0)
         self.temporal_overlap_spin = self._spin(0, 64, 8)
         self.prepend_frames_spin = self._spin(0, 16, 4)
         self.chunk_size_spin = self._spin(0, 999999, 0)
         self.chunk_duration_combo = self._combo([str(index) for index in range(6)], "0")
 
         form.addRow(self._label("Color correction"), self.color_correction_combo)
-        form.addRow(self._label("Input noise"), input_row)
-        form.addRow(self._label("Latent noise"), latent_row)
+        form.addRow(self._label("Input noise"), self.input_noise_slider)
+        form.addRow(self._label("Latent noise"), self.latent_noise_slider)
         form.addRow(self._label("Temporal overlap"), self.temporal_overlap_spin)
         form.addRow(self._label("Prepend frames"), self.prepend_frames_spin)
         form.addRow(self._label("Chunk size"), self.chunk_size_spin)
@@ -478,11 +677,11 @@ class SettingsPanel(QWidget):
         self.vae_encode_tiled_toggle = self._toggle(True)
         self.vae_encode_tiled_toggle.toggled.connect(self._update_vae_controls)
         self.vae_encode_tile_size_spin = self._spin(128, 4096, 1024, 128)
-        self.vae_encode_tile_overlap_spin = self._spin(0, 512, 64, 16)
+        self.vae_encode_tile_overlap_spin = self._spin(0, 512, 64)
         self.vae_decode_tiled_toggle = self._toggle(True)
         self.vae_decode_tiled_toggle.toggled.connect(self._update_vae_controls)
         self.vae_decode_tile_size_spin = self._spin(128, 4096, 1024, 128)
-        self.vae_decode_tile_overlap_spin = self._spin(0, 512, 64, 16)
+        self.vae_decode_tile_overlap_spin = self._spin(0, 512, 64)
 
         form.addRow(self._label("Encode tiled"), self.vae_encode_tiled_toggle)
         form.addRow(self._label("Encode tile size"), self.vae_encode_tile_size_spin)
@@ -553,12 +752,15 @@ class SettingsPanel(QWidget):
 
     def _update_resolution_mode(self) -> None:
         mode = self.resolution_mode_combo.currentText()
-        self._resolution_label.setVisible(mode == "pixel")
-        self.resolution_spin.setVisible(mode == "pixel")
-        self._resolution_scale_label.setVisible(mode == "xtimes")
-        self.resolution_scale_combo.setVisible(mode == "xtimes")
-        self._resolution_presets_label.setVisible(mode == "presets")
-        self.resolution_presets_combo.setVisible(mode == "presets")
+        if self._simple_mode:
+            self._set_field_visible(self.resolution_mode_combo, False)
+            self._set_field_visible(self.resolution_spin, False)
+            self._set_field_visible(self.resolution_scale_combo, False)
+            self._set_field_visible(self.resolution_presets_combo, True)
+        else:
+            self._set_field_visible(self.resolution_spin, mode == "pixel")
+            self._set_field_visible(self.resolution_scale_combo, mode == "xtimes")
+            self._set_field_visible(self.resolution_presets_combo, mode == "presets")
         self._emit_settings_changed()
 
     def _update_vae_controls(self) -> None:

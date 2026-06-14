@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-from typing import List, Optional
+from typing import Iterable, List, Optional
 
 from PySide6.QtCore import Qt, Signal, QObject, QThread, QSize
 from PySide6.QtGui import QIcon, QImage, QPixmap
@@ -28,6 +28,7 @@ except Exception:  # pragma: no cover
 
 _FILTER = "Media (*.mp4 *.mov *.mkv *.avi *.webm *.png *.jpg *.jpeg *.tif *.tiff *.exr *.dpx);;All files (*)"
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+_VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".flv", ".wmv", ".m4v"}
 
 
 def _extract_metadata(path: str):
@@ -79,6 +80,7 @@ class ProjectPanel(QWidget):
     """Project navigator listing imported media with thumbnails."""
 
     file_selected = Signal(str)
+    input_folder_selected = Signal(str)
     output_folder_requested = Signal()
 
     def __init__(self, parent=None) -> None:
@@ -107,6 +109,8 @@ class ProjectPanel(QWidget):
 
         self._browse = Button3D("＋ Browse Files", variant="default")
         self._browse.clicked.connect(self._on_browse)
+        self._browse_folder = Button3D("📂 Input Folder", variant="default")
+        self._browse_folder.clicked.connect(self._on_browse_folder)
         self._output_btn = Button3D("📁 Output Folder", variant="ghost")
         self._output_btn.clicked.connect(self._on_open_output_folder)
         wrap = QWidget()
@@ -114,6 +118,7 @@ class ProjectPanel(QWidget):
         wrap_layout.setContentsMargins(Dims.PADDING_SM, Dims.PADDING_SM, Dims.PADDING_SM, Dims.PADDING_SM)
         wrap_layout.setSpacing(Dims.PADDING_SM)
         wrap_layout.addWidget(self._browse)
+        wrap_layout.addWidget(self._browse_folder)
         wrap_layout.addWidget(self._output_btn)
         layout.addWidget(wrap)
 
@@ -135,6 +140,11 @@ class ProjectPanel(QWidget):
         if select:
             self._list.setCurrentItem(item)
         self._load_thumb(path, item)
+
+    def add_files(self, paths: Iterable[str], select_last: bool = True) -> None:
+        files = [path for path in paths if path]
+        for index, path in enumerate(files):
+            self.add_file(path, select=select_last and index == len(files) - 1)
 
     def _load_thumb(self, path: str, item: QListWidgetItem) -> None:
         if cv2 is None:
@@ -176,10 +186,24 @@ class ProjectPanel(QWidget):
 
     def _on_browse(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(self, "Browse media", "", _FILTER)
-        for p in paths:
-            self.add_file(p, select=(p == paths[-1]))
+        self.add_files(paths)
         if paths:
             self.file_selected.emit(paths[-1])
+
+    def _on_browse_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Select input folder", "")
+        if not folder:
+            return
+        video_files = [
+            os.path.join(folder, name)
+            for name in sorted(os.listdir(folder))
+            if os.path.isfile(os.path.join(folder, name))
+            and os.path.splitext(name)[1].lower() in _VIDEO_EXTS
+        ]
+        self.add_files(video_files)
+        if video_files:
+            self.file_selected.emit(video_files[0])
+        self.input_folder_selected.emit(folder)
 
     def cleanup(self) -> None:
         for t in list(self._threads):

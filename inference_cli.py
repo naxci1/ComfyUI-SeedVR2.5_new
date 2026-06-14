@@ -185,15 +185,6 @@ class FFMPEGVideoWriter:
     """
 
     @staticmethod
-    def _map_codec_to_nvenc(codec: str) -> str:
-        lowered = (codec or "").strip().lower()
-        if "libx264" in lowered or "h264" in lowered:
-            return "h264_nvenc"
-        if "libx265" in lowered or "h265" in lowered or "hevc" in lowered:
-            return "hevc_nvenc"
-        return codec
-
-    @staticmethod
     def _extract_flag_value(args: List[str], *flags: str) -> Optional[str]:
         for idx, token in enumerate(args):
             if token in flags and idx + 1 < len(args):
@@ -228,13 +219,12 @@ class FFMPEGVideoWriter:
                 break
 
         if codec_val is not None and codec_idx is not None:
-            mapped_codec = cls._map_codec_to_nvenc(codec_val)
+            mapped_codec = codec_val
             args[codec_idx] = mapped_codec
 
             if "nvenc" in mapped_codec.lower():
                 crf_val = cls._extract_flag_value(args, "-crf", "-crf:v")
                 args = cls._strip_flag_with_value(args, "-crf", "-crf:v")
-                args = cls._strip_flag_with_value(args, "-rc", "-cq", "-qp", "-b:v")
                 if cls._extract_flag_value(args, "-spatial-aq") is None:
                     args += ["-spatial-aq", "1"]
                 if crf_val is not None:
@@ -477,7 +467,7 @@ IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp'}
 # Video I/O Functions
 # =============================================================================
 
-def get_media_files(directory: str) -> List[str]:
+def get_media_files(directory: str, videos_only: bool = False) -> List[str]:
     """
     Get all video and image files from directory, sorted alphabetically.
     
@@ -487,7 +477,7 @@ def get_media_files(directory: str) -> List[str]:
     Returns:
         Sorted list of file paths (strings) matching video or image extensions
     """
-    valid_extensions = VIDEO_EXTENSIONS | IMAGE_EXTENSIONS
+    valid_extensions = VIDEO_EXTENSIONS if videos_only else (VIDEO_EXTENSIONS | IMAGE_EXTENSIONS)
     path = Path(directory)
     
     # Get all files and filter by extension (case-insensitive)
@@ -1255,7 +1245,7 @@ def process_single_file(input_path: str, args: "argparse.Namespace", device_list
             if not cap.isOpened():
                 raise ValueError(f"Cannot open video file: {input_path}")
             
-            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            fps = float(getattr(args, "source_fps", 0.0) or 0.0) or cap.get(cv2.CAP_PROP_FPS) or 30.0
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -1657,6 +1647,45 @@ def _emit_gui_queue_status(file_path: str, current: int, total: int) -> None:
     print(f"__SEEDVR2_GUI_STATUS__|{json.dumps(payload, ensure_ascii=False)}", flush=True)
 
 
+def _emit_gui_phase_status(phase_name: str, phase_index: int, phase_total: int = 4) -> None:
+    """Emit a machine-readable phase update for the GUI worker."""
+    payload = {
+        "phase_name": phase_name,
+        "phase_index": phase_index,
+        "phase_total": phase_total,
+    }
+    print(f"__SEEDVR2_GUI_PHASE__|{json.dumps(payload, ensure_ascii=False)}", flush=True)
+
+
+def _load_or_create_processing_list(list_path: Path, media_files: List[str]) -> Dict[str, str]:
+    """Load a pending/done processing list, or create one from media_files."""
+    entries: Dict[str, str] = {}
+    if list_path.exists():
+        try:
+            for raw_line in list_path.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if "\t" in line:
+                    name, status = line.split("\t", 1)
+                elif "|" in line:
+                    name, status = line.split("|", 1)
+                else:
+                    name, status = line, "pending"
+                entries[name.strip()] = status.strip().lower() or "pending"
+        except Exception:
+            entries = {}
+    for file_path in media_files:
+        entries.setdefault(Path(file_path).name, "pending")
+    _write_processing_list(list_path, entries)
+    return entries
+
+
+def _write_processing_list(list_path: Path, entries: Dict[str, str]) -> None:
+    lines = [f"{name}\t{status}" for name, status in sorted(entries.items())]
+    list_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+
+
 def _strict_batch_flush(*objs: Any) -> None:
     """Strict flush hook used by GUI/CLI runs to aggressively release memory."""
     for obj in objs:
@@ -1759,6 +1788,7 @@ def save_frames_to_video(
             )
 
     if writer is None:
+        _emit_gui_phase_status("Encoding", 4)
         debug.log(f"Saving {T} frames to video: {output_path} (backend={effective_backend})", category="file")
         os.makedirs(Path(output_path).parent, exist_ok=True)
         if effective_backend == "opencv":
@@ -2017,6 +2047,8 @@ def _process_frames_core(
     ctx['text_embeds'] = load_text_embeddings(script_directory, ctx['dit_device'], ctx['compute_dtype'], debug)
     debug.log("Loaded text embeddings for DiT", category="dit")
     
+    _emit_gui_phase_status("Pre-processing", 1)
+
     # Compute generation info and log start (handles prepending internally)
     frames_tensor, gen_info = compute_generation_info(
         ctx=ctx,
@@ -2045,6 +2077,7 @@ def _process_frames_core(
     # is wrapped in try/finally so that an OOM mid-phase still releases VRAM
     # before the error propagates to the Auto Tune step-down retry.
     try:
+        _emit_gui_phase_status("AI Inference", 2)
         # Phase 1: Encode
         ctx = encode_all_batches(
             runner, ctx=ctx, images=frames_tensor,
@@ -2081,6 +2114,7 @@ def _process_frames_core(
         if is_streaming:
             _release_phase_memory("Decode", debug)
 
+        _emit_gui_phase_status("Post-processing", 3)
         # Phase 4: Post-process
         ctx = postprocess_all_batches(
             ctx=ctx, debug=debug, progress_callback=None,
@@ -2459,6 +2493,12 @@ Examples:
                         help="JSON array of custom FFmpeg video encoding args, e.g. "
                              '\'["-c:v","prores_ks","-profile:v","3","-pix_fmt","yuv422p10le"]\'. '
                              "When supplied, implies --video_backend ffmpeg and overrides --10bit codec defaults.")
+    io_group.add_argument("--source_fps", type=float, default=0.0,
+                        help="Override output FPS with the exact source FPS supplied by the GUI.")
+    io_group.add_argument("--processing_list_file", type=str, default=None,
+                        help="Pending/done batch list file used for resumable directory processing.")
+    io_group.add_argument("--video_only_directory", action="store_true",
+                        help="When input is a directory, process only video files.")
     io_group.add_argument("--model_dir", type=str, default=None,
                         help=f"Model directory (default: ./models/{SEEDVR2_FOLDER_NAME})")
     io_group.add_argument("--pre_downscale", type=int, default=1, choices=[1, 2, 3],
@@ -2784,11 +2824,25 @@ def main() -> None:
         format_auto_detected = args.output_format is None
         
         if input_type == 'directory':
-            media_files = get_media_files(args.input)
+            media_files = get_media_files(args.input, videos_only=getattr(args, "video_only_directory", False))
             if not media_files:
                 debug.log(f"No video or image files found in directory: {args.input}", 
                         level="ERROR", category="file", force=True)
                 sys.exit(1)
+
+            processing_list_file = getattr(args, "processing_list_file", None) or str(
+                Path(args.input) / "seedvr2_processing_list.txt"
+            )
+            processing_entries = _load_or_create_processing_list(Path(processing_list_file), media_files)
+            total_files = len(processing_entries)
+            completed_before_run = sum(1 for status in processing_entries.values() if status == "done")
+            media_files = [
+                file_path for file_path in media_files
+                if processing_entries.get(Path(file_path).name, "pending") != "done"
+            ]
+            if not media_files:
+                debug.log("All files in the processing list are already marked done.", category="success", force=True)
+                sys.exit(0)
             
             debug.log(f"Found {len(media_files)} media files to process", category="file", force=True)
             
@@ -2812,11 +2866,11 @@ def main() -> None:
                     debug.log("━" * 60, category="none", force=True)
                     debug.log("", category="none", force=True)
                 
-                total_files = len(media_files)
-                _emit_gui_queue_status(file_path, idx, total_files)
+                queue_index = completed_before_run + idx
+                _emit_gui_queue_status(file_path, queue_index, total_files)
                 debug.log(
-                    f"Processing: {file_path} | File {idx} of {total_files} "
-                    f"[Done: {idx - 1}, Remaining: {total_files - idx}]",
+                    f"Processing: {file_path} | File {queue_index} of {total_files} "
+                    f"[Done: {queue_index - 1}, Remaining: {total_files - queue_index}]",
                     category="generation", force=True
                 )
                 
@@ -2861,6 +2915,8 @@ def main() -> None:
                     args,
                     on_success=_release_post_file_resources,
                 )
+                processing_entries[Path(file_path).name] = "done"
+                _write_processing_list(Path(processing_list_file), processing_entries)
                 
                 # Restore original format
                 args.output_format = original_format
