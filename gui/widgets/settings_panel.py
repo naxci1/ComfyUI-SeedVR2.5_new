@@ -1138,20 +1138,23 @@ class SettingsPanel(QWidget):
         )
 
     def _build_vram_group(self) -> None:
-        box = QGroupBox("ESTIMATED VRAM", self)
+        box = QGroupBox("DEVICE INFO", self)
         layout = QVBoxLayout(box)
         layout.setContentsMargins(Dims.PADDING_MD, Dims.PADDING_LG, Dims.PADDING_MD, Dims.PADDING_MD)
-        self.vram_value_label = QLabel("0.0 GB", box)
-        self.vram_value_label.setStyleSheet(
-            f"font-size: {Fonts.SIZE_H1 + 6}px; font-weight: {Fonts.WEIGHT_BOLD}; color: {Colors.SUCCESS};"
+        box.setStyleSheet(
+            f"QGroupBox {{ color: {Colors.TEXT_PRIMARY}; font-size: {Fonts.SIZE_SMALL + 1}px; "
+            f"font-weight: {Fonts.WEIGHT_BOLD}; border: 1px solid {Colors.BORDER}; "
+            f"border-radius: {Dims.CORNER_RADIUS_MD}px; margin-top: 8px; padding-top: 8px; }}"
         )
-        self.vram_status_label = QLabel("Balanced defaults selected", box)
-        self.vram_status_label.setWordWrap(True)
-        self.vram_status_label.setStyleSheet(
-            f"color: {Colors.TEXT_SECONDARY}; font-size: {Fonts.SIZE_SMALL}px;"
-        )
-        layout.addWidget(self.vram_value_label)
-        layout.addWidget(self.vram_status_label)
+        self._device_info_labels: List[QLabel] = []
+        for _ in range(7):
+            lbl = QLabel("—", box)
+            lbl.setStyleSheet(
+                f"color: {Colors.TEXT_PRIMARY}; font-size: {Fonts.SIZE_SMALL + 1}px; "
+                f"font-weight: {Fonts.WEIGHT_MEDIUM};"
+            )
+            layout.addWidget(lbl)
+            self._device_info_labels.append(lbl)
         self._layout.addWidget(box)
         self._advanced_only_widgets.append(box)
 
@@ -1192,44 +1195,19 @@ class SettingsPanel(QWidget):
         self.settings_changed.emit()
 
     def _update_vram_prediction(self) -> None:
-        settings = self.get_all_settings()
-        resolution = settings["resolution"]
-        if settings["resolution_mode"] == "presets":
-            resolution = self._PRESET_RESOLUTIONS.get(settings["resolution_presets"], resolution)
-        elif settings["resolution_mode"] == "xtimes":
-            resolution = int(settings["resolution_scale"]) * 720
-
-        batch = settings["batch_size"]
-        est = 3.0 + (resolution / 720.0) * 1.4 + ((batch - 1) / 4.0) * 0.08
-        if "7b" in settings["dit_model"].lower():
-            est += 3.8
-        if settings["cache_dit"]:
-            est += 0.5
-        if settings["cache_vae"]:
-            est += 0.3
-        if settings["vae_encode_tiled"] or settings["vae_decode_tiled"]:
-            est *= 0.82
-        if settings["compile_dit"] or settings["compile_vae"]:
-            est += 0.4
-
-        if est < 8:
-            color = Colors.SUCCESS
-            text = "Comfortable — current settings should fit well"
-        elif est < 14:
-            color = Colors.WARNING
-            text = "Elevated — Auto Tune recommended"
-        else:
-            color = Colors.DANGER
-            text = "High risk — reduce resolution or batch size"
-
-        self.vram_value_label.setText(f"{est:.1f} GB")
-        self.vram_value_label.setStyleSheet(
-            f"font-size: {Fonts.SIZE_H1 + 6}px; font-weight: {Fonts.WEIGHT_BOLD}; color: {color};"
-        )
-        self.vram_status_label.setText(text)
+        return
 
     def update_vram_estimate(self) -> None:
-        self._update_vram_prediction()
+        return
+
+    def set_device_info_lines(self, lines: List[str]) -> None:
+        if not hasattr(self, "_device_info_labels"):
+            return
+        padded = list(lines[:len(self._device_info_labels)])
+        while len(padded) < len(self._device_info_labels):
+            padded.append("—")
+        for lbl, text in zip(self._device_info_labels, padded):
+            lbl.setText(str(text))
 
     def set_image_mode(self) -> None:
         """Force settings appropriate for single-image processing."""

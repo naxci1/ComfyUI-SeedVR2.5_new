@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Property, QPropertyAnimation, QEasingCurve, Qt, QRectF
 from PySide6.QtGui import QColor, QLinearGradient, QPainter
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QWidget, QVBoxLayout
 
 from ..theme import Anim, Colors, Dims, Fonts
 
@@ -112,7 +112,19 @@ class AnimatedProgressBar(QWidget):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        layout = QHBoxLayout(self)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(4)
+
+        self._status_label = QLabel("CHUNK 0/0 | BATCH 0/0 | IDLE", self)
+        self._status_label.setStyleSheet(
+            f"background: {Colors.BG_LIGHTER}; color: {Colors.TEXT_PRIMARY};"
+            f"font-size: {Fonts.SIZE_SMALL + 2}px; font-weight: {Fonts.WEIGHT_BOLD};"
+            f"padding: 4px 8px; border-radius: {Dims.CORNER_RADIUS_SM}px;"
+        )
+        root.addWidget(self._status_label)
+
+        layout = QHBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
@@ -134,6 +146,7 @@ class AnimatedProgressBar(QWidget):
         layout.addWidget(self._total_bar, 2)
         layout.addWidget(self._process_label)
         layout.addWidget(self._process_bar, 3)
+        root.addLayout(layout)
 
     # ---------------------------------------------------------------- api
     def setValue(self, value: float, eta: str = "") -> None:  # noqa: N802
@@ -149,5 +162,9 @@ class AnimatedProgressBar(QWidget):
 
     def reset(self) -> None:
         self._total_label.setText("Total")
+        self._status_label.setText("CHUNK 0/0 | BATCH 0/0 | IDLE")
         self._total_bar.reset()
         self._process_bar.reset()
+
+    def setStatusText(self, text: str) -> None:  # noqa: N802
+        self._status_label.setText(text or "CHUNK 0/0 | BATCH 0/0 | IDLE")

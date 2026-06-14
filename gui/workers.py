@@ -98,6 +98,7 @@ class InferenceWorker(QObject):
     batch_progress_update = Signal(int, int)
     queue_status_update = Signal(str, int, int, int, int)
     phase_update = Signal(str, int, int, float)
+    chunk_status_update = Signal(str, int, int, int, int)
     finished = Signal(bool, str)
     started_signal = Signal()
     oom_detected = Signal(int, int, int)
@@ -106,6 +107,7 @@ class InferenceWorker(QObject):
     _GLOBAL_TOKENS = ("batch ", "frame ", "chunk ")
     _QUEUE_STATUS_PREFIX = "__SEEDVR2_GUI_STATUS__|"
     _PHASE_STATUS_PREFIX = "__SEEDVR2_GUI_PHASE__|"
+    _CHUNK_STATUS_PREFIX = "__SEEDVR2_GUI_CHUNK__|"
 
     def __init__(
         self,
@@ -186,6 +188,19 @@ class InferenceWorker(QObject):
                         int(payload.get("phase_index", 0)),
                         int(payload.get("phase_total", 0)),
                         float(payload.get("phase_progress", 0.0)),
+                    )
+                except Exception:
+                    self.log_line.emit(line)
+                continue
+            if line.startswith(self._CHUNK_STATUS_PREFIX):
+                try:
+                    payload = json.loads(line[len(self._CHUNK_STATUS_PREFIX):])
+                    self.chunk_status_update.emit(
+                        str(payload.get("phase_name", "")),
+                        int(payload.get("chunk_current", 0)),
+                        int(payload.get("chunk_total", 0)),
+                        int(payload.get("batch_current", 0)),
+                        int(payload.get("batch_total", 0)),
                     )
                 except Exception:
                     self.log_line.emit(line)

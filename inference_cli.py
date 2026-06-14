@@ -51,7 +51,9 @@ import json
 import argparse
 import time
 import shlex
+import hashlib
 import platform
+import tempfile
 import threading
 import multiprocessing as mp
 from collections import deque
@@ -152,6 +154,16 @@ from src.optimization.memory_manager import clear_memory, get_gpu_backend, is_cu
 debug = Debug(enabled=False)  # Will be enabled via --debug CLI flag
 
 
+def _seedvr_temp_dir() -> str:
+    if os.name == "nt":
+        return os.path.join("C:\\1Click_SeedVR2.5", "temp")
+    return os.path.join(tempfile.gettempdir(), "1Click_SeedVR2.5", "temp")
+
+
+TEMP_DIR = _seedvr_temp_dir()
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+
 # =============================================================================
 # FFMPEG Class
 # =============================================================================
@@ -209,6 +221,10 @@ class FFMPEGVideoWriter:
     @classmethod
     def _normalize_video_encoder_args(cls, raw_args: List[str]) -> List[str]:
         args = list(raw_args)
+        # Rawvideo pipe input has no audio stream; force audio-off and strip any
+        # accidental audio flags from custom args.
+        args = cls._strip_flag_with_value(args, "-c:a", "-b:a", "-q:a", "-ac", "-ar", "-map")
+        args = [token for token in args if token not in {"-an"}]
 
         codec_idx = None
         codec_val = None
@@ -312,7 +328,7 @@ class FFMPEGVideoWriter:
         ffmpeg_cmd = [
             'ffmpeg', '-y', '-f', 'rawvideo', '-pix_fmt', 'rgb24',
             '-s', f'{width}x{height}', '-r', str(fps), '-i', '-',
-            *video_enc_args, path
+            *video_enc_args, '-an', path
         ]
         if debug.enabled:
             debug.log(
@@ -1260,10 +1276,16 @@ def _run_with_auto_tune(
     auto_tune = getattr(args, "auto_tune", False)
 
     if auto_tune:
+        input_type = get_input_type(input_path) if input_path else "video"
+        is_image = input_type == "image"
         # Apply VRAM-based starting parameters.
         vram_gb = get_vram_gb()
         params = get_starting_params(vram_gb)
-        args.batch_size = params["batch_size"]
+        if is_image:
+            args.batch_size = 1
+            args.uniform_batch_size = False
+        else:
+            args.batch_size = params["batch_size"]
         tile_size = params["tile_size"]
         if tile_size < 1024:
             args.vae_encode_tiled = True
@@ -1271,24 +1293,20 @@ def _run_with_auto_tune(
             args.vae_encode_tile_size = tile_size
             args.vae_decode_tile_size = tile_size
         debug.log(
-            f"Auto Tune: free VRAM {vram_gb:.1f} GB → starting batch={params['batch_size']}"
+            f"Auto Tune: free VRAM {vram_gb:.1f} GB → starting batch={args.batch_size}"
             f" tile={tile_size}",
             category="setup", force=True,
         )
 
         # Probe input resolution once for pre_downscale decisions.
         input_short_side = _probe_input_short_side(input_path) if input_path else None
-        input_type = get_input_type(input_path) if input_path else "video"
         is_video = input_type == "video"
 
         # Build the ordered action sequence.
         oom_actions = _build_oom_action_sequence(is_video, args.batch_size, input_short_side)
 
         # Attach a BatchCache so the VAE encode loop can resume from failed batch.
-        cache_dir = os.path.join(
-            getattr(args, "output", "") or ".", ".seedvr2_cache",
-            f"run_{int(time.time())}"
-        )
+        cache_dir = os.path.join(TEMP_DIR, ".seedvr2_cache", f"run_{int(time.time())}")
         batch_cache = BatchCache(cache_dir)
         args._batch_cache = batch_cache
     else:
@@ -1496,37 +1514,119 @@ def process_single_file(input_path: str, args: "argparse.Namespace", device_list
             # Single GPU: stream in main process
             else:
                 chunk_count = 0
-                for result in _stream_video_chunks(
-                    cap=cap,
-                    frames_to_process=frames_to_process,
-                    chunk_size=chunk_size,
-                    overlap=overlap,
-                    args=args,
-                    device_id=device_list[0],
-                    debug=debug,
-                    runner_cache=runner_cache,
-                    log_progress=streaming,
-                    total_chunks=total_chunks,
-                    cleanup_timer_name="chunk_cleanup"
-                ):
-                    chunk_count += 1
-                    # NOTE: Lanczos downscale is applied to input frames inside
-                    # _stream_video_chunks, so the result here is already at the
-                    # correct (upscaled) resolution.
-                    # Save output
-                    if is_png:
-                        save_frames_to_image(result, output_path, base_name,
-                                             start_index=frames_written,
-                                             image_format=args.output_format)
-                    else:
-                        video_writer = save_frames_to_video(result, output_path, fps, writer=video_writer,
-                            video_backend=args.video_backend, use_10bit=args.use_10bit,
-                            custom_video_args=custom_video_args)
+                # Chunked video export now always renders chunk files without audio,
+                # then concatenates and muxes the source audio once at the end.
+                if streaming and not is_png:
+                    run_temp_dir = _chunk_run_temp_dir(input_path, output_path)
+                    progress_path = os.path.join(run_temp_dir, "progress.json")
+                    completed_chunks = _load_chunk_progress(progress_path)
+                    if completed_chunks:
+                        debug.log(
+                            f"Resuming chunks: {len(completed_chunks)}/{total_chunks} already completed",
+                            category="info", force=True, indent_level=1,
+                        )
 
-                    frames_written += result.shape[0]
-                    del result
-                    result = None
+                    ds_factor = getattr(args, "pre_downscale", 1) or 1
+                    for chunk_i in range(total_chunks):
+                        chunk_number = chunk_i + 1
+                        chunk_start = args.skip_first_frames + chunk_i * chunk_size
+                        current_chunk_frames = min(chunk_size, frames_to_process - chunk_i * chunk_size)
+                        chunk_path = os.path.join(run_temp_dir, f"chunk_{chunk_number:05d}.mp4")
 
+                        if chunk_number in completed_chunks and os.path.isfile(chunk_path):
+                            frames_written += current_chunk_frames
+                            chunk_count += 1
+                            _emit_gui_chunk_status("encoding", chunk_number, total_chunks, 0, 0)
+                            continue
+
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, chunk_start)
+                        chunk_frames = _read_frames_from_cap(cap, current_chunk_frames)
+                        if chunk_frames is None:
+                            break
+                        if ds_factor > 1:
+                            chunk_frames = _apply_lanczos_downscale(chunk_frames, ds_factor)
+
+                        chunk_args = argparse.Namespace(**vars(args))
+                        if chunk_number > 1:
+                            chunk_args.prepend_frames = 0
+
+                        _emit_gui_chunk_status("encoding", chunk_number, total_chunks, 0, 0)
+                        result = _single_gpu_direct_processing(
+                            chunk_frames.to(torch.float16),
+                            chunk_args,
+                            device_list[0],
+                            runner_cache,
+                        )
+                        chunk_writer = save_frames_to_video(
+                            result,
+                            chunk_path,
+                            fps,
+                            video_backend=args.video_backend,
+                            use_10bit=args.use_10bit,
+                            custom_video_args=custom_video_args,
+                        )
+                        if chunk_writer is not None:
+                            chunk_writer.release()
+                        frames_written += result.shape[0]
+                        chunk_count += 1
+                        completed_chunks.add(chunk_number)
+                        _write_chunk_progress(progress_path, completed_chunks, total_chunks)
+                        del result
+                        result = None
+                        del chunk_frames
+                        gc.collect()
+                        try:
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+
+                    chunk_paths = [
+                        os.path.join(run_temp_dir, f"chunk_{idx:05d}.mp4")
+                        for idx in range(1, total_chunks + 1)
+                    ]
+                    missing = [p for p in chunk_paths if not os.path.isfile(p)]
+                    if missing:
+                        raise RuntimeError(f"Missing chunk outputs: {len(missing)} chunk(s) were not rendered.")
+
+                    concatenated_path = os.path.join(run_temp_dir, "concatenated_video.mp4")
+                    _emit_gui_chunk_status("encoding", total_chunks, total_chunks, 0, 0)
+                    _concat_chunk_videos(chunk_paths, concatenated_path)
+                    _mux_original_audio(concatenated_path, input_path, output_path)
+                    shutil.rmtree(run_temp_dir, ignore_errors=True)
+                else:
+                    for result in _stream_video_chunks(
+                        cap=cap,
+                        frames_to_process=frames_to_process,
+                        chunk_size=chunk_size,
+                        overlap=overlap,
+                        args=args,
+                        device_id=device_list[0],
+                        debug=debug,
+                        runner_cache=runner_cache,
+                        log_progress=streaming,
+                        total_chunks=total_chunks,
+                        cleanup_timer_name="chunk_cleanup"
+                    ):
+                        chunk_count += 1
+                        if streaming:
+                            _emit_gui_chunk_status("encoding", chunk_count, total_chunks, 0, 0)
+                        # NOTE: Lanczos downscale is applied to input frames inside
+                        # _stream_video_chunks, so the result here is already at the
+                        # correct (upscaled) resolution.
+                        # Save output
+                        if is_png:
+                            save_frames_to_image(result, output_path, base_name,
+                                                 start_index=frames_written,
+                                                 image_format=args.output_format)
+                        else:
+                            video_writer = save_frames_to_video(result, output_path, fps, writer=video_writer,
+                                video_backend=args.video_backend, use_10bit=args.use_10bit,
+                                custom_video_args=custom_video_args)
+
+                        frames_written += result.shape[0]
+                        del result
+                        result = None
                 chunk_idx = chunk_count
             
             if streaming:
@@ -1821,6 +1921,110 @@ def _emit_gui_phase_status(
         "phase_progress": max(0.0, min(1.0, float(phase_progress))),
     }
     print(f"__SEEDVR2_GUI_PHASE__|{json.dumps(payload, ensure_ascii=False)}", flush=True)
+
+
+def _emit_gui_chunk_status(
+    phase_name: str,
+    chunk_current: int,
+    chunk_total: int,
+    batch_current: int = 0,
+    batch_total: int = 0,
+) -> None:
+    payload = {
+        "phase_name": str(phase_name or ""),
+        "chunk_current": max(0, int(chunk_current)),
+        "chunk_total": max(0, int(chunk_total)),
+        "batch_current": max(0, int(batch_current)),
+        "batch_total": max(0, int(batch_total)),
+    }
+    print(f"__SEEDVR2_GUI_CHUNK__|{json.dumps(payload, ensure_ascii=False)}", flush=True)
+
+
+def _chunk_run_temp_dir(input_path: str, output_path: str) -> str:
+    key = f"{Path(input_path).resolve()}|{Path(output_path).resolve()}"
+    digest = hashlib.sha1(key.encode("utf-8", errors="ignore")).hexdigest()[:12]
+    temp_dir = os.path.join(TEMP_DIR, f"chunk_run_{digest}")
+    os.makedirs(temp_dir, exist_ok=True)
+    return temp_dir
+
+
+def _load_chunk_progress(progress_path: str) -> set[int]:
+    try:
+        if not os.path.isfile(progress_path):
+            return set()
+        with open(progress_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        items = payload.get("completed", [])
+        if isinstance(items, list):
+            return {int(x) for x in items if isinstance(x, int) or str(x).isdigit()}
+    except Exception:
+        pass
+    return set()
+
+
+def _write_chunk_progress(progress_path: str, completed: set[int], total_chunks: int) -> None:
+    payload = {
+        "completed": sorted(int(x) for x in completed),
+        "total_chunks": int(total_chunks),
+        "updated_at": int(time.time()),
+    }
+    with open(progress_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def _concat_chunk_videos(chunk_paths: List[str], output_path: str) -> None:
+    list_file = os.path.join(os.path.dirname(output_path), "concat_list.txt")
+    with open(list_file, "w", encoding="utf-8") as f:
+        for chunk_path in chunk_paths:
+            norm = str(Path(chunk_path).resolve()).replace("\\", "/").replace("'", "'\\''")
+            f.write(f"file '{norm}'\n")
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", list_file,
+        "-c:v", "copy",
+        "-an",
+        output_path,
+    ]
+    run = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0,
+    )
+    try:
+        os.remove(list_file)
+    except Exception:
+        pass
+    if run.returncode != 0:
+        raise RuntimeError(f"FFmpeg concat failed: {run.stdout[-1200:] if run.stdout else 'unknown error'}")
+
+
+def _mux_original_audio(temp_concatenated_path: str, original_input_path: str, output_path: str) -> None:
+    final_cmd = [
+        "ffmpeg", "-y",
+        "-i", temp_concatenated_path,
+        "-i", original_input_path,
+        "-c:v", "copy",
+        "-c:a", "copy",
+        "-map", "0:v:0",
+        "-map", "1:a:0?",
+        "-shortest",
+        output_path,
+    ]
+    run = subprocess.run(
+        final_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0,
+    )
+    if run.returncode != 0:
+        raise RuntimeError(f"FFmpeg audio mux failed: {run.stdout[-1200:] if run.stdout else 'unknown error'}")
 
 
 def _load_or_create_processing_list(list_path: Path, media_files: List[str]) -> Dict[str, str]:

@@ -11,6 +11,7 @@ import sys
 import traceback
 import webbrowser
 import json
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -111,6 +112,29 @@ APP_NAME = "1-Click SeedVR2.5 v.1.8b (by Naxci1)"
 GITHUB_URL = "https://github.com/naxci1/1Click_SeedVR2.5"
 
 
+def _seedvr_temp_dir() -> str:
+    if os.name == "nt":
+        return os.path.join("C:\\1Click_SeedVR2.5", "temp")
+    return os.path.join(tempfile.gettempdir(), "1Click_SeedVR2.5", "temp")
+
+
+TEMP_DIR = _seedvr_temp_dir()
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+try:
+    import psutil  # type: ignore
+except Exception:  # pragma: no cover
+    psutil = None  # type: ignore
+
+try:
+    import pynvml  # type: ignore
+    pynvml.nvmlInit()
+    _HAS_NVML = True
+except Exception:  # pragma: no cover
+    pynvml = None  # type: ignore
+    _HAS_NVML = False
+
+
 class _HardwareProbe(QObject):
     detected = Signal(str, str)
 
@@ -201,6 +225,14 @@ class MainWindow(QMainWindow):
         self._preview_mode = "single"
         self._current_phase_index = 0
         self._fs_win = None  # fullscreen overlay window reference
+        self._chunk_current = 0
+        self._chunk_total = 0
+        self._batch_current = 0
+        self._batch_total = 0
+        self._phase_name = "idle"
+        self._device_timer = QTimer(self)
+        self._device_timer.setInterval(1500)
+        self._device_timer.timeout.connect(self._update_device_info)
 
         self._build_ui()
         self._connect_signals()
@@ -209,6 +241,8 @@ class MainWindow(QMainWindow):
         self._start_hardware_probe()
         self._start_codec_probe()
         self._update_status_summary()
+        self._device_timer.start()
+        self._update_device_info()
 
         self.export_requested.connect(self._spawn_worker)
         self.preview_requested.connect(self._spawn_preview)
@@ -383,22 +417,23 @@ class MainWindow(QMainWindow):
 
     def _toggle_split_fullscreen(self) -> None:
         """Show the split view widget in a fullscreen window with an Exit button."""
+        if self._fs_win is not None:
+            self._fs_win.close()
+            return
         if not self.split_view_widget.has_images():
             Toast.show(self, "No split view to show fullscreen", "warning")
             return
-        # Create a frameless fullscreen container.
-        # Store as instance attribute so Python's GC doesn't destroy it immediately.
-        fs_win = QWidget(None, Qt.Window | Qt.FramelessWindowHint)
+
+        fs_win = QMainWindow(self)
         self._fs_win = fs_win
-        fs_win.setAttribute(Qt.WA_DeleteOnClose)
-        fs_win.destroyed.connect(lambda: setattr(self, "_fs_win", None))
+        fs_win.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
         fs_win.setStyleSheet(f"background: {Colors.PREVIEW_BG};")
-        layout = QVBoxLayout(fs_win)
+        container = QWidget(fs_win)
+        layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Clone images into a new SplitViewWidget for the fullscreen overlay.
-        fs_split = SplitViewWidget(fs_win)
+        fs_split = SplitViewWidget(container)
         if self.split_view_widget._original and self.split_view_widget._processed:
             fs_split.set_images(
                 self.split_view_widget._original,
@@ -406,11 +441,13 @@ class MainWindow(QMainWindow):
             )
         layout.addWidget(fs_split, 1)
 
-        exit_btn = Button3D("✕  Exit Full Screen", variant="danger", parent=fs_win)
+        exit_btn = Button3D("✕  Exit Full Screen", variant="danger", parent=container)
         exit_btn.setFixedHeight(36)
         exit_btn.clicked.connect(fs_win.close)
         layout.addWidget(exit_btn)
 
+        fs_win.setCentralWidget(container)
+        fs_win.destroyed.connect(lambda: setattr(self, "_fs_win", None))
         fs_win.showFullScreen()
 
     def _refresh_comparison_view(self) -> None:
@@ -528,7 +565,6 @@ class MainWindow(QMainWindow):
         self.project_panel.file_selected.connect(self.load_file)
         self.project_panel.file_removed.connect(self._on_file_removed)
         self.project_panel.input_folder_selected.connect(self._on_input_folder_selected)
-        self.project_panel.output_folder_requested.connect(self._on_output_folder_requested)
         self.drop_zone.file_dropped.connect(self._on_file_dropped)
 
         self.trim_timeline.in_point_changed.connect(lambda _=0: self._update_trim_labels())
@@ -593,9 +629,6 @@ class MainWindow(QMainWindow):
         """Reset IN/OUT to full range (fix #8 — X clear button)."""
         self.trim_timeline.set_full_range()
         self._update_trim_labels()
-
-    def _on_output_folder_requested(self) -> None:
-        pass  # Already handled inside ProjectPanel._on_open_output_folder.
 
     @staticmethod
     def _normalize_audio_mode(value: str) -> str:
@@ -706,6 +739,15 @@ class MainWindow(QMainWindow):
         self._gpu_vram = vram
         self.gpu_label.setText(f"GPU: {name}")
         self.vram_label.setText(f"VRAM: {vram}")
+        self.settings_panel.set_device_info_lines([
+            f"GPU: {name}",
+            "GPU Load: —  |  —°C",
+            f"VRAM: — / {vram}" if vram and vram != "—" else "VRAM: — / —",
+            "Shared VRAM: — / —",
+            "CPU: —  |  —°C",
+            "RAM: — / —",
+            "Temp: CPU —°C | GPU —°C",
+        ])
 
     def _on_codec_detected(self, result: dict) -> None:
         self._codec_cache = result
@@ -721,6 +763,92 @@ class MainWindow(QMainWindow):
             f"Auto Tune {'On' if settings['auto_tune'] else 'Off'}"
         )
         self.settings_summary_label.setText(summary)
+
+    def _update_device_info(self) -> None:
+        cpu_pct = 0.0
+        cpu_temp = None
+        ram_used_gb = 0.0
+        ram_total_gb = 0.0
+        ram_pct = 0.0
+        if psutil is not None:
+            try:
+                cpu_pct = float(psutil.cpu_percent(interval=None))
+                vm = psutil.virtual_memory()
+                ram_used_gb = float(vm.used) / (1024 ** 3)
+                ram_total_gb = float(vm.total) / (1024 ** 3)
+                ram_pct = float(vm.percent)
+                temps = psutil.sensors_temperatures() if hasattr(psutil, "sensors_temperatures") else {}
+                if temps:
+                    for entries in temps.values():
+                        if entries:
+                            cpu_temp = getattr(entries[0], "current", None)
+                            if cpu_temp is not None:
+                                break
+            except Exception:
+                pass
+
+        gpu_name = self._gpu_name
+        gpu_util = None
+        gpu_temp = None
+        vram_used_gb = None
+        vram_total_gb = None
+        vram_shared_used_gb = None
+        vram_shared_total_gb = None
+        if _HAS_NVML and pynvml is not None:
+            try:
+                handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                gpu_name = pynvml.nvmlDeviceGetName(handle)
+                if isinstance(gpu_name, bytes):
+                    gpu_name = gpu_name.decode("utf-8", errors="replace")
+                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                gpu_util = float(util.gpu)
+                gpu_temp = float(pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU))
+                mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                vram_used_gb = float(mem.used) / (1024 ** 3)
+                vram_total_gb = float(mem.total) / (1024 ** 3)
+                try:
+                    mem2 = pynvml.nvmlDeviceGetMemoryInfo_v2(handle)
+                    reserved = float(getattr(mem2, "reserved", 0.0))
+                    vram_shared_used_gb = reserved / (1024 ** 3)
+                    vram_shared_total_gb = max(0.0, (vram_total_gb or 0.0) - (vram_used_gb or 0.0))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        gpu_line = (
+            f"GPU Load: {gpu_util:.0f}%  |  {gpu_temp:.0f}°C"
+            if gpu_util is not None and gpu_temp is not None
+            else "GPU Load: —  |  —°C"
+        )
+        if vram_used_gb is not None and vram_total_gb and vram_total_gb > 0:
+            vram_pct = (vram_used_gb / vram_total_gb) * 100.0
+            vram_line = f"VRAM: {vram_used_gb:.1f} / {vram_total_gb:.1f} GB ({vram_pct:.0f}%)"
+        else:
+            vram_line = f"VRAM: — / {self._gpu_vram}" if self._gpu_vram and self._gpu_vram != "—" else "VRAM: — / —"
+        if vram_shared_used_gb is not None and vram_shared_total_gb is not None:
+            shared_line = f"Shared VRAM: {vram_shared_used_gb:.1f} / {vram_shared_total_gb:.1f} GB"
+        else:
+            shared_line = "Shared VRAM: — / —"
+        cpu_line = f"CPU: {cpu_pct:.0f}%  |  {cpu_temp:.0f}°C" if cpu_temp is not None else f"CPU: {cpu_pct:.0f}%  |  —°C"
+        if ram_total_gb > 0:
+            ram_line = f"RAM: {ram_used_gb:.1f} / {ram_total_gb:.1f} GB ({ram_pct:.0f}%)"
+        else:
+            ram_line = "RAM: — / —"
+        temp_line = (
+            f"Temp: CPU {cpu_temp:.0f}°C | GPU {gpu_temp:.0f}°C"
+            if cpu_temp is not None and gpu_temp is not None
+            else "Temp: CPU —°C | GPU —°C"
+        )
+        self.settings_panel.set_device_info_lines([
+            f"GPU: {gpu_name}",
+            gpu_line,
+            vram_line,
+            shared_line,
+            cpu_line,
+            ram_line,
+            temp_line,
+        ])
 
     def _on_file_dropped(self, path: str) -> None:
         self.project_panel.add_file(path)
@@ -881,9 +1009,7 @@ class MainWindow(QMainWindow):
         return str(path.with_name(name))
 
     def _preview_output_path(self) -> str:
-        source = Path(self._current_file)
-        frame = self.preview_widget.current_frame()
-        return str(source.parent / f"{source.stem}_preview_f{frame:06d}_sv2.tiff")
+        return str(Path(TEMP_DIR) / "preview_result.tiff")
 
     def _build_cli_args(self, payload: dict) -> list[str]:
         settings = payload.get("settings", {})
@@ -1030,8 +1156,7 @@ class MainWindow(QMainWindow):
         # Fix 5 — capture snapshot of current frame for split view after export
         frame_image = self.preview_widget.current_frame_image()
         if not frame_image.isNull():
-            source = Path(self._current_file)
-            snap_path = str(source.parent / f"{source.stem}_export_snapshot.tiff")
+            snap_path = str(Path(TEMP_DIR) / "export_snapshot.tiff")
             self._save_qimage_as_tiff16(frame_image, snap_path)
             self._snapshot_fallback_path = snap_path
         else:
@@ -1060,10 +1185,8 @@ class MainWindow(QMainWindow):
             Toast.show(self, "No preview frame available", "warning")
             return
 
-        out_dir = Path(self._current_file).parent
-        source = Path(self._current_file)
-        frame_idx = int(payload.get("frame_index", 0))
-        input_frame_path = out_dir / f"{source.stem}_preview_source_f{frame_idx:06d}.tiff"
+        os.makedirs(TEMP_DIR, exist_ok=True)
+        input_frame_path = Path(TEMP_DIR) / "preview_source.tiff"
         preview_output = Path(self._preview_output_path())
 
         self._save_qimage_as_tiff16(frame_image, str(input_frame_path))
@@ -1072,6 +1195,8 @@ class MainWindow(QMainWindow):
         preview_settings = dict(payload.get("settings", {}))
         preview_settings["skip_first_frames"] = 0
         preview_settings["load_cap"] = 0
+        preview_settings["batch_size"] = 1
+        preview_settings["uniform_batch_size"] = False
         preview_payload = {
             "mode": "preview",
             "input": str(input_frame_path),
@@ -1080,7 +1205,7 @@ class MainWindow(QMainWindow):
             "output_format": "tiff",
         }
         self._snapshot_fallback_path = str(
-            preview_output.with_name(preview_output.stem + "_fallback.tiff")
+            Path(TEMP_DIR) / "preview_fallback.tiff"
         )
         self._save_qimage_as_tiff16(frame_image, self._snapshot_fallback_path)
         args = self._build_cli_args(preview_payload)
@@ -1099,6 +1224,7 @@ class MainWindow(QMainWindow):
         self._worker.log_line.connect(self._on_log_line)
         self._worker.progress_update.connect(self._on_progress)
         self._worker.batch_progress_update.connect(self._on_batch_progress)
+        self._worker.chunk_status_update.connect(self._on_chunk_status)
         self._worker.queue_status_update.connect(self._on_queue_status)
         self._worker.phase_update.connect(self._on_phase_update)
         self._worker.oom_detected.connect(self._on_oom_detected)
@@ -1106,6 +1232,12 @@ class MainWindow(QMainWindow):
         self._worker.finished.connect(self._on_finished)
         self.progress.reset()
         self._current_phase_index = 0
+        self._chunk_current = 0
+        self._chunk_total = 0
+        self._batch_current = 0
+        self._batch_total = 0
+        self._phase_name = "idle"
+        self._update_progress_status_text()
         self._thread.start()
 
     def _set_processing(self, processing: bool) -> None:
@@ -1132,15 +1264,39 @@ class MainWindow(QMainWindow):
         """Process (current phase) progress — right bar."""
         if total > 0:
             self.progress.setValue(100.0 * current / total)
+            self._batch_current = current
+            self._batch_total = total
+            self._update_progress_status_text()
 
     def _on_batch_progress(self, current: int, total: int) -> None:
         """Legacy per-step progress updates from CLI."""
         if total > 0:
             self.progress.setValue(100.0 * current / total)
+            self._batch_current = current
+            self._batch_total = total
+            self._update_progress_status_text()
+
+    def _on_chunk_status(
+        self,
+        phase_name: str,
+        chunk_current: int,
+        chunk_total: int,
+        batch_current: int,
+        batch_total: int,
+    ) -> None:
+        self._phase_name = (phase_name or self._phase_name or "encoding").strip().lower()
+        if chunk_total > 0:
+            self._chunk_current = chunk_current
+            self._chunk_total = chunk_total
+        if batch_total > 0:
+            self._batch_current = batch_current
+            self._batch_total = batch_total
+        self._update_progress_status_text()
 
     def _on_phase_update(self, phase_name: str, current: int, total: int, phase_progress: float = 0.0) -> None:
         if total <= 0 or current <= 0:
             return
+        self._phase_name = phase_name
         self._current_phase_index = current
         bounded_phase_progress = max(0.0, min(1.0, float(phase_progress)))
         self.progress.setTotalLabel(f"{current}/{total} {phase_name}")
@@ -1148,6 +1304,17 @@ class MainWindow(QMainWindow):
         self.progress.setTotalValue(100.0 * current / total)
         self.progress.setValue(100.0 * bounded_phase_progress)
         self.status_label.setText(phase_name)
+        self._update_progress_status_text()
+
+    def _update_progress_status_text(self) -> None:
+        phase = str(self._phase_name or "idle").upper()
+        chunk_cur = self._chunk_current if self._chunk_current > 0 else 0
+        chunk_tot = self._chunk_total if self._chunk_total > 0 else 0
+        batch_cur = self._batch_current if self._batch_current > 0 else 0
+        batch_tot = self._batch_total if self._batch_total > 0 else 0
+        self.progress.setStatusText(
+            f"CHUNK {chunk_cur}/{chunk_tot} | BATCH {batch_cur}/{batch_tot} | {phase}"
+        )
 
     def _on_queue_status(self, file_path: str, current: int, total: int, done: int, remaining: int) -> None:
         name = os.path.basename(file_path) if file_path else "queue"
@@ -1243,6 +1410,10 @@ class MainWindow(QMainWindow):
         if success:
             self.progress.setValue(100.0)
             self.progress.setTotalValue(100.0)
+            self._phase_name = "done"
+            self._batch_current = max(self._batch_current, self._batch_total)
+            self._chunk_current = max(self._chunk_current, self._chunk_total)
+            self._update_progress_status_text()
             self._play_success_sound()
             Toast.show(self, "Completed successfully", "success")
             loaded = self._load_preview_outputs()

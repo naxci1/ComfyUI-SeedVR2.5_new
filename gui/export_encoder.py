@@ -178,8 +178,10 @@ def build_ffmpeg_command(
     # FPS — preserve source
     cmd += ["-r", str(source_fps)]
 
-    # Audio
-    if audio_mode == "none" or audio_mode == "None":
+    # Audio (raw frame sequence has no audio stream; never copy audio in that case)
+    if input_frames_dir:
+        cmd += ["-an"]
+    elif audio_mode == "none" or audio_mode == "None":
         cmd += ["-an"]
     elif audio_mode == "copy":
         cmd += ["-c:a", "copy"]

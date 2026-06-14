@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import os
-import subprocess
-import sys
 from typing import Iterable, List, Optional
 
 from PySide6.QtCore import Qt, Signal, QObject, QThread, QSize
@@ -125,7 +123,6 @@ class ProjectPanel(QWidget):
     file_selected = Signal(str)
     file_removed = Signal(str)
     input_folder_selected = Signal(str)
-    output_folder_requested = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -157,15 +154,12 @@ class ProjectPanel(QWidget):
         self._browse.clicked.connect(self._on_browse)
         self._browse_folder = Button3D("📂 Input Folder", variant="default")
         self._browse_folder.clicked.connect(self._on_browse_folder)
-        self._output_btn = Button3D("📁 Output Folder", variant="ghost")
-        self._output_btn.clicked.connect(self._on_open_output_folder)
         wrap = QWidget()
         wrap_layout = QVBoxLayout(wrap)
         wrap_layout.setContentsMargins(Dims.PADDING_SM, Dims.PADDING_SM, Dims.PADDING_SM, Dims.PADDING_SM)
         wrap_layout.setSpacing(Dims.PADDING_SM)
         wrap_layout.addWidget(self._browse)
         wrap_layout.addWidget(self._browse_folder)
-        wrap_layout.addWidget(self._output_btn)
         layout.addWidget(wrap)
 
     # ---------------------------------------------------------------- api
@@ -233,19 +227,6 @@ class ProjectPanel(QWidget):
         self._threads.append(thread)
         self._workers.append(worker)
         thread.start()
-
-    def _on_open_output_folder(self) -> None:
-        folder = self._output_dir or os.getcwd()
-        try:
-            if sys.platform == "win32":
-                os.startfile(folder)  # type: ignore[attr-defined]
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", folder])
-            else:
-                subprocess.Popen(["xdg-open", folder])
-        except Exception:
-            pass
-        self.output_folder_requested.emit()
 
     def _on_item_clicked(self, item: QListWidgetItem) -> None:
         path = item.data(Qt.UserRole)
