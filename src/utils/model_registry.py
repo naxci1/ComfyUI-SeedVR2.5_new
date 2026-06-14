@@ -76,6 +76,8 @@ def get_available_dit_models() -> List[str]:
         discovered_models = [
             filename for filename in model_files
             if filename not in MODEL_REGISTRY
+            and filename.lower().startswith("seedvr2_ema_")
+            and filename.lower().endswith((".gguf", ".safetensors"))
         ]
         
         # Add discovered models to the list

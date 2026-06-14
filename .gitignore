@@ -24,3 +24,6 @@ models/video_vae_v3_mine_bad/
 src/processing/
 TILE_VAE*
 .DS_Store
+build/
+dist/
+version_info.txt

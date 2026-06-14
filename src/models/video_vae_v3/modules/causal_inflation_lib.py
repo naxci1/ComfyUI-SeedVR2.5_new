@@ -123,7 +123,17 @@ class InflatedCausalConv3d(Conv3d):
         # Compatible with no limit.
         if math.isinf(self.memory_limit):
             if prev_cache is not None:
-                x = torch.cat([prev_cache, x], dim=split_dim - 1)
+                # Pre-allocate output to avoid intermediate buffer from torch.cat.
+                _dim = split_dim - 1
+                _cl = prev_cache.size(_dim)
+                _xl = x.size(_dim)
+                _shape = list(x.shape)
+                _shape[_dim] = _cl + _xl
+                _buf = torch.empty(_shape, dtype=x.dtype, device=x.device,
+                                   memory_format=torch.contiguous_format)
+                _buf.narrow(_dim, 0, _cl).copy_(prev_cache)
+                _buf.narrow(_dim, _cl, _xl).copy_(x)
+                x = _buf
             return super().forward(x)
 
         # Compute tensor shape after concat & padding.
@@ -135,7 +145,17 @@ class InflatedCausalConv3d(Conv3d):
         if memory_occupy < self.memory_limit or split_dim == x.ndim:
             x_concat = x
             if prev_cache is not None:
-                x_concat = torch.cat([prev_cache, x], dim=split_dim - 1)
+                # Pre-allocate output to avoid intermediate buffer from torch.cat.
+                _dim = split_dim - 1
+                _cl = prev_cache.size(_dim)
+                _xl = x.size(_dim)
+                _shape = list(x.shape)
+                _shape[_dim] = _cl + _xl
+                _buf = torch.empty(_shape, dtype=x.dtype, device=x.device,
+                                   memory_format=torch.contiguous_format)
+                _buf.narrow(_dim, 0, _cl).copy_(prev_cache)
+                _buf.narrow(_dim, _cl, _xl).copy_(x)
+                x_concat = _buf
             
             def pad_and_forward():
                 padded = safe_pad_operation(x_concat, padding, mode='constant', value=0.0)
@@ -162,9 +182,19 @@ class InflatedCausalConv3d(Conv3d):
         # Loop Fwd.
         cache = None
         for idx in range(len(x)):
-            # Concat prev cache from last dim
+            # Concat prev cache from last dim using pre-allocation to avoid
+            # intermediate tensor buffers that trigger OOM under VRAM pressure.
             if prev_cache is not None:
-                x[idx] = torch.cat([prev_cache[idx], x[idx]], dim=split_dim - 1)
+                _dim = split_dim - 1
+                _cl = prev_cache[idx].size(_dim)
+                _xl = x[idx].size(_dim)
+                _shape = list(x[idx].shape)
+                _shape[_dim] = _cl + _xl
+                _buf = torch.empty(_shape, dtype=x[idx].dtype, device=x[idx].device,
+                                   memory_format=torch.contiguous_format)
+                _buf.narrow(_dim, 0, _cl).copy_(prev_cache[idx])
+                _buf.narrow(_dim, _cl, _xl).copy_(x[idx])
+                x[idx] = _buf
 
             # Get padding pattern.
             lpad_dim = (x[idx].ndim - split_dim - 1) * 2
@@ -201,13 +231,36 @@ class InflatedCausalConv3d(Conv3d):
             # Update cache.
             cache = next_cache
 
-        output = retry_on_oom(
-            torch.cat,
-            x,
-            split_dim,
-            debug=getattr(self, 'debug', None),
-            operation_name="InflatedCausalConv3d.concat_splits"
+        # Flush PyTorch's reserved-but-unallocated VRAM pool back to CUDA before
+        # the large contiguous allocation.  On cudaMallocAsync platforms the pool
+        # can become fragmented so that a contiguous block cannot be found even
+        # though enough total memory is reserved.  empty_cache() returns those
+        # reserved segments to CUDA so the single pre-allocation below can
+        # satisfy the request from a fresh, unfragmented pool.
+        if x[0].is_cuda:
+            torch.cuda.empty_cache()
+
+        # Pre-allocate one contiguous output buffer and fill each split result
+        # into it via narrow+copy_, releasing each slice reference immediately
+        # after copying.  This replaces torch.cat, which would require both all
+        # N split tensors and the full output buffer to be live simultaneously.
+        # With this approach at most one split result is alive during the fill
+        # loop, keeping peak VRAM significantly lower.
+        total_dim_size = sum(xi.size(split_dim) for xi in x)
+        out_shape = list(x[0].shape)
+        out_shape[split_dim] = total_dim_size
+        output = torch.empty(
+            out_shape,
+            dtype=x[0].dtype,
+            device=x[0].device,
+            memory_format=torch.contiguous_format,
         )
+        offset = 0
+        for i in range(len(x)):
+            sz = x[i].size(split_dim)
+            output.narrow(split_dim, offset, sz).copy_(x[i])
+            offset += sz
+            x[i] = None  # release reference so CUDA memory is reclaimed promptly
         return output
 
     def forward(
@@ -270,7 +323,9 @@ class InflatedCausalConv3d(Conv3d):
             and cache_size != 0
         ):
             if cache_size > input[-1].size(2) and cache is not None and len(input) == 1:
-                input[0] = torch.cat([cache, input[0]], dim=2)
+                # Cast cache to the input dtype to avoid float32 upcasting during
+                # concatenation, which can trigger OOM in the 10-bit ProRes pipeline.
+                input[0] = torch.cat([cache.to(dtype=input[0].dtype), input[0]], dim=2)
                 cache = None
             if cache_size <= input[-1].size(2):
                 self.memory = input[-1][:, :, -cache_size:].detach().contiguous()
@@ -287,7 +342,9 @@ class InflatedCausalConv3d(Conv3d):
                 cache_size = get_cache_size(self, input[i].size(2) + cache_len, pad_len=0)
             if cache_size != 0:
                 if cache_size > input[i].size(2) and cache is not None:
-                    input[i] = torch.cat([cache, input[i]], dim=2)
+                    # Cast cache to the input dtype to avoid float32 upcasting during
+                    # concatenation, which can trigger OOM in the 10-bit ProRes pipeline.
+                    input[i] = torch.cat([cache.to(dtype=input[i].dtype), input[i]], dim=2)
                     cache = None
                 assert cache_size <= input[i].size(2), f"{cache_size} > {input[i].size(2)}"
                 next_cache = input[i][:, :, -cache_size:]

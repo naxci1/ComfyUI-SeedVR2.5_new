@@ -46,10 +46,16 @@ Model Support:
 # Standard library imports
 import sys
 import os
+import gc
+import json
 import argparse
 import time
+import shlex
+import hashlib
 import platform
+import threading
 import multiprocessing as mp
+from collections import deque
 from typing import Dict, Any, List, Optional, Tuple, Literal, Generator
 from datetime import datetime
 from pathlib import Path
@@ -66,6 +72,12 @@ os.environ['PYTHONPATH'] = script_dir + ':' + os.environ.get('PYTHONPATH', '')
 if mp.get_start_method(allow_none=True) != 'spawn':
     mp.set_start_method('spawn', force=True)
 
+# ── Blackwell / PyTorch performance environment variables ────────────────────
+# Must be injected BEFORE 'import torch' so the CUDA runtime picks them up.
+os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
+os.environ.setdefault("TORCH_CUDNN_V8_API_ENABLED", "1")
+os.environ.setdefault("CUDA_CACHE_MAXSIZE", "4294967296")
+
 # Configure platform-specific memory management before heavy imports
 # Must be set BEFORE import torch
 if platform.system() == "Darwin":
@@ -74,7 +86,11 @@ if platform.system() == "Darwin":
     os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
     os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.0")
 else:
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
+    # expandable_segments lets the CUDA allocator grow/shrink segment sizes on demand,
+    # preventing the VRAM fragmentation that causes OOM during Phase 3 VAE decoding
+    # (10.87 GiB allocated, 1.56 GiB reserved-but-unallocated, 1.32 GiB contiguous block missing).
+    # cudaNative is used instead of cudaMallocAsync to avoid the "ignores max_split_size_mb" warning.
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     # Pre-parse arguments that must be handled before torch import
     _pre_parser = argparse.ArgumentParser(add_help=False)
@@ -106,6 +122,8 @@ else:
 
 # Heavy dependency imports after environment configuration
 import torch
+torch._inductor.config.triton.cudagraphs = False
+torch._dynamo.config.suppress_errors = True
 import cv2
 import numpy as np
 import subprocess
@@ -135,6 +153,43 @@ from src.optimization.memory_manager import clear_memory, get_gpu_backend, is_cu
 debug = Debug(enabled=False)  # Will be enabled via --debug CLI flag
 
 
+if getattr(sys, "frozen", False):
+    APP_ROOT = os.path.dirname(sys.executable)
+else:
+    APP_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+DEFAULT_TEMP_DIR = os.path.join(APP_ROOT, "temp")
+CONFIG_PATH = os.path.join(APP_ROOT, "config.json")
+
+
+def _load_temp_dir_from_config() -> str:
+    config: Dict[str, Any] = {}
+    if os.path.isfile(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                config = loaded
+        except Exception:
+            config = {}
+
+    temp_dir = str(config.get("temp_dir", "")).strip()
+    if not temp_dir:
+        temp_dir = DEFAULT_TEMP_DIR
+        config["temp_dir"] = temp_dir
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
+                json.dump(config, fh, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    os.makedirs(temp_dir, exist_ok=True)
+    return temp_dir
+
+
+TEMP_DIR = _load_temp_dir_from_config()
+
+
 # =============================================================================
 # FFMPEG Class
 # =============================================================================
@@ -144,16 +199,15 @@ class FFMPEGVideoWriter:
     Video writer using ffmpeg subprocess for encoding with 10-bit support.
     
     Provides cv2.VideoWriter-compatible interface (write, isOpened, release) while
-    using ffmpeg for encoding. Enables 10-bit output (yuv420p10le with x265) which
-    reduces banding artifacts in gradients compared to standard 8-bit encodes.
+    using ffmpeg for encoding. Defaults to GPU-accelerated NVENC HEVC encoding.
     
     Args:
         path: Output video file path
         width: Frame width in pixels
         height: Frame height in pixels
         fps: Frames per second
-        use_10bit: If True, uses x265 codec with yuv420p10le pixel format.
-                   If False, uses x264 with yuv420p (default: False)
+        use_10bit: If True, uses yuv420p10le pixel format when default args are used.
+                   If False, uses yuv420p (default: False)
         custom_video_args: Optional list of ffmpeg video encoding args to use instead of
                            the default H264/H265 codec selection. When provided, ``use_10bit``
                            is ignored for codec/pix_fmt selection (but you may still rely on it
@@ -167,6 +221,113 @@ class FFMPEGVideoWriter:
         Frames must be passed to write() in BGR format (same as cv2.VideoWriter).
         Internally converts to RGB for ffmpeg rawvideo input.
     """
+
+    @staticmethod
+    def _extract_flag_value(args: List[str], *flags: str) -> Optional[str]:
+        for idx, token in enumerate(args):
+            if token in flags and idx + 1 < len(args):
+                return args[idx + 1]
+        return None
+
+    @staticmethod
+    def _strip_flag_with_value(args: List[str], *flags: str) -> List[str]:
+        stripped: List[str] = []
+        skip_next = False
+        for idx, token in enumerate(args):
+            if skip_next:
+                skip_next = False
+                continue
+            if token in flags:
+                if idx + 1 < len(args):
+                    skip_next = True
+                continue
+            stripped.append(token)
+        return stripped
+
+    @classmethod
+    def _normalize_video_encoder_args(cls, raw_args: List[str]) -> List[str]:
+        args = list(raw_args)
+        # Rawvideo pipe input has no audio stream; force audio-off and strip any
+        # accidental audio flags from custom args.
+        args = cls._strip_flag_with_value(args, "-c:a", "-b:a", "-q:a", "-ac", "-ar", "-map")
+        args = [token for token in args if token not in {"-an"}]
+
+        codec_idx = None
+        codec_val = None
+        for idx, token in enumerate(args):
+            if token == "-c:v" and idx + 1 < len(args):
+                codec_idx = idx + 1
+                codec_val = args[idx + 1]
+                break
+
+        if codec_val is not None and codec_idx is not None:
+            mapped_codec = codec_val
+            args[codec_idx] = mapped_codec
+
+            if "nvenc" in mapped_codec.lower():
+                crf_val = cls._extract_flag_value(args, "-crf", "-crf:v")
+                args = cls._strip_flag_with_value(args, "-crf", "-crf:v")
+                if cls._extract_flag_value(args, "-spatial-aq") is None:
+                    args += ["-spatial-aq", "1"]
+                if crf_val is not None:
+                    args += ["-cq", str(crf_val)]
+
+                # CPU-only presets are invalid for NVENC; map them to the closest NVENC preset.
+                # veryslow/slower/slow → p7 (highest quality), medium → p5,
+                # fast/faster → p2-p3, veryfast/superfast/ultrafast → p1 (fastest).
+                _CPU_TO_NVENC_PRESET = {
+                    "veryslow": "p7",
+                    "very slow": "p7",
+                    "slower": "p7",
+                    "slow": "p7",
+                    "medium": "p5",
+                    "fast": "p3",
+                    "faster": "p2",
+                    "veryfast": "p1",
+                    "very fast": "p1",
+                    "superfast": "p1",
+                    "ultrafast": "p1",
+                }
+                preset_val = cls._extract_flag_value(args, "-preset")
+                if preset_val is not None:
+                    nvenc_preset = _CPU_TO_NVENC_PRESET.get(preset_val.lower())
+                    if nvenc_preset is not None:
+                        args = cls._strip_flag_with_value(args, "-preset")
+                        args += ["-preset", nvenc_preset]
+
+        return args
+    
+    @staticmethod
+    def _detect_best_hw_encoder() -> Optional[List[str]]:
+        """Detect the best available HEVC hardware encoder via ``ffmpeg -encoders``.
+
+        Returns a list of ffmpeg ``-c:v`` + tuning args for the first available
+        hardware encoder (NVENC → QSV → AMF), or ``None`` when no hardware
+        encoder is found so the caller can fall back to software encoding.
+        Never raises: probing failures simply return ``None``.
+        """
+        encoders_to_try = [
+            ("hevc_nvenc", ["-c:v", "hevc_nvenc", "-preset", "p7", "-b:v", "8M",
+                            "-spatial-aq", "1", "-temporal-aq", "1"]),
+            ("hevc_qsv",   ["-c:v", "hevc_qsv", "-preset", "veryslow",
+                            "-global_quality", "18", "-look_ahead", "1"]),
+            ("hevc_amf",   ["-c:v", "hevc_amf", "-quality", "quality",
+                            "-rc", "cqp", "-qp_p", "18"]),
+        ]
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-encoders"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                if sys.platform == "win32" else 0,
+            )
+            available = result.stdout.decode("utf-8", errors="replace") if result.stdout else ""
+            for encoder_name, enc_args in encoders_to_try:
+                if encoder_name in available:
+                    return list(enc_args)
+        except Exception:
+            pass
+        return None  # Will use software encoding fallback
     
     def __init__(self, path: str, width: int, height: int, fps: float, use_10bit: bool = False,
                  custom_video_args: Optional[List[str]] = None):
@@ -174,20 +335,77 @@ class FFMPEGVideoWriter:
             video_enc_args = custom_video_args
         else:
             pix_fmt = 'yuv420p10le' if use_10bit else 'yuv420p'
-            codec = 'libx265' if use_10bit else 'libx264'
-            video_enc_args = ['-c:v', codec, '-pix_fmt', pix_fmt, '-preset', 'medium', '-crf', '12']
+            hw_args = self._detect_best_hw_encoder()
+            if hw_args is not None:
+                # Allow an explicit bitrate override for NVENC defaults.
+                bitrate = os.environ.get("SEEDVR2_DEFAULT_BITRATE")
+                if bitrate and "-b:v" in hw_args:
+                    b_idx = hw_args.index("-b:v")
+                    if b_idx + 1 < len(hw_args):
+                        hw_args[b_idx + 1] = bitrate
+                video_enc_args = hw_args + ['-pix_fmt', 'p010le' if use_10bit else 'yuv420p']
+            else:
+                # Software fallback when no hardware encoder is available
+                # (AMD/Intel/CPU-only systems without the matching ffmpeg build).
+                video_enc_args = ['-c:v', 'libx265', '-preset', 'slow', '-crf', '18',
+                                  '-pix_fmt', 'yuv420p10le' if use_10bit else 'yuv420p']
+        video_enc_args = self._normalize_video_encoder_args(video_enc_args)
         
+        ffmpeg_cmd = [
+            'ffmpeg', '-y', '-f', 'rawvideo', '-pix_fmt', 'rgb24',
+            '-s', f'{width}x{height}', '-r', str(fps), '-i', '-',
+            *video_enc_args, '-an', path
+        ]
+        if debug.enabled:
+            debug.log(
+                f"FFmpeg command: {' '.join(shlex.quote(str(part)) for part in ffmpeg_cmd)}",
+                category="file",
+                force=True,
+            )
+
+        # Persistent encoder pipe. We keep ffmpeg's stderr connected to a PIPE
+        # (instead of discarding it) and drain it on a background daemon thread
+        # into a bounded ring buffer. This is what makes long exports debuggable:
+        # when the pipe breaks after minutes of streaming, the OS only tells us
+        # "broken pipe" — the *reason* (codec rejection, disk full, bad args) is
+        # only ever written by ffmpeg to stderr. Buffering the tail lets us report
+        # the real cause instead of an opaque error.
+        self._stderr_tail: "deque[str]" = deque(maxlen=50)
         self.proc = subprocess.Popen(
-            ['ffmpeg', '-y', '-f', 'rawvideo', '-pix_fmt', 'rgb24',
-             '-s', f'{width}x{height}', '-r', str(fps), '-i', '-',
-             *video_enc_args, path],
-            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            ffmpeg_cmd,
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         )
-    
+        self._stderr_thread = threading.Thread(
+            target=self._drain_stderr, name="ffmpeg-stderr-drain", daemon=True
+        )
+        self._stderr_thread.start()
+
+    def _drain_stderr(self) -> None:
+        """Continuously read ffmpeg stderr so the pipe never fills and blocks the
+        encoder, retaining only the most recent lines for diagnostics."""
+        stream = self.proc.stderr if self.proc else None
+        if stream is None:
+            return
+        try:
+            for raw in iter(stream.readline, b""):
+                line = raw.decode("utf-8", errors="replace").rstrip()
+                if line:
+                    self._stderr_tail.append(line)
+        except (ValueError, OSError):
+            pass  # Stream closed during shutdown.
+
+    def _stderr_message(self) -> str:
+        """Return the captured ffmpeg stderr tail, if any, for error reporting."""
+        if not self._stderr_tail:
+            return ""
+        return " | ffmpeg said: " + " / ".join(list(self._stderr_tail)[-5:])
+
     def write(self, frame_bgr: np.ndarray):
         if not self.isOpened():
-            raise RuntimeError("FFMPEGVideoWriter: ffmpeg process is not running")
-        
+            raise RuntimeError(
+                "FFMPEGVideoWriter: ffmpeg process is not running." + self._stderr_message()
+            )
+
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         try:
             self.proc.stdin.write(frame_rgb.astype(np.uint8).tobytes())
@@ -195,25 +413,29 @@ class FFMPEGVideoWriter:
         except BrokenPipeError:
             raise RuntimeError(
                 "FFMPEGVideoWriter: ffmpeg process terminated unexpectedly. "
-                "Check video path, codec support, and disk space."
+                "Check video path, codec support, and disk space." + self._stderr_message()
             )
-    
+
     def isOpened(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
-    
+
     def release(self):
         if self.proc:
             try:
                 self.proc.stdin.close()
             except Exception:
                 pass  # Ignore errors on close
-            
+
             self.proc.wait()
-            
+
+            # Let the drain thread flush any final stderr lines before we read them.
+            if self._stderr_thread is not None:
+                self._stderr_thread.join(timeout=2.0)
+
             if self.proc.returncode != 0:
                 debug.log(
                     f"ffmpeg exited with code {self.proc.returncode}. "
-                    "Check output file for corruption.",
+                    "Check output file for corruption." + self._stderr_message(),
                     level="WARNING", force=True, category="file"
                 )
             self.proc = None
@@ -287,7 +509,7 @@ IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp'}
 # Video I/O Functions
 # =============================================================================
 
-def get_media_files(directory: str) -> List[str]:
+def get_media_files(directory: str, videos_only: bool = False) -> List[str]:
     """
     Get all video and image files from directory, sorted alphabetically.
     
@@ -297,7 +519,7 @@ def get_media_files(directory: str) -> List[str]:
     Returns:
         Sorted list of file paths (strings) matching video or image extensions
     """
-    valid_extensions = VIDEO_EXTENSIONS | IMAGE_EXTENSIONS
+    valid_extensions = VIDEO_EXTENSIONS if videos_only else (VIDEO_EXTENSIONS | IMAGE_EXTENSIONS)
     path = Path(directory)
     
     # Get all files and filter by extension (case-insensitive)
@@ -330,8 +552,9 @@ def extract_frames_from_image(image_path: str) -> Tuple[torch.Tensor, float]:
     if not os.path.exists(image_path):
         raise FileNotFoundError(f"Image file not found: {image_path}")
     
-    # Read image with alpha channel preserved
-    frame = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+    # Read image with alpha channel preserved (use fromfile+imdecode for Unicode path support)
+    _raw = np.fromfile(image_path, dtype=np.uint8)
+    frame = cv2.imdecode(_raw, cv2.IMREAD_UNCHANGED)
     if frame is None:
         raise ValueError(f"Cannot open image file: {image_path}")
     
@@ -345,9 +568,15 @@ def extract_frames_from_image(image_path: str) -> Tuple[torch.Tensor, float]:
         debug.log(f"Detected BGRA image, converted to RGB", category="file")
     else:
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    
-    # Convert to float32 and normalize
-    frame = frame.astype(np.float32) / 255.0
+
+    # Convert to float32 and normalize based on the source bit depth so that
+    # 16-bit inputs (e.g. 16-bit TIFF preview frames) preserve their full
+    # dynamic range instead of overflowing the [0,1] range.
+    if np.issubdtype(frame.dtype, np.integer):
+        max_val = float(np.iinfo(frame.dtype).max)
+    else:
+        max_val = 1.0 if frame.max() <= 1.0 else 255.0
+    frame = frame.astype(np.float32) / max_val
     
     # Convert to tensor [1, H, W, C]
     frames_tensor = torch.from_numpy(frame[None, ...]).to(torch.float16)
@@ -388,6 +617,7 @@ def get_input_type(input_path: str) -> Literal['video', 'image', 'directory', 'u
 
 
 _IMAGE_OUTPUT_EXTS = frozenset({".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp"})
+_IMAGE_SEQUENCE_FORMATS = frozenset({"png", "tif", "tiff", "jpg", "jpeg", "dpx", "exr"})
 _VIDEO_CONTAINER_EXTS: Dict[str, str] = {
     "mp4": ".mp4",
     "mov": ".mov",
@@ -395,6 +625,94 @@ _VIDEO_CONTAINER_EXTS: Dict[str, str] = {
     "webm": ".webm",
     "avi": ".avi",
 }
+
+# Codec name substrings that mandate a specific output container format.
+# Codecs absent from this map are assumed to work in any standard container.
+_CODEC_REQUIRED_FORMAT: Dict[str, str] = {
+    "prores": "mov",   # Apple ProRes family (prores_ks, prores, prores_lt, prores_xe …)
+    "dnxhd": "mov",    # Avid DNxHD
+    "dnxhr": "mov",    # Avid DNxHR (HD and UHD variants)
+}
+
+# Containers that carry an explicit codec allow-list.
+# Containers NOT listed here are considered permissive (e.g. MKV accepts almost anything).
+_FORMAT_ALLOWED_CODEC_PATTERNS: Dict[str, frozenset] = {
+    "mp4": frozenset({
+        "h264", "libx264", "hevc", "libx265", "h265", "avc",
+        "h264_nvenc", "hevc_nvenc", "h264_amf", "hevc_amf",
+        "h264_qsv", "hevc_qsv", "av1", "libaom", "vp9", "mpeg4",
+    }),
+    "webm": frozenset({"vp8", "vp9", "av1", "libaom", "libvpx"}),
+}
+
+OUTPUT_FILE_PREFIX = "seedvr_"
+SECONDS_PER_MINUTE = 60.0
+
+
+def _seedvr_prefixed_name(name: str) -> str:
+    return name if name.startswith(OUTPUT_FILE_PREFIX) else f"{OUTPUT_FILE_PREFIX}{name}"
+
+
+def _extract_codec_from_ffmpeg_args(ffmpeg_args: Optional[List[str]]) -> Optional[str]:
+    """Return the value of the -c:v flag in ffmpeg_args, or None if absent."""
+    if not ffmpeg_args:
+        return None
+    for idx, token in enumerate(ffmpeg_args):
+        if token == "-c:v" and idx + 1 < len(ffmpeg_args):
+            return ffmpeg_args[idx + 1]
+    return None
+
+
+def _resolve_output_format_for_codec(
+    codec: Optional[str],
+    requested_format: str,
+) -> Tuple[str, Optional[str]]:
+    """
+    Validate that *codec* is compatible with *requested_format* container.
+
+    Returns ``(final_format, warning_message)`` where *warning_message* is a
+    human-readable string when a correction was made, or ``None`` when the
+    requested format was already valid.
+
+    Rules applied in order:
+      1. Codec has a required container and *requested_format* matches → accept.
+      2. Codec has a required container and *requested_format* does NOT match →
+         correct to the required container and return a warning.
+      3. *requested_format* has a strict allow-list and the codec is not in it →
+         correct to the codec's required format (or "mov" as a safe fallback).
+      4. No conflict → return *requested_format* unchanged.
+    """
+    if codec is None:
+        return requested_format, None
+
+    codec_lower = codec.lower()
+
+    # Check whether this codec mandates a specific container.
+    req_format: Optional[str] = None
+    for pattern, fmt in _CODEC_REQUIRED_FORMAT.items():
+        if pattern in codec_lower:
+            req_format = fmt
+            break
+
+    if req_format is not None and req_format != requested_format:
+        msg = (
+            f"Codec '{codec}' requires container '{req_format}' "
+            f"(requested: '{requested_format}') — output format corrected to '{req_format}'."
+        )
+        return req_format, msg
+
+    # Check whether the requested container explicitly disallows this codec.
+    allowed = _FORMAT_ALLOWED_CODEC_PATTERNS.get(requested_format)
+    if allowed is not None:
+        if not any(pat in codec_lower for pat in allowed):
+            fallback = req_format or "mov"
+            msg = (
+                f"Codec '{codec}' is not supported in container '{requested_format}' "
+                f"— output format corrected to '{fallback}'."
+            )
+            return fallback, msg
+
+    return requested_format, None
 
 
 def generate_output_path(input_path: str, output_format: str, output_dir: Optional[str] = None, 
@@ -413,41 +731,159 @@ def generate_output_path(input_path: str, output_format: str, output_dir: Option
         Absolute output path (file for single image/video, directory for sequences)
     """
     input_path_obj = Path(input_path)
-    input_name = input_path_obj.stem
+    input_name = _seedvr_prefixed_name(input_path_obj.stem)
     
     # Determine base directory and whether to add suffix
     if output_dir:
-        # User specified output directory - use as-is, no suffix
+        # User specified output directory - use as-is.
         base_dir = Path(output_dir)
-        add_suffix = False
     elif from_directory:
-        # Batch mode: create sibling folder with _upscaled, keep original filenames
+        # Batch mode: create sibling folder with _upscaled, using seedvr-prefixed filenames.
         original_dir = input_path_obj.parent
         base_dir = original_dir.parent / f"{original_dir.name}_upscaled"
-        add_suffix = False
     else:
-        # Single file mode: output to same directory with _upscaled suffix
+        # Single file mode: output to the same directory with a seedvr-prefixed filename.
         base_dir = input_path_obj.parent
-        add_suffix = True
     
-    # Build filename with optional suffix
-    file_suffix = "_upscaled" if add_suffix else ""
-    
-    # Image input always produces an image output regardless of the video format flag
+    # Image input always produces an image output regardless of the video format flag.
+    # Honor a requested image format (e.g. tiff) so high-fidelity outputs are kept;
+    # fall back to PNG for any non-image format.
     if input_type == "image":
-        output_path = base_dir / f"{input_name}{file_suffix}.png"
+        fmt_lower = (output_format or "").lower()
+        img_ext = f".{fmt_lower}" if f".{fmt_lower}" in _IMAGE_OUTPUT_EXTS else ".png"
+        output_path = base_dir / f"{input_name}{img_ext}"
         return str(ensure_unique_output_path(output_path).resolve())
 
     # Generate output path based on format
     if output_format == "png":
         # PNG sequence: output is a directory, not a file
-        output_path = base_dir / f"{input_name}{file_suffix}"
+        output_path = base_dir / input_name
     else:
         # Video output: pick the container extension
         fmt_lower = (output_format or "mp4").lower()
         ext = _VIDEO_CONTAINER_EXTS.get(fmt_lower, f".{fmt_lower}")
-        output_path = base_dir / f"{input_name}{file_suffix}{ext}"
-    
+        output_path = base_dir / f"{input_name}{ext}"
+
+    return str(ensure_unique_output_path(output_path).resolve())
+
+
+def _normalize_output_path_for_target(
+    output_path: str,
+    output_format: Optional[str],
+    input_type: str,
+    video_backend: str,
+) -> str:
+    """
+    Reconcile the output path's extension with the requested export target.
+
+    The user-selected ``--output_format`` is *authoritative*. Any extension the
+    user supplied on ``--output`` (for example a stray ``.png``) is stripped via
+    :func:`os.path.splitext` and the correct extension for the format is
+    re-appended. For video-container exports this override is **mandatory** and
+    unconditional: there is no code path that lets an image extension (``.png``
+    etc.) reach the ffmpeg command when a video container (mp4/mov/mkv/…) is the
+    requested format, regardless of ``video_backend``.
+    """
+    fmt = (output_format or "mp4").lower()
+    abs_path = str(Path(output_path).resolve())
+    base, ext = os.path.splitext(abs_path)
+
+    # --- Single image output (image input) ---
+    if input_type == "image":
+        target_ext = f".{fmt}" if f".{fmt}" in _IMAGE_OUTPUT_EXTS else ".png"
+        if ext.lower() != target_ext:
+            debug.log(
+                f"Output extension '{ext or '<none>'}' is invalid for image output; "
+                f"using '{target_ext}'.",
+                level="WARNING",
+                category="file",
+                force=True,
+            )
+        return base + target_ext
+
+    # --- Image-sequence export (video input → directory of frames) ---
+    if fmt in _IMAGE_SEQUENCE_FORMATS:
+        if ext:
+            debug.log(
+                f"Image-sequence export requested ({fmt}); removing file extension "
+                f"'{ext}' to use directory output.",
+                level="WARNING",
+                category="file",
+                force=True,
+            )
+            return base
+        return abs_path
+
+    # --- Video container export: extension MUST match --output_format ---
+    # Look up the canonical container extension and re-append it after stripping
+    # whatever the user supplied. This guarantees that, for the ffmpeg backend,
+    # the filename always matches the requested format (never .png/.jpg/etc.).
+    target_ext = _VIDEO_CONTAINER_EXTS.get(fmt, f".{fmt}")
+    if ext.lower() != target_ext:
+        debug.log(
+            f"Output extension '{ext or '<none>'}' does not match "
+            f"--output_format '{fmt}'; enforcing '{target_ext}'"
+            + (" for ffmpeg backend." if video_backend == "ffmpeg" else "."),
+            level="WARNING",
+            category="file",
+            force=True,
+        )
+    return base + target_ext
+
+
+def resolve_canonical_output_path(
+    input_path: str,
+    output: Optional[str],
+    output_format: Optional[str],
+    input_type: str,
+    video_backend: str,
+    from_directory: bool = False,
+) -> str:
+    """
+    Produce the single canonical output path mandated by ``output_format``.
+
+    This is the *only* place the user-supplied ``--output`` string is reconciled
+    against the master ``--output_format``. It must run in ``main()`` before any
+    branching or writer initialization so that downstream consumers (including
+    :func:`process_single_file`, the ``is_png`` decision, and the writers) receive
+    a path whose extension/target-type already agrees with ``output_format``.
+
+    Args:
+        input_path: Source file path.
+        output: User-supplied ``--output`` value (may be ``None``).
+        output_format: Master format/container (already resolved to its final value).
+        input_type: "image", "video", or "directory".
+        video_backend: "ffmpeg" or "opencv".
+        from_directory: True when processing files discovered inside a directory.
+
+    Returns:
+        Absolute, unique output path reconciled with ``output_format``.
+    """
+    requested_format = (output_format or "").lower()
+    if from_directory:
+        # Batch mode always derives the per-file path; ``output`` is the optional
+        # destination directory and may be ``None``.
+        output_path = generate_output_path(
+            input_path, output_format, output_dir=output,
+            input_type=input_type, from_directory=True,
+        )
+    elif output is None:
+        output_path = generate_output_path(input_path, output_format, input_type=input_type)
+    elif not Path(output).suffix or (requested_format in _IMAGE_SEQUENCE_FORMATS and input_type != "image"):
+        # No extension or image-sequence export → treat ``output`` as a directory.
+        output_path = generate_output_path(
+            input_path, output_format, output_dir=output, input_type=input_type,
+        )
+    else:
+        output_path = str(Path(output).resolve())
+
+    # Master format dictates the extension/target type.
+    output_path = _normalize_output_path_for_target(
+        output_path=output_path,
+        output_format=output_format,
+        input_type=input_type,
+        video_backend=video_backend,
+    )
     return str(ensure_unique_output_path(output_path).resolve())
 
 
@@ -478,9 +914,477 @@ def ensure_unique_output_path(path: Path | str) -> Path:
         counter += 1
 
 
-def process_single_file(input_path: str, args: argparse.Namespace, device_list: List[str], 
-                       output_path: Optional[str] = None, format_auto_detected: bool = False,
-                       runner_cache: Optional[Dict[str, Any]] = None) -> int:
+def _resolve_effective_resolution(args: "argparse.Namespace", input_width: int, input_height: int) -> int:
+    """Compute the effective target resolution from pre_downscale + resolution_mode settings.
+
+    Steps:
+    1. Apply pre-downscale factor to determine the *processing baseline* dimensions.
+    2. If resolution_mode == 'xtimes', multiply the baseline short-side by resolution_scale.
+    3. If resolution_mode == 'pixel', return args.resolution unchanged (it is already the
+       pixel target; the engine's own geometry logic will handle aspect ratio).
+
+    Returns:
+        Target short-side resolution in pixels to pass as args.resolution.
+    """
+    ds = getattr(args, "pre_downscale", 1) or 1
+    baseline_h = input_height // ds
+    baseline_w = input_width // ds
+    short_side = min(baseline_h, baseline_w)
+
+    mode = getattr(args, "resolution_mode", "pixel") or "pixel"
+    if mode == "xtimes":
+        scale = getattr(args, "resolution_scale", 2) or 2
+        return short_side * scale
+    # pixel mode
+    return getattr(args, "resolution", 1080)
+
+
+def _apply_lanczos_downscale(frames_tensor: "torch.Tensor", factor: int) -> "torch.Tensor":
+    """Downscale a float32 [T, H, W, C] tensor by *factor* using Lanczos filtering.
+
+    Uses cv2.INTER_LANCZOS4 on each frame independently.  Returns a new tensor of shape
+    [T, H//factor, W//factor, C] with values still in [0, 1].  Uses module-level
+    ``cv2``, ``np`` and ``torch`` (no redundant local re-imports).
+    """
+    frames_np = (frames_tensor.cpu().numpy() * 255.0).astype("uint8")  # [T,H,W,C]
+    T, H, W, C = frames_np.shape
+    new_h, new_w = H // factor, W // factor
+    out = []
+    for frame in frames_np:
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        resized = cv2.resize(frame_bgr, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+        out.append(cv2.cvtColor(resized, cv2.COLOR_BGR2RGB))
+    return torch.from_numpy(np.stack(out, axis=0).astype("float32") / 255.0)
+
+
+def _force_disable_cudagraphs_for_safe_mode(args: "argparse.Namespace", mode_label: str) -> None:
+    """Disable CUDA Graph capture paths for dynamic-shape-safe execution modes."""
+    try:
+        import torch._inductor.config as _inductor_config
+        _inductor_config.triton.cudagraphs = False
+    except Exception as e:
+        debug.log(
+            f"Could not disable torch._inductor.config.triton.cudagraphs: {e}",
+            level="WARNING",
+            category="setup",
+            force=True,
+            indent_level=1,
+        )
+
+    if hasattr(args, "compile_dynamic") and not bool(getattr(args, "compile_dynamic", False)):
+        args.compile_dynamic = True
+        debug.log(
+            f"{mode_label}: forced compile_dynamic=True for dynamic-shape safety",
+            category="setup",
+            force=True,
+            indent_level=1,
+        )
+
+    debug.log(
+        f"{mode_label}: forced CUDA Graphs OFF for safe dynamic execution",
+        category="setup",
+        force=True,
+        indent_level=1,
+    )
+
+
+def _log_crash_diagnostics() -> None:
+    """Log the exact GPU/RAM state at the moment of a fatal error.
+
+    Called from the centralized error handler so that a crash report captures the
+    memory picture *before* the process unwinds — by the time a traceback prints,
+    allocator state is already being torn down. We never let diagnostics raise:
+    a failure here must not mask the original exception.
+    """
+    try:
+        import psutil  # Project dependency; imported lazily to keep startup light.
+        vm = psutil.virtual_memory()
+        proc_rss = psutil.Process(os.getpid()).memory_info().rss
+        debug.log(
+            f"System RAM: used {vm.used / 1e9:.2f} GB / {vm.total / 1e9:.2f} GB "
+            f"({vm.percent:.0f}%), this process RSS {proc_rss / 1e9:.2f} GB",
+            level="ERROR", category="generation", force=True,
+        )
+    except Exception:
+        pass
+
+    try:
+        if is_cuda_available() and torch.cuda.is_available():
+            for dev in range(torch.cuda.device_count()):
+                free_b, total_b = torch.cuda.mem_get_info(dev)
+                allocated = torch.cuda.memory_allocated(dev)
+                reserved = torch.cuda.memory_reserved(dev)
+                debug.log(
+                    f"GPU {dev} ({torch.cuda.get_device_name(dev)}): "
+                    f"free {free_b / 1e9:.2f} GB / total {total_b / 1e9:.2f} GB, "
+                    f"allocated {allocated / 1e9:.2f} GB, reserved {reserved / 1e9:.2f} GB",
+                    level="ERROR", category="generation", force=True,
+                )
+    except Exception:
+        pass
+
+
+def _is_oom_error(err: BaseException) -> bool:
+    """True when an exception represents a CUDA out-of-memory condition."""
+    if isinstance(err, getattr(torch.cuda, "OutOfMemoryError", ())):
+        return True
+    return "out of memory" in str(err).lower()
+
+
+# ── Auto Tune helpers ────────────────────────────────────────────────────────
+
+def get_vram_gb() -> float:
+    """Return free VRAM in GB, or a conservative default (8 GB) if unavailable."""
+    try:
+        if torch.cuda.is_available():
+            free, _total = torch.cuda.mem_get_info()
+            return free / (1024 ** 3)
+    except Exception:
+        pass
+    return 8.0
+
+
+def get_starting_params(vram_gb: float) -> dict:
+    """VRAM-based starting parameters for Auto Tune.
+
+    These are *starting points only*. Target resolution never changes.
+    """
+    if vram_gb >= 12:
+        return {"batch_size": 81, "tile_size": 1024}
+    elif vram_gb >= 8:
+        return {"batch_size": 81, "tile_size": 256}
+    else:
+        return {"batch_size": 41, "tile_size": 256}
+
+
+class BatchCache:
+    """Cache for VAE-encoded latent batches to avoid re-encoding on OOM retry.
+
+    After each successful VAE encode batch the caller saves the encoded latents
+    here.  On an OOM retry, already-cached batches are reused so processing
+    resumes from the failed batch rather than restarting from scratch.
+    """
+
+    def __init__(self, cache_dir: str) -> None:
+        self.cache_dir = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+
+    def save_batch(self, batch_idx: int, latents) -> None:
+        path = os.path.join(self.cache_dir, f"batch_{batch_idx:04d}.pt")
+        torch.save(latents.cpu(), path)
+
+    def load_batch(self, batch_idx: int):
+        path = os.path.join(self.cache_dir, f"batch_{batch_idx:04d}.pt")
+        if os.path.exists(path):
+            return torch.load(path, map_location="cuda")
+        return None
+
+    def has_batch(self, batch_idx: int) -> bool:
+        return os.path.exists(os.path.join(self.cache_dir, f"batch_{batch_idx:04d}.pt"))
+
+    def cleanup(self) -> None:
+        import shutil
+        if os.path.exists(self.cache_dir):
+            shutil.rmtree(self.cache_dir, ignore_errors=True)
+
+
+# Ordered tile sizes used by the OOM fallback chain.
+_AUTOTUNE_TILE_STEPS = [512, 256]
+# Block-swap escalation steps: (blocks_to_swap, enable_swap_io).
+_AUTOTUNE_SWAP_STEPS = [(16, True), (24, False), (32, False), (36, False)]
+# Batch-size constants.
+_AUTOTUNE_BATCH_MIN = 33      # hard floor — never go below this for video
+_AUTOTUNE_BATCH_STEP = 8      # reduction per OOM step
+
+
+def _build_oom_action_sequence(
+    is_video: bool,
+    starting_batch: int,
+    input_short_side: Optional[int],
+) -> List[tuple]:
+    """Build the ordered list of (action, …) tuples for the OOM fallback chain.
+
+    Video chain (in order):
+      1-2. Tile reduction: 1024→512→256
+      3-6. Block-swap escalation: 0→16(+swap_io)→24→32→36
+      7-N. Batch reduction by 8 each step, floor at 33
+      N+1. pre_downscale=2 (only when input short-side > 480 px)
+      N+2. Final-combo: tile=256, swap=36, swap_io, batch=33 [+pre_downscale if >480p]
+
+    Image chain (batch is always 1, so no batch reduction):
+      1-2. Tile reduction
+      3-6. Block-swap escalation
+      7.   pre_downscale=2
+      8.   Final-combo
+    """
+    seq: List[tuple] = []
+
+    # Tile reduction (shared)
+    for tile_size in _AUTOTUNE_TILE_STEPS:
+        seq.append(("tile", tile_size))
+
+    # Block-swap escalation (shared)
+    for swap_val, do_swap_io in _AUTOTUNE_SWAP_STEPS:
+        seq.append(("swap", swap_val, do_swap_io))
+
+    if is_video:
+        # Batch reduction — reduce from starting_batch by 8 until we hit the floor.
+        batch = starting_batch
+        while batch > _AUTOTUNE_BATCH_MIN:
+            batch = max(_AUTOTUNE_BATCH_MIN, batch - _AUTOTUNE_BATCH_STEP)
+            seq.append(("batch", batch))
+
+        # Pre-downscale only when input resolution warrants it.
+        if input_short_side is not None and input_short_side > 480:
+            seq.append(("pre_downscale", 2, input_short_side))
+
+        # Final combo.
+        seq.append(("final", is_video, input_short_side))
+    else:
+        # Images: no batch reduction (images use batch_size=1 implicitly).
+        seq.append(("pre_downscale", 2, None))  # last-resort for images
+        seq.append(("final", is_video, input_short_side))
+
+    return seq
+
+
+def _apply_oom_action(args: "argparse.Namespace", action: tuple) -> str:
+    """Apply a single OOM mitigation action and return a human-readable summary."""
+    kind = action[0]
+
+    if kind == "tile":
+        tile_size = action[1]
+        prev = getattr(args, "vae_encode_tile_size", 1024)
+        args.vae_encode_tiled = True
+        args.vae_decode_tiled = True
+        args.vae_encode_tile_size = tile_size
+        args.vae_decode_tile_size = tile_size
+        args.vae_encode_tile_overlap = min(getattr(args, "vae_encode_tile_overlap", 128), 32)
+        args.vae_decode_tile_overlap = min(getattr(args, "vae_decode_tile_overlap", 128), 32)
+        return f"tile {prev}→{tile_size}, retrying..."
+
+    elif kind == "swap":
+        swap_val, do_swap_io = action[1], action[2]
+        prev = getattr(args, "blocks_to_swap", 0)
+        args.blocks_to_swap = swap_val
+        if do_swap_io:
+            args.swap_io_components = True
+        extra = " + swap_io ON" if do_swap_io else ""
+        return f"swap {prev}→{swap_val}{extra}, retrying..."
+
+    elif kind == "batch":
+        new_batch = action[1]
+        prev = getattr(args, "batch_size", 81)
+        args.batch_size = new_batch
+        return f"batch {prev}→{new_batch}, retrying..."
+
+    elif kind == "pre_downscale":
+        factor = action[1]
+        short = action[2]
+        args.pre_downscale = factor
+        ctx = f" (input {short}px > 480p)" if short and short > 480 else ""
+        return f"pre_downscale={factor}{ctx}, retrying..."
+
+    elif kind == "final":
+        is_vid = action[1]
+        short = action[2]
+        args.vae_encode_tiled = True
+        args.vae_decode_tiled = True
+        args.vae_encode_tile_size = 256
+        args.vae_decode_tile_size = 256
+        args.vae_encode_tile_overlap = 32
+        args.vae_decode_tile_overlap = 32
+        args.blocks_to_swap = 36
+        args.swap_io_components = True
+        if is_vid:
+            args.batch_size = _AUTOTUNE_BATCH_MIN
+        msg = f"final fallback: tile=256 swap=36 swap_io batch={'33' if is_vid else '1'}"
+        if short and short > 480:
+            args.pre_downscale = 2
+            msg += " pre_downscale=2"
+        return f"Auto Tune: {msg}"
+
+    return "no-op"
+
+
+def _probe_input_short_side(input_path: str) -> Optional[int]:
+    """Return the short-side pixel resolution of an image/video input, or ``None``.
+
+    Used by the Auto Tune pre-check to decide the initial ``pre_downscale``. Never
+    raises: probing failures simply return ``None`` so the pre-check is skipped.
+    """
+    try:
+        itype = get_input_type(input_path)
+        if itype == "video":
+            cap = cv2.VideoCapture(input_path)
+            if not cap.isOpened():
+                return None
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cap.release()
+            return min(width, height) if width and height else None
+        if itype == "image":
+            _raw = np.fromfile(input_path, dtype=np.uint8)
+            img = cv2.imdecode(_raw, cv2.IMREAD_COLOR)
+            if img is None:
+                return None
+            height, width = img.shape[:2]
+            return min(width, height)
+    except Exception:
+        return None
+    return None
+
+
+def _autotune_precheck(args: "argparse.Namespace", input_path: str) -> None:
+    """Auto Tune pre-check (no-op).
+
+    Pre-downscale is now applied *only* as a last-resort fallback inside the
+    OOM retry chain, never upfront.  This function is kept for call-site
+    compatibility.
+    """
+
+
+def _halve_chunk_size_on_oom(args: "argparse.Namespace") -> Optional[str]:
+    """Halve the active streaming ``chunk_size`` after a CUDA OOM.
+
+    Dynamic step-down chunking (PR #462): when a phase OOMs despite the
+    per-phase cleanup, fewer frames must flow through the pipeline at once. The
+    streaming chunk size is halved (floored at 1) so the next retry re-reads the
+    video in smaller, memory-bounded chunks and resumes processing. Chunk
+    duration (minutes) overrides are also collapsed to the explicit frame count.
+
+    Returns a short human-readable summary, or ``None`` when no chunking is
+    active (so nothing was changed).
+    """
+    current = int(getattr(args, "chunk_size", 0) or 0)
+    if current <= 1:
+        return None
+    new_size = max(1, current // 2)
+    if new_size == current:
+        return None
+    args.chunk_size = new_size
+    # An explicit frame-count chunk takes precedence over a minute-based one;
+    # drop the duration override so the halved frame count is authoritative.
+    if getattr(args, "chunk_duration_minutes", 0):
+        args.chunk_duration_minutes = 0.0
+    return f"chunk_size {current}→{new_size}"
+
+
+def _run_with_auto_tune(
+    process_fn,
+    args: "argparse.Namespace",
+    input_path: str = "",
+    on_success=None,
+) -> int:
+    """Run ``process_fn`` and, when Auto Tune is on, retry through CUDA OOM.
+
+    On the *first* call, VRAM-based starting parameters are applied
+    (batch_size and tile_size).  On every subsequent CUDA OOM the allocator
+    caches are flushed and the next action in the fallback chain is applied:
+
+    Video chain:
+      1-2.   Tile reduction: 1024→512→256
+      3-6.   Block-swap escalation: 0→16(+swap_io)→24→32→36
+      7-N.   Batch reduction by 8 per step, floor at 33 (never goes below)
+      N+1.   pre_downscale=2 (only when input short-side > 480 px)
+      N+2.   Final combo: tile=256 + swap=36 + swap_io + batch=33 [+pre_ds if >480p]
+
+    Image chain (batch is always 1):
+      1-2.   Tile reduction
+      3-6.   Block-swap escalation
+      7.     pre_downscale=2
+      8.     Final combo
+
+    Non-OOM errors, or OOMs when Auto Tune is disabled, propagate unchanged.
+    A BatchCache instance is attached to ``args._batch_cache`` for use by the
+    VAE encode pipeline to avoid re-encoding already-cached batches on retry.
+    """
+    auto_tune = getattr(args, "auto_tune", False)
+
+    if auto_tune:
+        input_type = get_input_type(input_path) if input_path else "video"
+        is_image = input_type == "image"
+        # Apply VRAM-based starting parameters.
+        vram_gb = get_vram_gb()
+        params = get_starting_params(vram_gb)
+        if is_image:
+            args.batch_size = 1
+            args.uniform_batch_size = False
+            args.prepend_frames = 0
+            args.temporal_overlap = 0
+        else:
+            args.batch_size = params["batch_size"]
+        tile_size = params["tile_size"]
+        if tile_size < 1024:
+            args.vae_encode_tiled = True
+            args.vae_decode_tiled = True
+            args.vae_encode_tile_size = tile_size
+            args.vae_decode_tile_size = tile_size
+        debug.log(
+            f"Auto Tune: free VRAM {vram_gb:.1f} GB → starting batch={args.batch_size}"
+            f" tile={tile_size}",
+            category="setup", force=True,
+        )
+
+        # Probe input resolution once for pre_downscale decisions.
+        input_short_side = _probe_input_short_side(input_path) if input_path else None
+        is_video = input_type == "video"
+
+        # Build the ordered action sequence.
+        oom_actions = _build_oom_action_sequence(is_video, args.batch_size, input_short_side)
+
+        # Attach a BatchCache so the VAE encode loop can resume from failed batch.
+        cache_dir = os.path.join(TEMP_DIR, ".seedvr2_cache", f"run_{int(time.time())}")
+        batch_cache = BatchCache(cache_dir)
+        args._batch_cache = batch_cache
+    else:
+        oom_actions = []
+        batch_cache = None
+
+    action_idx = 0
+    while True:
+        try:
+            result = process_fn()
+            if on_success is not None:
+                on_success()
+            if batch_cache is not None:
+                batch_cache.cleanup()
+            return result
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as err:
+            if not auto_tune or not _is_oom_error(err):
+                if batch_cache is not None:
+                    batch_cache.cleanup()
+                raise
+            if action_idx >= len(oom_actions):
+                _log_crash_diagnostics()
+                debug.log(
+                    "CRITICAL MEMORY ERROR: Unable to fit model in VRAM even with"
+                    " minimal settings.",
+                    level="ERROR", category="generation", force=True,
+                )
+                if batch_cache is not None:
+                    batch_cache.cleanup()
+                sys.exit(1)
+
+            debug.log("Auto Tune: OOM detected", category="setup", force=True)
+            if hasattr(torch, "cuda"):
+                torch.cuda.empty_cache()
+            gc.collect()
+
+            # Dynamic step-down chunking on every OOM (kept from previous logic).
+            chunk_summary = _halve_chunk_size_on_oom(args)
+
+            action = oom_actions[action_idx]
+            action_idx += 1
+            summary = _apply_oom_action(args, action)
+            if chunk_summary:
+                summary = f"{chunk_summary}; {summary}"
+            debug.log(f"Auto Tune: {summary}", category="setup", force=True)
+
+
+def process_single_file(input_path: str, args: "argparse.Namespace", device_list: "List[str]",
+                       output_path: "Optional[str]" = None, format_auto_detected: bool = False,
+                       runner_cache: "Optional[Dict[str, Any]]" = None) -> int:
     """
     Process a single video or image file with optional model caching.
     
@@ -498,191 +1402,366 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
     Returns:
         Number of frames written to output
     """
-    input_type = get_input_type(input_path)
-    
-    if input_type == "unknown":
-        debug.log(f"Skipping unsupported file: {input_path}", level="WARNING", category="file", force=True)
-        return 0
-    
-    debug.log(f"Processing {input_type}: {Path(input_path).name}", category="generation", force=True)
-    
-    # Generate or validate output path
-    if output_path is None:
-        output_path = generate_output_path(input_path, args.output_format, input_type=input_type)
-    elif not Path(output_path).suffix or (args.output_format == "png" and input_type != "image"):
-        # No extension or PNG sequence → treat as directory, generate filename
-        output_path = generate_output_path(input_path, args.output_format, 
-                                         output_dir=output_path, input_type=input_type)
-    else:
-        output_path = str(ensure_unique_output_path(output_path).resolve())
-    
-    # Guard: image inputs must never write to a video-extension path (OpenCV imwrite crash)
-    if input_type == "image" and Path(output_path).suffix.lower() not in _IMAGE_OUTPUT_EXTS:
-        output_path = str(Path(output_path).with_suffix(".png").resolve())
-    
-    # Show format with auto-detection indicator
-    format_prefix = "Auto-detected" if format_auto_detected else "Requested"
-    debug.log(f"{format_prefix} output format: {args.output_format}", category="info", force=True, indent_level=1)
-    
-    # === VIDEO PROCESSING ===
-    if input_type == "video":
-        if not os.path.exists(input_path):
-            raise FileNotFoundError(f"Video file not found: {input_path}")
+    cap: Optional[cv2.VideoCapture] = None
+    video_writer: Optional[cv2.VideoWriter] = None
+    frames_tensor: Optional[torch.Tensor] = None
+    result: Optional[torch.Tensor] = None
+
+    try:
+        input_type = get_input_type(input_path)
         
-        cap = cv2.VideoCapture(input_path)
-        if not cap.isOpened():
-            raise ValueError(f"Cannot open video file: {input_path}")
-        
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        
-        debug.log(f"Video info: {total_frames} frames, {width}x{height}, {fps:.2f} FPS", category="info")
-        
-       # Skip initial frames
-        if args.skip_first_frames > 0:
-            debug.log(f"Skipping first {args.skip_first_frames} frames", category="info")
-            cap.set(cv2.CAP_PROP_POS_FRAMES, args.skip_first_frames)
-        
-        # Calculate frames to process (apply load_cap if set)
-        frames_to_process = total_frames - args.skip_first_frames
-        if args.load_cap > 0:
-            frames_to_process = min(frames_to_process, args.load_cap)
-        
-        # Early exit for empty/exhausted video
-        if frames_to_process <= 0:
-            debug.log(f"No frames to process after skipping {args.skip_first_frames} of {total_frames}", 
-                     level="WARNING", category="file", force=True)
-            cap.release()
+        if input_type == "unknown":
+            debug.log(f"Skipping unsupported file: {input_path}", level="WARNING", category="file", force=True)
             return 0
+
+        if bool(getattr(args, "preview", False)):
+            _force_disable_cudagraphs_for_safe_mode(args, "Preview mode")
+        if input_type == "image":
+            _force_disable_cudagraphs_for_safe_mode(args, "Single-image mode")
+            args.prepend_frames = 0
+            args.temporal_overlap = 0
+            args.batch_size = 1
+            args.uniform_batch_size = False
         
-        # Streaming mode: process in chunks
-        chunk_size = args.chunk_size if args.chunk_size > 0 else frames_to_process
-        streaming = args.chunk_size > 0
-        total_chunks = (frames_to_process + chunk_size - 1) // chunk_size  # ceiling division
+        debug.log(f"Processing {input_type}: {Path(input_path).name}", category="generation", force=True)
         
-        if streaming:
-            debug.log(f"Streaming mode: chunks of {chunk_size} frames, overlap={args.temporal_overlap}", 
-                     category="info", force=True, indent_level=1)
-        
-        is_png = args.output_format == "png"
-        video_writer = None
-        overlap = args.temporal_overlap
-        frames_written = 0
-        chunk_idx = 0
-        base_name = Path(input_path).stem
-        
-        # Extract custom ffmpeg video args if supplied
-        custom_video_args: Optional[List[str]] = getattr(args, "ffmpeg_video_args", None) or None
-        
-        # Multi-GPU: workers stream their own segments
-        if len(device_list) > 1:
-            cap.release()  # Workers will reopen
-            video_info = {
-                'video_path': input_path,
-                'start_frame': args.skip_first_frames,
-                'frames_to_process': frames_to_process,
-            }
-            result = _gpu_processing(None, device_list, args, video_info=video_info)
-            
-            # Save result
-            if is_png:
-                save_frames_to_image(result, output_path, base_name)
-            else:
-                video_writer = save_frames_to_video(result, output_path, fps, 
-                    video_backend=args.video_backend, use_10bit=args.use_10bit,
-                    custom_video_args=custom_video_args)
-                if video_writer is not None:
-                    video_writer.release()
-            
-            frames_written = result.shape[0]
-        
-        # Single GPU: stream in main process
+        # The output path is reconciled against the master --output_format by the
+        # caller (main, via resolve_canonical_output_path) before this worker is
+        # ever invoked. Trust the path as given; only fall back to reconciliation
+        # here for defensive use when called without a pre-resolved path.
+        if output_path is None:
+            output_path = resolve_canonical_output_path(
+                input_path, None, args.output_format, input_type, args.video_backend,
+            )
         else:
-            chunk_count = 0
-            for result in _stream_video_chunks(
-                cap=cap,
-                frames_to_process=frames_to_process,
-                chunk_size=chunk_size,
-                overlap=overlap,
-                args=args,
-                device_id=device_list[0],
-                debug=debug,
-                runner_cache=runner_cache,
-                log_progress=streaming,
-                total_chunks=total_chunks,
-                cleanup_timer_name="chunk_cleanup"
-            ):
-                chunk_count += 1
-                
-                # Save output
-                if is_png:
-                    save_frames_to_image(result, output_path, base_name, start_index=frames_written)
+            output_path = str(Path(output_path).resolve())
+    
+        # Show format with auto-detection indicator
+        format_prefix = "Auto-detected" if format_auto_detected else "Requested"
+        debug.log(f"{format_prefix} output format: {args.output_format}", category="info", force=True, indent_level=1)
+        
+        # === VIDEO PROCESSING ===
+        if input_type == "video":
+            if not os.path.exists(input_path):
+                raise FileNotFoundError(f"Video file not found: {input_path}")
+            
+            cap = cv2.VideoCapture(input_path)
+            if not cap.isOpened():
+                raise ValueError(f"Cannot open video file: {input_path}")
+            
+            fps = float(getattr(args, "source_fps", 0.0) or 0.0) or cap.get(cv2.CAP_PROP_FPS) or 30.0
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            
+            debug.log(f"Video info: {total_frames} frames, {width}x{height}, {fps:.2f} FPS", category="info")
+            
+           # Skip initial frames
+            if args.skip_first_frames > 0:
+                debug.log(f"Skipping first {args.skip_first_frames} frames", category="info")
+                cap.set(cv2.CAP_PROP_POS_FRAMES, args.skip_first_frames)
+            
+            # Calculate frames to process (apply load_cap if set)
+            frames_to_process = total_frames - args.skip_first_frames
+            if args.load_cap > 0:
+                frames_to_process = min(frames_to_process, args.load_cap)
+            
+            # Early exit for empty/exhausted video
+            if frames_to_process <= 0:
+                debug.log(f"No frames to process after skipping {args.skip_first_frames} of {total_frames}", 
+                         level="WARNING", category="file", force=True)
+                return 0
+
+            # --- Pre-downscale & X-Times resolution math ---
+            ds_factor = getattr(args, "pre_downscale", 1) or 1
+            if ds_factor > 1:
+                debug.log(
+                    f"Pre-Downscale {ds_factor}:1 → processing baseline: "
+                    f"{width // ds_factor}×{height // ds_factor} px",
+                    category="info", force=True, indent_level=1,
+                )
+            args.resolution = _resolve_effective_resolution(args, width, height)
+            debug.log(f"Effective target resolution: {args.resolution} px (short side)", category="info", force=True, indent_level=1)
+            
+            # Streaming mode: process in chunks
+            requested_chunk_size = int(getattr(args, "chunk_size", 0) or 0)
+            chunk_duration_minutes = float(getattr(args, "chunk_duration_minutes", 0.0) or 0.0)
+            runtime_chunk_size = 0
+            if requested_chunk_size > 0:
+                runtime_chunk_size = requested_chunk_size
+            elif chunk_duration_minutes > 0.0:
+                runtime_chunk_size = int(round(chunk_duration_minutes * SECONDS_PER_MINUTE * fps))
+            chunk_size = runtime_chunk_size if runtime_chunk_size > 0 else frames_to_process
+            streaming = runtime_chunk_size > 0
+            total_chunks = (frames_to_process + chunk_size - 1) // chunk_size  # ceiling division
+            
+            if streaming:
+                if requested_chunk_size > 0:
+                    debug.log(
+                        f"Streaming mode: chunks of {chunk_size} frames, overlap={args.temporal_overlap}",
+                        category="info", force=True, indent_level=1
+                    )
                 else:
-                    video_writer = save_frames_to_video(result, output_path, fps, writer=video_writer,
+                    debug.log(
+                        f"Streaming mode: {chunk_duration_minutes:g} minute chunks → {chunk_size} frames at {fps:.2f} FPS, overlap={args.temporal_overlap}",
+                        category="info", force=True, indent_level=1
+                    )
+            
+            # Image sequences: detect by format extension, not just "png"
+            is_png = (args.output_format or "").lower() in _IMAGE_SEQUENCE_FORMATS
+            overlap = args.temporal_overlap
+            frames_written = 0
+            chunk_idx = 0
+            base_name = Path(input_path).stem
+            
+            # Extract custom ffmpeg video args if supplied
+            custom_video_args: Optional[List[str]] = getattr(args, "ffmpeg_video_args", None) or None
+            
+            # Multi-GPU: workers stream their own segments
+            if len(device_list) > 1:
+                cap.release()
+                cap = None
+                video_info = {
+                    'video_path': input_path,
+                    'start_frame': args.skip_first_frames,
+                    'end_frame': args.skip_first_frames + frames_to_process,
+                    'frames_to_process': frames_to_process,
+                }
+                result = _gpu_processing(None, device_list, args, video_info=video_info)
+                # NOTE: Lanczos downscale is now applied to INPUT frames inside
+                # _stream_video_chunks (called by each GPU worker), so no post-processing
+                # downscale is needed here.
+
+                # Save result
+                if is_png:
+                    save_frames_to_image(result, output_path, base_name,
+                                         image_format=args.output_format)
+                else:
+                    video_writer = save_frames_to_video(result, output_path, fps,
                         video_backend=args.video_backend, use_10bit=args.use_10bit,
                         custom_video_args=custom_video_args)
-                
-                frames_written += result.shape[0]
-                del result
+
+                frames_written = result.shape[0]
+
+            # Single GPU: stream in main process
+            else:
+                chunk_count = 0
+                # Chunked video export now always renders chunk files without audio,
+                # then concatenates and muxes the source audio once at the end.
+                if streaming and not is_png:
+                    run_temp_dir = _chunk_run_temp_dir(input_path, output_path)
+                    progress_path = os.path.join(run_temp_dir, "progress.json")
+                    completed_chunks = _load_chunk_progress(progress_path)
+                    if completed_chunks:
+                        debug.log(
+                            f"Resuming chunks: {len(completed_chunks)}/{total_chunks} already completed",
+                            category="info", force=True, indent_level=1,
+                        )
+
+                    ds_factor = getattr(args, "pre_downscale", 1) or 1
+                    for chunk_i in range(total_chunks):
+                        chunk_number = chunk_i + 1
+                        chunk_start = args.skip_first_frames + chunk_i * chunk_size
+                        current_chunk_frames = min(chunk_size, frames_to_process - chunk_i * chunk_size)
+                        chunk_path = os.path.join(run_temp_dir, f"chunk_{chunk_number:05d}.mp4")
+
+                        if chunk_number in completed_chunks and os.path.isfile(chunk_path):
+                            frames_written += current_chunk_frames
+                            chunk_count += 1
+                            _emit_gui_chunk_status("encoding", chunk_number, total_chunks, 0, 0)
+                            continue
+
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, chunk_start)
+                        chunk_frames = _read_frames_from_cap(cap, current_chunk_frames)
+                        if chunk_frames is None:
+                            break
+                        if ds_factor > 1:
+                            chunk_frames = _apply_lanczos_downscale(chunk_frames, ds_factor)
+
+                        chunk_args = argparse.Namespace(**vars(args))
+                        if chunk_number > 1:
+                            chunk_args.prepend_frames = 0
+
+                        _emit_gui_chunk_status("encoding", chunk_number, total_chunks, 0, 0)
+                        result = _single_gpu_direct_processing(
+                            chunk_frames.to(torch.float16),
+                            chunk_args,
+                            device_list[0],
+                            runner_cache,
+                        )
+                        chunk_writer = save_frames_to_video(
+                            result,
+                            chunk_path,
+                            fps,
+                            video_backend=args.video_backend,
+                            use_10bit=args.use_10bit,
+                            custom_video_args=custom_video_args,
+                        )
+                        if chunk_writer is not None:
+                            chunk_writer.release()
+                        frames_written += result.shape[0]
+                        chunk_count += 1
+                        completed_chunks.add(chunk_number)
+                        _write_chunk_progress(progress_path, completed_chunks, total_chunks)
+                        del result
+                        result = None
+                        del chunk_frames
+                        gc.collect()
+                        try:
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+
+                    chunk_paths = [
+                        os.path.join(run_temp_dir, f"chunk_{idx:05d}.mp4")
+                        for idx in range(1, total_chunks + 1)
+                    ]
+                    missing = [p for p in chunk_paths if not os.path.isfile(p)]
+                    if missing:
+                        raise RuntimeError(f"Missing chunk outputs: {len(missing)} chunk(s) were not rendered.")
+
+                    concatenated_path = os.path.join(run_temp_dir, "concatenated_video.mp4")
+                    _emit_gui_chunk_status("encoding", total_chunks, total_chunks, 0, 0)
+                    _concat_chunk_videos(chunk_paths, concatenated_path)
+                    _mux_original_audio(concatenated_path, input_path, output_path)
+                    shutil.rmtree(run_temp_dir, ignore_errors=True)
+                else:
+                    for result in _stream_video_chunks(
+                        cap=cap,
+                        frames_to_process=frames_to_process,
+                        chunk_size=chunk_size,
+                        overlap=overlap,
+                        args=args,
+                        device_id=device_list[0],
+                        debug=debug,
+                        runner_cache=runner_cache,
+                        log_progress=streaming,
+                        total_chunks=total_chunks,
+                        cleanup_timer_name="chunk_cleanup"
+                    ):
+                        chunk_count += 1
+                        if streaming:
+                            _emit_gui_chunk_status("encoding", chunk_count, total_chunks, 0, 0)
+                        # NOTE: Lanczos downscale is applied to input frames inside
+                        # _stream_video_chunks, so the result here is already at the
+                        # correct (upscaled) resolution.
+                        # Save output
+                        if is_png:
+                            save_frames_to_image(result, output_path, base_name,
+                                                 start_index=frames_written,
+                                                 image_format=args.output_format)
+                        else:
+                            video_writer = save_frames_to_video(result, output_path, fps, writer=video_writer,
+                                video_backend=args.video_backend, use_10bit=args.use_10bit,
+                                custom_video_args=custom_video_args)
+
+                        frames_written += result.shape[0]
+                        del result
+                        result = None
+                chunk_idx = chunk_count
             
-            chunk_idx = chunk_count
-            cap.release()
+            if streaming:
+                debug.log("", category="none", force=True)
+                if len(device_list) > 1:
+                    debug.log(f"Streaming complete: {frames_written} frames across {len(device_list)} GPUs", category="success", force=True)
+                else:
+                    debug.log(f"Streaming complete: {frames_written} frames in {chunk_idx} chunks", category="success", force=True)
+            
+            debug.log(f"Output saved to: {output_path}", category="file", force=True)
+            return frames_written
+        
+        # === IMAGE PROCESSING ===
+        frames_tensor, _ = extract_frames_from_image(input_path)
+
+        # Apply pre-downscale Lanczos to input image and resolve effective resolution
+        img_ds_factor = getattr(args, "pre_downscale", 1) or 1
+        _, img_h, img_w, _ = frames_tensor.shape
+        args.resolution = _resolve_effective_resolution(args, img_w, img_h)
+        if img_ds_factor > 1:
+            debug.log(
+                f"Pre-Downscale {img_ds_factor}:1 on image: "
+                f"{img_w}×{img_h} → {img_w // img_ds_factor}×{img_h // img_ds_factor} px",
+                category="info", force=True, indent_level=1,
+            )
+            frames_tensor = _apply_lanczos_downscale(
+                frames_tensor.to(torch.float32), img_ds_factor
+            ).to(torch.float16)
+        debug.log(
+            f"Effective target resolution: {args.resolution} px (short side)",
+            category="info", force=True, indent_level=1,
+        )
+
+        processing_start = time.time()
+        # Process frames (multiprocessing only for multi-GPU)
+        if len(device_list) > 1:
+            result = _gpu_processing(frames_tensor, device_list, args)
+        else:
+            result = _single_gpu_direct_processing(frames_tensor, args, device_list[0], runner_cache)
+        debug.log(f"Processing time: {time.time() - processing_start:.2f}s", category="timing")
+
+        # Save single image. Pass the float result directly so 16-bit targets
+        # (e.g. TIFF previews) retain full precision; the saver picks the bit
+        # depth from the output extension.
+        os.makedirs(Path(output_path).parent, exist_ok=True)
+        frame_float = result[0].cpu().numpy()
+        _save_image_bgr(frame_float, output_path)
+        del frame_float
+
+        debug.log(f"Output saved to: {output_path}", category="file", force=True)
+        return 1
+    finally:
+        try:
+            if cap is not None:
+                cap.release()
+        except Exception:
+            pass
+        try:
             if video_writer is not None:
                 video_writer.release()
-        
-        if streaming:
-            debug.log("", category="none", force=True)
-            if len(device_list) > 1:
-                debug.log(f"Streaming complete: {frames_written} frames across {len(device_list)} GPUs", category="success", force=True)
-            else:
-                debug.log(f"Streaming complete: {frames_written} frames in {chunk_idx} chunks", category="success", force=True)
-        
-        debug.log(f"Output saved to: {output_path}", category="file", force=True)
-        return frames_written
-    
-    # === IMAGE PROCESSING ===
-    frames_tensor, _ = extract_frames_from_image(input_path)
-    
-    processing_start = time.time()
-    # Process frames (multiprocessing only for multi-GPU)
-    if len(device_list) > 1:
-        result = _gpu_processing(frames_tensor, device_list, args)
-    else:
-        result = _single_gpu_direct_processing(frames_tensor, args, device_list[0], runner_cache)
-    debug.log(f"Processing time: {time.time() - processing_start:.2f}s", category="timing")
-    
-    # Save single image
-    os.makedirs(Path(output_path).parent, exist_ok=True)
-    frame_np = (result[0].cpu().numpy() * 255.0).astype(np.uint8)
-    _save_image_bgr(frame_np, output_path)
-    
-    debug.log(f"Output saved to: {output_path}", category="file", force=True)
-    return 1
+        except Exception:
+            pass
+        if result is not None:
+            del result
+        if frames_tensor is not None:
+            del frames_tensor
+        _release_post_file_resources()
 
 
 def _read_frames_from_cap(cap: cv2.VideoCapture, max_frames: int) -> Optional[torch.Tensor]:
     """
     Read up to max_frames from an already-open VideoCapture.
-    
+
+    This reads *only* ``max_frames`` frames (the current chunk size) and never
+    the whole video: the loop strictly stops after ``max_frames`` iterations and
+    ``np.stack`` is applied solely to the small chunk that was just read. This is
+    what keeps RAM usage bounded to a single chunk when streaming/chunking is
+    enabled, instead of materialising the entire decoded sequence at once.
+
     Args:
         cap: An already opened cv2.VideoCapture instance
-        max_frames: Maximum number of frames to read in this call
-    
+        max_frames: Maximum number of frames to read in this call (chunk size)
+
     Returns:
         Tensor [T, H, W, C] float32 [0,1], or None if no frames available
     """
+    # Guard against non-positive chunk sizes so we never spin or over-read.
+    if max_frames <= 0:
+        return None
+
     frames = []
+    # Strictly stop at max_frames: the loop runs at most chunk_size times.
     for _ in range(max_frames):
         ret, frame = cap.read()
         if not ret:
             break
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         frames.append(frame)
-    
+
     if not frames:
         return None
+    # np.stack runs only on this chunk's frames (len(frames) <= max_frames),
+    # never on the full video sequence.
     return torch.from_numpy(np.stack(frames)).to(torch.float32)
 
 
@@ -729,7 +1808,9 @@ def _stream_video_chunks(
     prev_raw_tail = None
     chunk_idx = 0
     streaming = chunk_size < frames_to_process
-    
+    # Pre-downscale factor – applied to each chunk's raw frames before processing
+    ds_factor = getattr(chunk_args, "pre_downscale", 1) or 1
+
     while frames_read < frames_to_process:
         read_count = min(chunk_size, frames_to_process - frames_read)
         new_frames = _read_frames_from_cap(cap, read_count)
@@ -737,11 +1818,17 @@ def _stream_video_chunks(
             break
         frames_read += new_frames.shape[0]
         chunk_idx += 1
-        
+
+        # Apply pre-downscale Lanczos to raw input frames before processing.
+        # This must happen BEFORE overlap concatenation so that prev_raw_tail
+        # and new_frames are both at the downscaled resolution.
+        if ds_factor > 1:
+            new_frames = _apply_lanczos_downscale(new_frames, ds_factor)
+
         # Disable prepend_frames after first chunk
         if chunk_idx > 1:
             chunk_args.prepend_frames = 0
-        
+
         # Prepend context from previous chunk
         if prev_raw_tail is not None and overlap > 0:
             context_count = min(overlap, prev_raw_tail.shape[0])
@@ -749,56 +1836,309 @@ def _stream_video_chunks(
         else:
             frames = new_frames
             context_count = 0
-        
+
         # Log progress if enabled
         if log_progress and streaming:
             if chunk_idx > 1:
                 debug.log("", category="none", force=True)
                 debug.log("━" * 60, category="none", force=True)
             debug.log("", category="none", force=True)
-            debug.log(f"{log_prefix}Chunk {chunk_idx}/{total_chunks}: {new_frames.shape[0]} new + {context_count} context frames", 
+            debug.log(f"{log_prefix}Chunk {chunk_idx}/{total_chunks}: {new_frames.shape[0]} new + {context_count} context frames",
                      category="generation", force=True)
             debug.log("", category="none", force=True)
-        
-        # Process chunk
-        result = _process_frames_core(
-            frames_tensor=frames.to(torch.float16),
-            args=chunk_args,
-            device_id=device_id,
-            debug=debug,
-            runner_cache=runner_cache
-        )
-        
-        # Remove context frames from output
-        if context_count > 0:
-            result = result[context_count:]
-        
-        # Save tail for next chunk context
-        prev_raw_tail = new_frames[-overlap:].clone() if overlap > 0 else None
-        
-        # Cleanup before yield
-        del frames
-        
-        yield result
-        
-        # Memory cleanup between chunks
-        if streaming:
-            clear_memory(debug=debug, deep=True, force=True, timer_name=cleanup_timer_name)
+
+        # Process chunk. The processing + yield is wrapped in try/finally so the
+        # per-chunk VRAM is always released afterwards, even if a phase OOMs.
+        result = None
+        try:
+            result = _process_frames_core(
+                frames_tensor=frames.to(torch.float16),
+                args=chunk_args,
+                device_id=device_id,
+                debug=debug,
+                runner_cache=runner_cache
+            )
+
+            # Remove context frames from output
+            if context_count > 0:
+                result = result[context_count:]
+
+            # Save tail for next chunk context (downscaled frames for consistency)
+            prev_raw_tail = new_frames[-overlap:].clone() if overlap > 0 else None
+
+            # Cleanup before yield
+            del frames
+
+            yield result
+        finally:
+            # Strict cleanup after every chunk (PR #462/#572): release VRAM even
+            # on OOM so the allocator is defragmented before the next chunk or an
+            # Auto Tune step-down retry.
+            if streaming:
+                clear_memory(debug=debug, deep=True, force=True, timer_name=cleanup_timer_name)
+            else:
+                _strict_batch_flush()
 
 
-def _save_image_bgr(frame_np: np.ndarray, file_path: str) -> None:
+def _save_image_bgr(frame: np.ndarray, file_path: str) -> None:
     """
-    Save a single RGB(A) uint8 frame to disk, converting to BGR(A) for OpenCV.
-    
+    Save a single RGB(A) frame to disk as BGR(A) for OpenCV.
+
+    Accepts either a Float32 array in range [0,1] or an integer array. TIFF
+    outputs are written as uncompressed 16-bit to preserve fidelity for previews
+    and intermediate frames; all other formats are written as 8-bit.
+
     Args:
-        frame_np: Frame as uint8 numpy array [H, W, C] where C is 3 (RGB) or 4 (RGBA)
-        file_path: Output file path
+        frame: Frame as numpy array [H, W, C] where C is 3 (RGB) or 4 (RGBA);
+            either float in [0,1] or an integer dtype.
+        file_path: Output file path (extension selects the format/bit depth)
     """
-    if frame_np.shape[2] == 4:
-        frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGBA2BGRA)
+    ext = os.path.splitext(file_path)[1].lower()
+    sixteen_bit = ext in (".tif", ".tiff")
+
+    # Normalize input to float [0,1] regardless of incoming dtype.
+    if np.issubdtype(frame.dtype, np.floating):
+        norm = np.clip(frame, 0.0, 1.0)
+    elif np.issubdtype(frame.dtype, np.integer):
+        norm = np.clip(frame.astype(np.float32) / float(np.iinfo(frame.dtype).max), 0.0, 1.0)
     else:
-        frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
-    cv2.imwrite(file_path, frame_bgr)
+        norm = np.clip(frame.astype(np.float32), 0.0, 1.0)
+
+    if sixteen_bit:
+        scaled = (norm * 65535.0 + 0.5).astype(np.uint16)
+    else:
+        scaled = (norm * 255.0 + 0.5).astype(np.uint8)
+
+    if scaled.shape[2] == 4:
+        out = cv2.cvtColor(scaled, cv2.COLOR_RGBA2BGRA)
+    else:
+        out = cv2.cvtColor(scaled, cv2.COLOR_RGB2BGR)
+
+    if sixteen_bit:
+        # IMWRITE_TIFF_COMPRESSION = 1 → no compression (uncompressed TIFF).
+        _ext = os.path.splitext(file_path)[1]
+        _success, _buf = cv2.imencode(_ext, out, [int(cv2.IMWRITE_TIFF_COMPRESSION), 1])
+        if _success:
+            _buf.tofile(file_path)
+    else:
+        _ext = os.path.splitext(file_path)[1]
+        _success, _buf = cv2.imencode(_ext, out)
+        if _success:
+            _buf.tofile(file_path)
+
+
+def _emit_gui_queue_status(file_path: str, current: int, total: int) -> None:
+    """Emit a machine-readable queue update for the GUI worker."""
+    payload = {
+        "file_path": file_path,
+        "current": current,
+        "total": total,
+        "done": max(0, current - 1),
+        "remaining": max(0, total - current),
+    }
+    print(f"__SEEDVR2_GUI_STATUS__|{json.dumps(payload, ensure_ascii=False)}", flush=True)
+
+
+def _emit_gui_phase_status(
+    phase_name: str,
+    phase_index: int,
+    phase_total: int = 4,
+    phase_progress: float = 0.0,
+) -> None:
+    """Emit a machine-readable phase update for the GUI worker."""
+    payload = {
+        "phase_name": phase_name,
+        "phase_index": phase_index,
+        "phase_total": phase_total,
+        "phase_progress": max(0.0, min(1.0, float(phase_progress))),
+    }
+    print(f"__SEEDVR2_GUI_PHASE__|{json.dumps(payload, ensure_ascii=False)}", flush=True)
+
+
+def _emit_gui_chunk_status(
+    phase_name: str,
+    chunk_current: int,
+    chunk_total: int,
+    batch_current: int = 0,
+    batch_total: int = 0,
+) -> None:
+    payload = {
+        "phase_name": str(phase_name or ""),
+        "chunk_current": max(0, int(chunk_current)),
+        "chunk_total": max(0, int(chunk_total)),
+        "batch_current": max(0, int(batch_current)),
+        "batch_total": max(0, int(batch_total)),
+    }
+    print(f"__SEEDVR2_GUI_CHUNK__|{json.dumps(payload, ensure_ascii=False)}", flush=True)
+
+
+def _chunk_run_temp_dir(input_path: str, output_path: str) -> str:
+    key = f"{Path(input_path).resolve()}|{Path(output_path).resolve()}"
+    digest = hashlib.sha1(key.encode("utf-8", errors="ignore")).hexdigest()[:12]
+    temp_dir = os.path.join(TEMP_DIR, f"chunk_run_{digest}")
+    os.makedirs(temp_dir, exist_ok=True)
+    return temp_dir
+
+
+def _load_chunk_progress(progress_path: str) -> set[int]:
+    try:
+        if not os.path.isfile(progress_path):
+            return set()
+        with open(progress_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        items = payload.get("completed", [])
+        if isinstance(items, list):
+            return {int(x) for x in items if isinstance(x, int) or str(x).isdigit()}
+    except Exception:
+        pass
+    return set()
+
+
+def _write_chunk_progress(progress_path: str, completed: set[int], total_chunks: int) -> None:
+    payload = {
+        "completed": sorted(int(x) for x in completed),
+        "total_chunks": int(total_chunks),
+        "updated_at": int(time.time()),
+    }
+    with open(progress_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def _concat_chunk_videos(chunk_paths: List[str], output_path: str) -> None:
+    list_file = os.path.join(os.path.dirname(output_path), "concat_list.txt")
+    with open(list_file, "w", encoding="utf-8") as f:
+        for chunk_path in chunk_paths:
+            norm = str(Path(chunk_path).resolve()).replace("\\", "/").replace("'", "'\\''")
+            f.write(f"file '{norm}'\n")
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", list_file,
+        "-c:v", "copy",
+        "-an",
+        output_path,
+    ]
+    run = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0,
+    )
+    try:
+        os.remove(list_file)
+    except Exception:
+        pass
+    if run.returncode != 0:
+        stdout = run.stdout.decode("utf-8", errors="replace") if run.stdout else ""
+        raise RuntimeError(f"FFmpeg concat failed: {stdout[-1200:] if stdout else 'unknown error'}")
+
+
+def _mux_original_audio(temp_concatenated_path: str, original_input_path: str, output_path: str) -> None:
+    final_cmd = [
+        "ffmpeg", "-y",
+        "-i", temp_concatenated_path,
+        "-i", original_input_path,
+        "-c:v", "copy",
+        "-c:a", "copy",
+        "-map", "0:v:0",
+        "-map", "1:a:0?",
+        "-shortest",
+        output_path,
+    ]
+    run = subprocess.run(
+        final_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0,
+    )
+    if run.returncode != 0:
+        stdout = run.stdout.decode("utf-8", errors="replace") if run.stdout else ""
+        raise RuntimeError(f"FFmpeg audio mux failed: {stdout[-1200:] if stdout else 'unknown error'}")
+
+
+def _load_or_create_processing_list(list_path: Path, media_files: List[str]) -> Dict[str, str]:
+    """Load a pending/done processing list, or create one from media_files."""
+    entries: Dict[str, str] = {}
+    if list_path.exists():
+        try:
+            for raw_line in list_path.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if "\t" in line:
+                    name, status = line.split("\t", 1)
+                elif "|" in line:
+                    name, status = line.split("|", 1)
+                else:
+                    name, status = line, "pending"
+                entries[name.strip()] = status.strip().lower() or "pending"
+        except Exception:
+            entries = {}
+    for file_path in media_files:
+        entries.setdefault(Path(file_path).name, "pending")
+    _write_processing_list(list_path, entries)
+    return entries
+
+
+def _write_processing_list(list_path: Path, entries: Dict[str, str]) -> None:
+    lines = [f"{name}\t{status}" for name, status in sorted(entries.items())]
+    list_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+
+
+def _strict_batch_flush(*objs: Any) -> None:
+    """Strict flush hook used by GUI/CLI runs to aggressively release memory."""
+    for obj in objs:
+        try:
+            del obj
+        except Exception:
+            pass
+    gc.collect()
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            if hasattr(torch.cuda, "ipc_collect"):
+                try:
+                    torch.cuda.ipc_collect()
+                except RuntimeError:
+                    pass  # May fail on ROCm or after context destruction
+    except Exception:
+        pass
+
+
+def _release_post_file_resources() -> None:
+    """Force Python and CUDA cleanup between sequential files."""
+    _strict_batch_flush()
+
+
+def _release_phase_memory(phase: str, debug: Optional['Debug'] = None) -> None:
+    """Offload and clear VRAM after a single processing phase.
+
+    Implements the PR #572 phase-based discipline: after each of the four
+    phases (Encode → Upscale → Decode → Postprocess) the allocator caches are
+    flushed with an explicit ``gc.collect()`` followed by
+    ``torch.cuda.empty_cache()`` so VRAM is released *between* phases instead
+    of only at the end of the chunk. This keeps the peak working set bounded to
+    a single phase and defragments the allocator before the next phase runs.
+
+    Never raises: cleanup failures are swallowed so they cannot mask the real
+    error (e.g. an in-flight OOM that must propagate to the Auto Tune retry).
+    """
+    gc.collect()
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            if hasattr(torch.cuda, "ipc_collect"):
+                try:
+                    torch.cuda.ipc_collect()
+                except RuntimeError:
+                    pass  # May fail on ROCm or after context destruction
+    except Exception:
+        pass
+    if debug is not None:
+        debug.log(f"Phase cleanup ({phase}): VRAM cache flushed", category="memory")
 
 
 def save_frames_to_video(
@@ -833,65 +2173,147 @@ def save_frames_to_video(
     Raises:
         ValueError: If video writer cannot be initialized
     """
-    frames_np = (frames_tensor.cpu().numpy() * 255.0).astype(np.uint8)
-    T, H, W, C = frames_np.shape
-    
-    # FFmpeg-only export backend (OpenCV VideoWriter path intentionally removed)
-    effective_backend = "ffmpeg"
-    
+    T, H, W, C = frames_tensor.shape
+
+    effective_backend = video_backend if video_backend in ("ffmpeg", "opencv") else "ffmpeg"
+    output_suffix = Path(output_path).suffix.lower()
+
+    if effective_backend == "ffmpeg":
+        if output_suffix in _IMAGE_OUTPUT_EXTS:
+            raise ValueError(
+                f"FFmpeg backend requires a video container path, got image extension '{output_suffix}' "
+                f"for output '{output_path}'."
+            )
+        if not output_suffix:
+            raise ValueError(
+                f"FFmpeg backend requires an explicit video file extension for output '{output_path}'."
+            )
+
     if writer is None:
         debug.log(f"Saving {T} frames to video: {output_path} (backend={effective_backend})", category="file")
         os.makedirs(Path(output_path).parent, exist_ok=True)
-        writer = FFMPEGVideoWriter(output_path, W, H, fps, use_10bit,
-                                   custom_video_args=custom_video_args)
-        if not writer.isOpened():
-            raise ValueError(f"Cannot create video writer for: {output_path}")
-    
-    for i, frame in enumerate(frames_np):
-        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        writer.write(frame_bgr)
-        if debug.enabled and (i + 1) % 100 == 0:
-            debug.log(f"Written {i + 1}/{T} frames", category="file")
-    
+        if effective_backend == "opencv":
+            # OpenCV VideoWriter: select a codec based on the output extension.
+            ext = Path(output_path).suffix.lower()
+            if ext in (".mp4", ".m4v"):
+                fourcc = cv2.VideoWriter.fourcc(*"mp4v")
+            elif ext in (".avi",):
+                fourcc = cv2.VideoWriter.fourcc(*"XVID")
+            elif ext in (".mov",):
+                fourcc = cv2.VideoWriter.fourcc(*"mp4v")
+            else:
+                fourcc = cv2.VideoWriter.fourcc(*"mp4v")
+            writer = cv2.VideoWriter(output_path, fourcc, fps, (W, H))
+            if not writer.isOpened():
+                raise ValueError(f"cv2.VideoWriter cannot open: {output_path}")
+        else:
+            writer = FFMPEGVideoWriter(output_path, W, H, fps, use_10bit,
+                                       custom_video_args=custom_video_args)
+            if not writer.isOpened():
+                raise ValueError(f"Cannot create video writer for: {output_path}")
+
+    # Periodic (not per-frame) cleanup: forcing gc.collect()/empty_cache() on every
+    # frame adds ~30-50ms overhead per frame (tens of seconds over a long video).
+    gc_interval = 32
+
+    for frame_idx in range(T):
+        frame_np = (
+            frames_tensor[frame_idx:frame_idx + 1]
+            .detach()
+            .clamp(0.0, 1.0)
+            .mul(255.0)
+            .to(device="cpu", dtype=torch.uint8)
+            .squeeze(0)
+            .contiguous()
+            .numpy()
+        )
+
+        if effective_backend == "ffmpeg":
+            frame_to_write = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
+        else:
+            frame_to_write = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
+        writer.write(frame_to_write)
+        del frame_np, frame_to_write
+
+        completed = frame_idx + 1
+        if debug.enabled and ((completed % 32 == 0) or completed == T):
+            debug.log(f"Written {completed}/{T} frames", category="file")
+
+        if (completed % gc_interval == 0) or completed == T:
+            gc.collect()
+            if frames_tensor.is_cuda:
+                torch.cuda.empty_cache()
+
     return writer  # Caller always closes
 
 
 def save_frames_to_image(
-    frames_tensor: torch.Tensor, 
-    output_dir: str, 
+    frames_tensor: torch.Tensor,
+    output_dir: str,
     base_name: str,
-    start_index: int = 0
+    start_index: int = 0,
+    image_format: Optional[str] = None,
 ) -> int:
     """
-    Save frames tensor as sequential PNG image files.
-    
-    Each frame saved as {base_name}_{index:0Nd}.png with zero-padded indices.
-    Converts Float32 [0,1] to uint8 [0,255] and RGB(A) to BGR(A) for OpenCV.
-    
+    Save frames tensor as sequential image files in the chosen format.
+
+    Each frame saved as ``{base_name}_{index:0Nd}{ext}`` with zero-padded indices.
+    Converts Float32 [0,1] to BGR(A) for OpenCV; TIFF frames are written as
+    uncompressed 16-bit, all other formats as 8-bit.
+
     Args:
         frames_tensor: Frames in format [T, H, W, C], Float32, range [0,1]
-        output_dir: Directory to save PNG files (created if doesn't exist)
+        output_dir: Directory to save image files (created if doesn't exist)
         base_name: Base name for output files (e.g., "frame" → "frame_00000.png")
         start_index: Starting index for filenames (for streaming continuation)
-    
+        image_format: Image format string from CLI ``--output_format`` (e.g. "png",
+            "tiff", "tif", "jpg", "jpeg", "dpx", "exr").  Defaults to "png".
+
     Returns:
         Number of frames saved
     """
+    # Map CLI format name → file extension
+    _FMT_TO_EXT: Dict[str, str] = {
+        "tiff": ".tiff", "tif": ".tiff",
+        "jpg": ".jpg", "jpeg": ".jpg",
+        "dpx": ".dpx",
+        "exr": ".exr",
+        "png": ".png",
+    }
+    ext = _FMT_TO_EXT.get((image_format or "png").lower(), ".png")
+
     os.makedirs(output_dir, exist_ok=True)
-    
-    frames_np = (frames_tensor.cpu().numpy() * 255.0).astype(np.uint8)
+
+    # Keep frames as Float32 [0,1] and let _save_image_bgr pick the bit depth
+    # from the extension (16-bit for TIFF, 8-bit otherwise) so high-fidelity
+    # formats are not down-converted to 8-bit.
+    frames_np = frames_tensor.cpu().numpy()
     total = frames_np.shape[0]
-    
+
     if start_index == 0:
-        debug.log(f"Saving {total} frames as PNGs to directory: {output_dir}", category="file")
+        debug.log(
+            f"Saving {total} frames as {ext.lstrip('.')} sequence to directory: {output_dir}",
+            category="file",
+        )
     digits = 6  # Supports up to 999,999 frames (~11.5 hours at 24fps)
 
     for idx, frame in enumerate(frames_np):
-        filename = f"{base_name}_{start_index + idx:0{digits}d}.png"
+        filename = f"{base_name}_{start_index + idx:0{digits}d}{ext}"
         file_path = os.path.join(output_dir, filename)
         _save_image_bgr(frame, file_path)
+        # Periodic cleanup (every 32 frames) instead of per-frame to avoid
+        # ~30-50ms gc/empty_cache overhead on every single image.
+        if (idx + 1) % 32 == 0:
+            gc.collect()
+            if frames_tensor.is_cuda:
+                torch.cuda.empty_cache()
         if debug.enabled and (idx + 1) % 100 == 0:
             debug.log(f"Saved {idx + 1}/{total} images", category="file")
+
+    # Final cleanup after all frames are written.
+    gc.collect()
+    if frames_tensor.is_cuda:
+        torch.cuda.empty_cache()
 
     debug.log(f"Saved {total} images to '{output_dir}'", category="success")
     return total
@@ -956,7 +2378,12 @@ def _process_frames_core(
         )
         if runner_cache is not None:
             runner_cache['ctx'] = ctx
-    
+
+    # Propagate Auto Tune flag into ctx so generation phases can read it.
+    # Keep the legacy key for compatibility with any older code paths.
+    ctx['auto_tune'] = getattr(args, 'auto_tune', False)
+    ctx['auto_safeguard'] = ctx['auto_tune']
+
     # Build torch compile args
     torch_compile_args_dit = None
     torch_compile_args_vae = None
@@ -1036,45 +2463,92 @@ def _process_frames_core(
     )
     log_generation_start(gen_info, debug)
     
-    # Phase 1: Encode
-    ctx = encode_all_batches(
-        runner, ctx=ctx, images=frames_tensor,
-        debug=debug, 
-        batch_size=args.batch_size,
-        uniform_batch_size=args.uniform_batch_size,
-        seed=args.seed,
-        progress_callback=None, 
-        temporal_overlap=args.temporal_overlap,
-        resolution=args.resolution,
-        max_resolution=args.max_resolution,
-        input_noise_scale=args.input_noise_scale,
-        color_correction=args.color_correction
-    )
-    
-    # Phase 2: Upscale
-    ctx = upscale_all_batches(
-        runner, ctx=ctx, debug=debug, progress_callback=None,
-        seed=args.seed,
-        latent_noise_scale=args.latent_noise_scale,
-        cache_model=cache_dit
-    )
-    
-    # Phase 3: Decode
-    ctx = decode_all_batches(
-        runner, ctx=ctx, debug=debug, progress_callback=None,
-        cache_model=cache_vae
-    )
-    
-    # Phase 4: Post-process
-    ctx = postprocess_all_batches(
-        ctx=ctx, debug=debug, progress_callback=None,
-        color_correction=args.color_correction,
-        prepend_frames=0,  # Worker mode handles this in main process
-        temporal_overlap=args.temporal_overlap,
-        batch_size=args.batch_size
-    )
-    
-    result_tensor = ctx['final_video']
+    # Inter-phase VRAM release is only worthwhile in streaming/chunked mode, where
+    # many chunks flow through the pipeline and defragmenting between phases keeps
+    # the peak working set bounded. In single-chunk (non-streaming) mode the extra
+    # empty_cache() calls just force VRAM reallocation and slow things down, so we
+    # skip them and rely on the final chunk-cleanup in the ``finally`` block.
+    is_streaming = (getattr(args, "chunk_size", 0) or 0) > 0 or \
+        (getattr(args, "chunk_duration_minutes", 0) or 0) > 0
+
+    # 4-phase pipeline (PR #572): each phase runs in isolation and its VRAM is
+    # explicitly offloaded/cleared before the next phase begins. The whole block
+    # is wrapped in try/finally so that an OOM mid-phase still releases VRAM
+    # before the error propagates to the Auto Tune step-down retry.
+    def _phase_progress_callback(phase_index: int, phase_name: str):
+        def _callback(current: int, total: int, _frames: int, _phase_label: str) -> None:
+            if total <= 0:
+                return
+            _emit_gui_phase_status(
+                phase_name=phase_name,
+                phase_index=phase_index,
+                phase_total=4,
+                phase_progress=float(current) / float(total),
+            )
+        return _callback
+
+    try:
+        # Phase 1: Encode
+        _emit_gui_phase_status("Encode", 1, phase_progress=0.0)
+        ctx = encode_all_batches(
+            runner, ctx=ctx, images=frames_tensor,
+            debug=debug, 
+            batch_size=args.batch_size,
+            uniform_batch_size=args.uniform_batch_size,
+            seed=args.seed,
+            progress_callback=_phase_progress_callback(1, "Encode"),
+            temporal_overlap=args.temporal_overlap,
+            resolution=args.resolution,
+            max_resolution=args.max_resolution,
+            input_noise_scale=args.input_noise_scale,
+            color_correction=args.color_correction
+        )
+        _emit_gui_phase_status("Encode", 1, phase_progress=1.0)
+        if is_streaming:
+            _release_phase_memory("Encode", debug)
+
+        # Phase 2: Upscale
+        _emit_gui_phase_status("Upscale", 2, phase_progress=0.0)
+        ctx = upscale_all_batches(
+            runner, ctx=ctx, debug=debug, progress_callback=_phase_progress_callback(2, "Upscale"),
+            seed=args.seed,
+            latent_noise_scale=args.latent_noise_scale,
+            cache_model=cache_dit
+        )
+        _emit_gui_phase_status("Upscale", 2, phase_progress=1.0)
+        if is_streaming:
+            _release_phase_memory("Upscale", debug)
+
+        # Phase 3: Decode
+        _emit_gui_phase_status("Decode", 3, phase_progress=0.0)
+        ctx = decode_all_batches(
+            runner, ctx=ctx, debug=debug, progress_callback=_phase_progress_callback(3, "Decode"),
+            cache_model=cache_vae,
+            only_frames=args.only_frames
+        )
+        _emit_gui_phase_status("Decode", 3, phase_progress=1.0)
+        if is_streaming:
+            _release_phase_memory("Decode", debug)
+
+        # Phase 4: Post-process
+        _emit_gui_phase_status("Postprocess", 4, phase_progress=0.0)
+        ctx = postprocess_all_batches(
+            ctx=ctx, debug=debug, progress_callback=_phase_progress_callback(4, "Postprocess"),
+            color_correction=args.color_correction,
+            prepend_frames=0,  # Worker mode handles this in main process
+            temporal_overlap=args.temporal_overlap,
+            batch_size=args.batch_size
+        )
+        _emit_gui_phase_status("Postprocess", 4, phase_progress=1.0)
+        if is_streaming:
+            _release_phase_memory("Postprocess", debug)
+
+        result_tensor = ctx['final_video']
+    finally:
+        # Strict cleanup: guarantee VRAM release after the chunk's phases, even
+        # when a phase raises (e.g. CUDA OOM), so the next chunk or retry starts
+        # from a clean, defragmented allocator state.
+        _release_phase_memory("chunk-cleanup", debug)
     
     # Convert to CPU and compatible dtype
     if result_tensor.is_cuda or result_tensor.is_mps:
@@ -1423,10 +2897,12 @@ Examples:
     io_group.add_argument("--output", type=str, default=None,
                         help="Output path (default: auto-generated in 'output/' directory)")
     io_group.add_argument("--output_format", type=str, default=None,
-                        help="Output format/container: 'png' (image sequence), 'mp4', 'mov', 'mkv', 'webm'. "
+                        help="Output format/container: 'png' (image sequence), 'mp4', 'mov', 'mkv', 'webm', "
+                             "'tiff', 'tif', 'jpg', 'jpeg', 'dpx', 'exr'. "
                              "Default: auto-detect from input type")
-    io_group.add_argument("--video_backend", type=str, default="ffmpeg", choices=["ffmpeg"],
-                        help="Video encoder backend (FFmpeg-only). Requires ffmpeg in PATH.")
+    io_group.add_argument("--video_backend", type=str, default="ffmpeg", choices=["ffmpeg", "opencv"],
+                        help="Video encoder backend: 'ffmpeg' (recommended, requires ffmpeg in PATH) or "
+                             "'opencv' (fallback, mp4/avi output only, no 10-bit support).")
     io_group.add_argument("--10bit", dest="use_10bit", action="store_true",
                         help="Save 10-bit video with x265 codec (reduces banding). Without this flag, "
                          "ffmpeg uses x264 for maximum compatibility. Requires --video_backend ffmpeg")
@@ -1434,9 +2910,24 @@ Examples:
                         help="JSON array of custom FFmpeg video encoding args, e.g. "
                              '\'["-c:v","prores_ks","-profile:v","3","-pix_fmt","yuv422p10le"]\'. '
                              "When supplied, implies --video_backend ffmpeg and overrides --10bit codec defaults.")
+    io_group.add_argument("--source_fps", type=float, default=0.0,
+                        help="Override output FPS with the exact source FPS supplied by the GUI.")
+    io_group.add_argument("--processing_list_file", type=str, default=None,
+                        help="Pending/done batch list file used for resumable directory processing.")
+    io_group.add_argument("--video_only_directory", action="store_true",
+                        help="When input is a directory, process only video files.")
     io_group.add_argument("--model_dir", type=str, default=None,
                         help=f"Model directory (default: ./models/{SEEDVR2_FOLDER_NAME})")
-    
+    io_group.add_argument("--pre_downscale", type=int, default=1, choices=[1, 2, 3],
+                        help="Pre-downscale input by this factor before upscaling using Lanczos filtering. "
+                             "1 = no downscale (default), 2 = halve dimensions, 3 = reduce to 1/3.")
+    io_group.add_argument("--resolution_mode", type=str, default="pixel", choices=["pixel", "xtimes"],
+                        help="Resolution computation mode. 'pixel' (default): use --resolution as the target "
+                             "short-side pixel count. 'xtimes': multiply the pre-downscaled input height "
+                             "by --resolution_scale.")
+    io_group.add_argument("--resolution_scale", type=int, default=2,
+                        help="Multiplier used when --resolution_mode xtimes is active (default: 2).")
+
     # Model Selection
     model_group = parser.add_argument_group('Model selection')
     model_group.add_argument("--dit_model", type=str, default=DEFAULT_DIT,
@@ -1462,9 +2953,13 @@ Examples:
                         help="Skip N initial frames (default: 0)")
     process_group.add_argument("--load_cap", type=int, default=0,
                         help="Load maximum N frames from video. 0 = load all (default: 0)")
+    process_group.add_argument("--only_frames", type=int, default=0,
+                        help="Limits the maximum number of frames processed per VAE decode chunk to prevent OOM. 0 = no limit (default: 0)")
     process_group.add_argument("--chunk_size", type=int, default=0,
                         help="Frames per chunk for streaming mode. When > 0, processes video in "
                              "memory-bounded chunks of N frames. 0 = load all frames at once (default: 0)")
+    process_group.add_argument("--chunk_duration_minutes", type=float, default=0.0,
+                        help="Chunk duration in minutes for streaming mode. Runtime chunk size is computed as minutes × 60 × source FPS. Ignored when --chunk_size is set.")
     process_group.add_argument("--prepend_frames", type=int, default=0,
                         help="Prepend N reversed frames to reduce start artifacts (auto-removed). Default: 0")
     process_group.add_argument("--temporal_overlap", type=int, default=0,
@@ -1530,11 +3025,11 @@ Examples:
                         help="Enable torch.compile for DiT model (20-40%% speedup, requires PyTorch 2.0+ and Triton)")
     perf_group.add_argument("--compile_vae", action="store_true",
                         help="Enable torch.compile for VAE model (15-25%% speedup, requires PyTorch 2.0+ and Triton)")
-    perf_group.add_argument("--compile_backend", type=str, default="inductor", choices=["inductor", "cudagraphs"],
-                        help="Compilation backend: 'inductor' (full optimization with Triton) or 'cudagraphs' (lightweight, no kernel optimization) (default: inductor)")
-    perf_group.add_argument("--compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
+    perf_group.add_argument("--compile_backend", type=str, default="inductor", choices=["inductor"],
+                        help="Compilation backend: 'inductor' (full optimization with Triton) (default: inductor)")
+    perf_group.add_argument("--compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune"],
                         help="Optimization level: 'default' (fast compilation), 'reduce-overhead' (lower overhead), 'max-autotune' (best runtime, slow compilation), "
-                        "'max-autotune-no-cudagraphs' (like max-autotune without cudagraphs) (default: default)")
+                        "(default: default)")
     perf_group.add_argument("--compile_fullgraph", action="store_true",
                         help="Compile entire model as single graph (faster but less flexible). May fail with dynamic shapes (default: False)")
     perf_group.add_argument("--compile_dynamic", action="store_true",
@@ -1555,6 +3050,10 @@ Examples:
     
     # Debugging
     debug_group = parser.add_argument_group('Debugging')
+    debug_group.add_argument("--auto_tune", action="store_true",
+                        help="Enable Auto Tune: performs pre-flight VRAM detection, forces VAE tile overlap "
+                             "to 32, and on OOM automatically relaxes settings and retries (up to 5 times) by "
+                             "shrinking batch size, enabling/tightening VAE tiling, and reducing temporal overlap.")
     debug_group.add_argument("--debug", action="store_true",
                         help="Enable verbose debug logging")
     
@@ -1592,8 +3091,60 @@ def main() -> None:
     # Parse arguments
     args = parse_arguments()
 
+    # --- Mandatory entry-point output path/extension override (source of truth) ---
+    # When the caller supplies BOTH an explicit --output path and an explicit
+    # --output_format, the output extension is forced to match the requested
+    # format right here, before any other logic runs. This guarantees the user's
+    # chosen container is authoritative and is never silently replaced (e.g. with
+    # a stray ".png"). When --output_format is auto-detected (None) the canonical
+    # reconciliation later in main() resolves the final path instead.
+    if getattr(args, "output", None) and getattr(args, "output_format", None):
+        base_path, output_ext = os.path.splitext(args.output)
+        fmt = args.output_format.lower()
+        if fmt in _IMAGE_SEQUENCE_FORMATS:
+            if output_ext.lower() in _IMAGE_OUTPUT_EXTS:
+                # The caller supplied a direct image file path (e.g. a
+                # "..._preview_upscaled.tiff"). Honor it as an exact filename so
+                # the image is written directly to that path (only its parent
+                # directory is created) instead of treating the path as a
+                # directory and dropping a frame sequence inside a new subfolder.
+                target_ext = f".{fmt}" if f".{fmt}" in _IMAGE_OUTPUT_EXTS else output_ext
+                args.output = f"{base_path}{target_ext}"
+            else:
+                # No image extension → image-sequence export writes a directory
+                # of frames, not a single file, so strip any extension and use
+                # the bare base path.
+                args.output = base_path
+        else:
+            ext = _VIDEO_CONTAINER_EXTS.get(fmt, f".{fmt}")
+            args.output = f"{base_path}{ext}"
+
     # Update debug instance with --debug flag
     debug.enabled = args.debug
+
+    # Auto Tune: force tile overlap to 32 for both encode and decode
+    if getattr(args, "auto_tune", False):
+        if hasattr(args, "vae_encode_tile_overlap"):
+            args.vae_encode_tile_overlap = 32
+        if hasattr(args, "vae_decode_tile_overlap"):
+            args.vae_decode_tile_overlap = 32
+        debug.log("Auto Tune active: VAE tile overlap forced to 32", category="setup", force=True)
+
+    # 16-bit TIFF optimization: clamp the VAE decode tile size to <=256 to cap
+    # peak VRAM during the Decode phase. 16-bit TIFF frames carry full-precision
+    # data, so their decode tiles are far larger than 8-bit ones; large tiles
+    # spike VRAM and trigger OOM. 256 keeps the decode peak bounded.
+    _decode_fmt = (getattr(args, "output_format", None) or "").lower()
+    if _decode_fmt in ("tiff", "tif") and getattr(args, "vae_decode_tile_size", 0) > 256:
+        debug.log(
+            f"16-bit TIFF output: clamping vae_decode_tile_size "
+            f"{args.vae_decode_tile_size}→256 to bound Decode-phase VRAM",
+            category="setup", force=True,
+        )
+        args.vae_decode_tile_size = 256
+        # Keep the tile overlap strictly smaller than the clamped tile size.
+        if getattr(args, "vae_decode_tile_overlap", 0) >= 256:
+            args.vae_decode_tile_overlap = min(args.vae_decode_tile_overlap, 32)
 
     # print header
     debug.print_header(cli=True)
@@ -1609,7 +3160,7 @@ def main() -> None:
     if args.vae_decode_tiled and args.vae_decode_tile_overlap >= args.vae_decode_tile_size:
         debug.log(f"VAE decode tile overlap ({args.vae_decode_tile_overlap}) must be smaller than tile size ({args.vae_decode_tile_size})", level="ERROR", category="vae", force=True)
         sys.exit(1)
-    
+
     # Validate ffmpeg availability if selected or needed for custom video args
     if args.ffmpeg_video_args:
         try:
@@ -1623,6 +3174,9 @@ def main() -> None:
             sys.exit(1)
         # Force ffmpeg backend when custom args are given
         args.video_backend = "ffmpeg"
+
+        # Codec-container pre-check is intentionally disabled.
+        # args.output_format is used as provided by the caller without modification.
     
     if args.video_backend == "ffmpeg" and shutil.which("ffmpeg") is None:
         debug.log("--video_backend ffmpeg requires ffmpeg in PATH. Install ffmpeg and retry.", 
@@ -1645,6 +3199,8 @@ def main() -> None:
             "Set --vae_offload_device explicitly to use a different device.",
             category="cache", force=True
         )
+
+    chunking_requested = bool((args.chunk_size or 0) > 0 or (args.chunk_duration_minutes or 0.0) > 0.0)
 
     if args.debug:
         if platform.system() == "Darwin":
@@ -1685,18 +3241,32 @@ def main() -> None:
         format_auto_detected = args.output_format is None
         
         if input_type == 'directory':
-            media_files = get_media_files(args.input)
+            media_files = get_media_files(args.input, videos_only=getattr(args, "video_only_directory", False))
             if not media_files:
                 debug.log(f"No video or image files found in directory: {args.input}", 
                         level="ERROR", category="file", force=True)
                 sys.exit(1)
+
+            processing_list_file = getattr(args, "processing_list_file", None) or str(
+                Path(args.input) / "seedvr2_processing_list.txt"
+            )
+            processing_entries = _load_or_create_processing_list(Path(processing_list_file), media_files)
+            total_files = len(processing_entries)
+            completed_before_run = sum(1 for status in processing_entries.values() if status == "done")
+            media_files = [
+                file_path for file_path in media_files
+                if processing_entries.get(Path(file_path).name, "pending") != "done"
+            ]
+            if not media_files:
+                debug.log("All files in the processing list are already marked done.", category="success", force=True)
+                sys.exit(0)
             
             debug.log(f"Found {len(media_files)} media files to process", category="file", force=True)
             
             # Multi-GPU caching requires streaming (workers cache within their chunk loops)
-            if (args.cache_dit or args.cache_vae) and len(device_list) > 1 and args.chunk_size <= 0:
+            if (args.cache_dit or args.cache_vae) and len(device_list) > 1 and not chunking_requested:
                 debug.log(
-                    "Model caching requires streaming mode (--chunk_size > 0) for multi-GPU. "
+                    "Model caching requires streaming mode (--chunk_size > 0 or --chunk_duration_minutes > 0) for multi-GPU. "
                     "Disabling caching for this run.",
                     level="WARNING", category="cache", force=True
                 )
@@ -1713,12 +3283,29 @@ def main() -> None:
                     debug.log("━" * 60, category="none", force=True)
                     debug.log("", category="none", force=True)
                 
-                debug.log(f"Processing file {idx}/{len(media_files)}", category="generation", force=True)
+                queue_index = completed_before_run + idx
+                _emit_gui_queue_status(file_path, queue_index, total_files)
+                debug.log(
+                    f"Processing: {file_path} | File {queue_index} of {total_files} "
+                    f"[Done: {queue_index - 1}, Remaining: {total_files - queue_index}]",
+                    category="generation", force=True
+                )
                 
-                # Auto-detect format per file if not user-specified
+                # Auto-detect format per file if not user-specified.
+                # When --ffmpeg_video_args is provided, derive the default container from
+                # the codec rather than blindly using "mp4" — this lets ProRes, DNxHD, etc.
+                # select the correct container automatically.
                 if format_auto_detected:
                     file_type = get_input_type(file_path)
-                    file_output_format = "mp4" if file_type == "video" else "png"
+                    if file_type == "video":
+                        _codec = _extract_codec_from_ffmpeg_args(
+                            getattr(args, "ffmpeg_video_args", None)
+                        )
+                        file_output_format, _warn = _resolve_output_format_for_codec(_codec, "mp4")
+                        if _warn:
+                            debug.log(_warn, level="WARNING", category="setup", force=True)
+                    else:
+                        file_output_format = "png"
                 else:
                     file_output_format = args.output_format
                 
@@ -1726,33 +3313,64 @@ def main() -> None:
                 original_format = args.output_format
                 args.output_format = file_output_format
                 
-                # generate_output_path handles None gracefully with "outputs" default
-                output_path = generate_output_path(file_path, file_output_format, args.output, 
-                                   input_type=get_input_type(file_path), from_directory=True)
+                # Reconcile the path against the now-final per-file format before
+                # the worker is invoked. file_output_format is the master here.
+                output_path = resolve_canonical_output_path(
+                    file_path, args.output, file_output_format,
+                    input_type=get_input_type(file_path),
+                    video_backend=args.video_backend, from_directory=True,
+                )
                 
-                # Process with explicit output path and runner cache
-                frames = process_single_file(file_path, args, device_list, output_path, 
-                                            format_auto_detected=format_auto_detected,
-                                            runner_cache=runner_cache)
-                total_frames_processed += frames
+                # Process with explicit output path and runner cache. Auto Tune
+                # (when enabled) recovers from OOM by relaxing settings and retrying.
+                _autotune_precheck(args, file_path)
+                total_frames_processed += _run_with_auto_tune(
+                    lambda: process_single_file(
+                        file_path, args, device_list, output_path,
+                        format_auto_detected=format_auto_detected,
+                        runner_cache=runner_cache),
+                    args,
+                    input_path=file_path,
+                    on_success=_release_post_file_resources,
+                )
+                processing_entries[Path(file_path).name] = "done"
+                _write_processing_list(Path(processing_list_file), processing_entries)
                 
                 # Restore original format
                 args.output_format = original_format
 
         elif input_type in ("video", "image"):
-            # Auto-detect output format for single file if not specified
+            # Auto-detect output format for single file if not specified.
+            # When --ffmpeg_video_args carries a codec, derive the container from it
+            # rather than defaulting to "mp4" unconditionally.
             if format_auto_detected:
-                args.output_format = "mp4" if input_type == "video" else "png"
+                if input_type == "video":
+                    _codec = _extract_codec_from_ffmpeg_args(
+                        getattr(args, "ffmpeg_video_args", None)
+                    )
+                    args.output_format, _warn = _resolve_output_format_for_codec(_codec, "mp4")
+                    if _warn:
+                        debug.log(_warn, level="WARNING", category="setup", force=True)
+                else:
+                    args.output_format = "png"
+            
+            # args.output_format is now final/authoritative. Reconcile args.output
+            # against it exactly once, before any worker call or writer init, so the
+            # master format mandates the path extension/target type.
+            args.output = resolve_canonical_output_path(
+                args.input, args.output, args.output_format,
+                input_type=input_type, video_backend=args.video_backend,
+            )
             
             # Caching: single-GPU streaming uses runner_cache, multi-GPU streaming workers cache internally
             runner_cache = None
-            streaming = args.chunk_size > 0
+            streaming = chunking_requested
             
             if args.cache_dit or args.cache_vae:
                 if len(device_list) > 1:
                     if not streaming:
                         debug.log(
-                            "Model caching requires streaming mode (--chunk_size > 0) for multi-GPU. "
+                            "Model caching requires streaming mode (--chunk_size > 0 or --chunk_duration_minutes > 0) for multi-GPU. "
                             "Disabling caching for this run.",
                             level="WARNING", category="cache", force=True
                         )
@@ -1767,11 +3385,16 @@ def main() -> None:
                         category="tip", force=True
                     )
             
-            frames = process_single_file(args.input, args, device_list, args.output,
-                                        format_auto_detected=format_auto_detected,
-                                        runner_cache=runner_cache)
-            total_frames_processed += frames
-        
+            _autotune_precheck(args, args.input)
+            total_frames_processed += _run_with_auto_tune(
+                lambda: process_single_file(
+                    args.input, args, device_list, args.output,
+                    format_auto_detected=format_auto_detected,
+                    runner_cache=runner_cache),
+                args,
+                input_path=args.input,
+            )
+
         else:
             debug.log(f"Unsupported input type: {args.input}", level="ERROR", category="file", force=True)
             sys.exit(1)
@@ -1789,6 +3412,8 @@ def main() -> None:
         
     except Exception as e:
         debug.log(f"Error during processing: {e}", level="ERROR", category="generation", force=True)
+        # Capture the exact GPU/RAM state before unwinding so crash reports are actionable.
+        _log_crash_diagnostics()
         import traceback
         traceback.print_exc()
         sys.exit(1)
