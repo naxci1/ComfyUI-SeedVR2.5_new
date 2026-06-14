@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
 from typing import Any, Dict, List
 
 from PySide6.QtCore import Qt, Signal, QTimer
@@ -32,6 +34,34 @@ try:
     from gui.config_manager import load_config
 except ImportError:  # pragma: no cover - direct-script execution fallback
     from config_manager import load_config  # type: ignore[no-redef]
+
+# ------------------------------------------------------------------ model name mapping
+# Maps short display names → actual filenames (order determines default priority).
+_MODEL_DISPLAY_MAP: Dict[str, str] = {
+    "3B Q8": "seedvr2_ema_3b-Q8_0.gguf",
+    "3B FP8": "seedvr2_ema_3b_fp8_e4m3fn.safetensors",
+    "3B FP16": "seedvr2_ema_3b_fp16.safetensors",
+    "3B Q4": "seedvr2_ema_3b-Q4_K_M.gguf",
+    "7B Q4": "seedvr2_ema_7b-Q4_K_M.gguf",
+    "7B Q8": "seedvr2_ema_7b-Q8_0.gguf",
+    "7B FP8": "seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors",
+    "7B FP16": "seedvr2_ema_7b_fp16.safetensors",
+    "7B Sharp Q4": "seedvr2_ema_7b_sharp-Q4_K_M.gguf",
+    "7B Sharp FP8": "seedvr2_ema_7b_sharp_fp8_e4m3fn_mixed_block35_fp16.safetensors",
+    "7B Sharp FP16": "seedvr2_ema_7b_sharp_fp16.safetensors",
+}
+# Reverse map: filename → short display name.
+_MODEL_FILENAME_TO_DISPLAY: Dict[str, str] = {v: k for k, v in _MODEL_DISPLAY_MAP.items()}
+
+
+def _display_name(filename: str) -> str:
+    """Return short display name for a model filename."""
+    return _MODEL_FILENAME_TO_DISPLAY.get(filename, filename)
+
+
+def _filename_for_display(display: str) -> str:
+    """Return actual filename for a short display name."""
+    return _MODEL_DISPLAY_MAP.get(display, display)
 
 
 class _FrameListLineEdit(QLineEdit):
@@ -88,6 +118,7 @@ class SettingsPanel(QWidget):
         self._trim_out_frame = 0
         self._trim_frame_count = 0
         self._trim_active = False
+        self._simple_mode = False
         self._model_fallback = [
             "seedvr2_ema_3b_fp8_e4m3fn.safetensors",
             "seedvr2_ema_3b_fp16.safetensors",
@@ -122,6 +153,7 @@ class SettingsPanel(QWidget):
         self._layout.setSpacing(Dims.PADDING_MD)
         scroll.setWidget(body)
 
+        self._build_presets_group()
         self._build_resolution_group()
         self._build_model_group()
         self._build_runtime_group()
@@ -136,20 +168,135 @@ class SettingsPanel(QWidget):
         self._update_vae_controls()
         self._update_vram_prediction()
 
+    # ---------------------------------------------------------------- simple mode
+    def set_simple_mode(self, simple: bool) -> None:
+        """Show only Resolution + Quality groups when simple=True."""
+        self._simple_mode = simple
+        advanced = not simple
+        # Groups to hide in simple mode (everything except resolution and batch/quality).
+        for widget in self._advanced_only_widgets:
+            widget.setVisible(advanced)
+
     def set_trim_range(self, trim_in: int, trim_out: int, frame_count: int, active: bool) -> None:
         self._trim_in_frame = max(0, int(trim_in))
         self._trim_out_frame = max(self._trim_in_frame, int(trim_out))
         self._trim_frame_count = max(0, int(frame_count))
         self._trim_active = bool(active) and self._trim_frame_count > 0
 
-    def _group(self, title: str) -> QFormLayout:
+    def _group(self, title: str, advanced_only: bool = False) -> QFormLayout:
         box = QGroupBox(title, self)
         form = QFormLayout(box)
         form.setContentsMargins(Dims.PADDING_MD, Dims.PADDING_LG, Dims.PADDING_MD, Dims.PADDING_MD)
         form.setSpacing(Dims.PADDING_SM)
         form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self._layout.addWidget(box)
+        if advanced_only:
+            self._advanced_only_widgets.append(box)
         return form
+
+    def _build_presets_group(self) -> None:
+        """Presets section: save/load named settings presets."""
+        self._advanced_only_widgets: List[QWidget] = []
+        self._presets_file = Path(os.path.expanduser("~")) / ".seedvr2_presets.json"
+        self._presets: Dict[str, Any] = self._load_presets()
+
+        box = QGroupBox("PRESETS", self)
+        vlay = QVBoxLayout(box)
+        vlay.setContentsMargins(Dims.PADDING_MD, Dims.PADDING_LG, Dims.PADDING_MD, Dims.PADDING_MD)
+        vlay.setSpacing(Dims.PADDING_SM)
+        self._layout.addWidget(box)
+
+        # Buttons row.
+        btn_row = QHBoxLayout()
+        self._preset_name_edit = QLineEdit(box)
+        self._preset_name_edit.setPlaceholderText("Preset name…")
+        self._save_preset_btn = QLabel("💾 Save", box)
+        self._save_preset_btn.setStyleSheet(
+            f"color: {Colors.TEXT_ACCENT}; font-size: {Fonts.SIZE_SMALL}px; cursor: pointer;"
+        )
+        self._save_preset_btn.mousePressEvent = self._on_save_preset  # type: ignore[method-assign]
+        btn_row.addWidget(self._preset_name_edit, 1)
+        btn_row.addWidget(self._save_preset_btn)
+        vlay.addLayout(btn_row)
+
+        # Preset list.
+        self._preset_list = QListWidget(box)
+        self._preset_list.setMaximumHeight(80)
+        self._preset_list.itemDoubleClicked.connect(self._on_load_preset)
+        vlay.addWidget(self._preset_list)
+
+        del_lbl = QLabel("(double-click to load)", box)
+        del_lbl.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; font-size: {Fonts.SIZE_TINY}px;")
+        vlay.addWidget(del_lbl)
+
+        self._refresh_preset_list()
+
+    def _load_presets(self) -> Dict[str, Any]:
+        try:
+            if self._presets_file.exists():
+                with open(self._presets_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    return data if isinstance(data, dict) else {}
+        except Exception:
+            pass
+        return {}
+
+    def _save_presets_to_disk(self) -> None:
+        try:
+            with open(self._presets_file, "w", encoding="utf-8") as f:
+                json.dump(self._presets, f, indent=2)
+        except Exception:
+            pass
+
+    def _refresh_preset_list(self) -> None:
+        self._preset_list.clear()
+        for name in sorted(self._presets.keys()):
+            item = QListWidgetItem(name)
+            item.setData(Qt.UserRole, name)
+            self._preset_list.addItem(item)
+
+    def _on_save_preset(self, _event=None) -> None:
+        name = self._preset_name_edit.text().strip()
+        if not name:
+            return
+        try:
+            self._presets[name] = self.get_all_settings()
+        except Exception:
+            return
+        self._save_presets_to_disk()
+        self._refresh_preset_list()
+        self._preset_name_edit.clear()
+
+    def _on_load_preset(self, item: QListWidgetItem) -> None:
+        name = item.data(Qt.UserRole)
+        settings = self._presets.get(name)
+        if not settings or not isinstance(settings, dict):
+            return
+        # Apply all available settings from the preset.
+        try:
+            if "resolution_mode" in settings:
+                self.resolution_mode_combo.setCurrentText(str(settings["resolution_mode"]))
+            if "resolution" in settings:
+                self.resolution_spin.setValue(int(settings["resolution"]))
+            if "resolution_scale" in settings:
+                self.resolution_scale_combo.setCurrentText(str(settings["resolution_scale"]))
+            if "resolution_presets" in settings:
+                self.resolution_presets_combo.setCurrentText(str(settings["resolution_presets"]))
+            if "batch_size" in settings:
+                self.batch_size_spin.setValue(int(settings["batch_size"]))
+            if "auto_tune" in settings:
+                self.auto_tune_toggle.setChecked(bool(settings["auto_tune"]))
+            if "cache_dit" in settings:
+                self.cache_dit_toggle.setChecked(bool(settings["cache_dit"]))
+            if "cache_vae" in settings:
+                self.cache_vae_toggle.setChecked(bool(settings["cache_vae"]))
+            if "temporal_overlap" in settings:
+                self.temporal_overlap_spin.setValue(int(settings["temporal_overlap"]))
+            if "color_correction" in settings:
+                self.color_correction_combo.setCurrentText(str(settings["color_correction"]))
+        except Exception:
+            pass
+        self._emit_settings_changed()
 
     def _label(self, text: str) -> QLabel:
         return QLabel(text)
@@ -216,6 +363,7 @@ class SettingsPanel(QWidget):
             self.cuda_device_list.item(0).setSelected(True)
 
     def _discover_models(self) -> List[str]:
+        """Return list of short display names for discovered + fallback models."""
         discovered: List[str] = []
         try:
             cfg = load_config()
@@ -227,7 +375,10 @@ class SettingsPanel(QWidget):
         except Exception:
             discovered = []
         merged = discovered + [item for item in self._model_fallback if item not in discovered]
-        return merged or list(self._model_fallback)
+        if not merged:
+            merged = list(self._model_fallback)
+        # Convert filenames to display names; keep unknown names as-is.
+        return [_display_name(fn) for fn in merged]
 
     def reload_models(self) -> None:
         current = self.dit_model_combo.currentText()
@@ -240,7 +391,7 @@ class SettingsPanel(QWidget):
         self._emit_settings_changed()
 
     def _build_resolution_group(self) -> None:
-        form = self._group("RESOLUTION")
+        form = self._group("RESOLUTION")  # always visible
         self.resolution_mode_combo = self._combo(["pixel", "xtimes", "presets"], "pixel")
         self.resolution_mode_combo.currentTextChanged.connect(self._update_resolution_mode)
         self.resolution_spin = self._spin(128, 7680, 720, 8)
@@ -261,8 +412,10 @@ class SettingsPanel(QWidget):
         form.addRow(self._label("Pre-downscale"), self.pre_downscale_combo)
 
     def _build_model_group(self) -> None:
-        form = self._group("MODEL & PERFORMANCE")
-        self.dit_model_combo = self._combo(self._discover_models(), "seedvr2_ema_3b_fp8_e4m3fn.safetensors")
+        form = self._group("MODEL & PERFORMANCE", advanced_only=True)
+        models = self._discover_models()
+        default_display = _display_name("seedvr2_ema_3b_fp8_e4m3fn.safetensors")
+        self.dit_model_combo = self._combo(models, default_display if default_display in models else (models[0] if models else ""))
         self.attention_mode_combo = self._combo(
             ["sdpa", "flash_attn_2", "flash_attn_3", "sage_attn_2", "sage_attn_3"],
             "sage_attn_3",
@@ -282,7 +435,7 @@ class SettingsPanel(QWidget):
         form.addRow(self._label("Debug"), self.debug_toggle)
 
     def _build_runtime_group(self) -> None:
-        form = self._group("RUNTIME")
+        form = self._group("RUNTIME", advanced_only=True)
         self.uniform_batch_toggle = self._toggle(True)
         self.batch_size_spin = self._spin(1, 999999, 81, 4)
         self.batch_size_spin.valueChanged.connect(self._snap_batch_size)
@@ -300,7 +453,7 @@ class SettingsPanel(QWidget):
         form.addRow(self._label("Only frames"), self.only_frames_edit)
 
     def _build_batch_group(self) -> None:
-        form = self._group("QUALITY & CHUNKING")
+        form = self._group("QUALITY & CHUNKING")  # always visible — chunk_size = "Quality/chunk"
         self.color_correction_combo = self._combo(
             ["none", "lab", "wavelet", "wavelet_adaptive", "hsv", "adain"],
             "none",
@@ -321,7 +474,7 @@ class SettingsPanel(QWidget):
         form.addRow(self._label("Chunk minutes"), self.chunk_duration_combo)
 
     def _build_vae_group(self) -> None:
-        form = self._group("VAE TILING")
+        form = self._group("VAE TILING", advanced_only=True)
         self.vae_encode_tiled_toggle = self._toggle(True)
         self.vae_encode_tiled_toggle.toggled.connect(self._update_vae_controls)
         self.vae_encode_tile_size_spin = self._spin(128, 4096, 1024, 128)
@@ -340,7 +493,7 @@ class SettingsPanel(QWidget):
         form.addRow(self._label("Decode overlap"), self.vae_decode_tile_overlap_spin)
 
     def _build_quality_group(self) -> None:
-        form = self._group("OFFLOAD & BLOCKSWAP")
+        form = self._group("OFFLOAD & BLOCKSWAP", advanced_only=True)
         self.dit_offload_device_combo = self._combo(["none", "cpu"], "none")
         self.vae_offload_device_combo = self._combo(["none", "cpu"], "cpu")
         self.tensor_offload_device_combo = self._combo(["none", "cpu"], "none")
@@ -354,7 +507,7 @@ class SettingsPanel(QWidget):
         form.addRow(self._label("Swap I/O components"), self.swap_io_components_check)
 
     def _build_device_group(self) -> None:
-        form = self._group("COMPILATION & DEVICES")
+        form = self._group("COMPILATION & DEVICES", advanced_only=True)
         self.compile_dit_check = self._check(False)
         self.compile_vae_check = self._check(False)
         self.compile_backend_combo = self._combo(["inductor", "eager"], "inductor")
@@ -387,6 +540,7 @@ class SettingsPanel(QWidget):
         layout.addWidget(self.vram_value_label)
         layout.addWidget(self.vram_status_label)
         self._layout.addWidget(box)
+        self._advanced_only_widgets.append(box)
 
     def _snap_batch_size(self, value: int) -> None:
         snapped = round((value - 1) / 4) * 4 + 1
@@ -483,7 +637,7 @@ class SettingsPanel(QWidget):
             "resolution_presets": self.resolution_presets_combo.currentText(),
             "max_resolution": self.max_resolution_spin.value(),
             "pre_downscale": self.pre_downscale_combo.currentText(),
-            "dit_model": self.dit_model_combo.currentText(),
+            "dit_model": _filename_for_display(self.dit_model_combo.currentText()),
             "attention_mode": self.attention_mode_combo.currentText(),
             "auto_tune": self.auto_tune_toggle.isChecked(),
             "cache_dit": self.cache_dit_toggle.isChecked(),

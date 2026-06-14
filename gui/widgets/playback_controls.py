@@ -18,6 +18,7 @@ class PlaybackControls(QWidget):
     snapshot_requested = Signal()
     trim_in_requested = Signal()
     trim_out_requested = Signal()
+    trim_clear_requested = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -33,8 +34,10 @@ class PlaybackControls(QWidget):
         self.next_btn = Button3D("⏭", variant="ghost", parent=self)
         self.mute_btn = Button3D("🔊", variant="ghost", parent=self)
         self.snapshot_btn = Button3D("📷", variant="default", parent=self)
-        self.trim_in_btn = Button3D("[", variant="ghost", parent=self)
-        self.trim_out_btn = Button3D("]", variant="ghost", parent=self)
+        self.trim_in_btn = Button3D("[IN]", variant="ghost", parent=self)
+        self.trim_clear_btn = Button3D("✕", variant="ghost", parent=self)
+        self.trim_clear_btn.setToolTip("Clear IN/OUT — reset to full range")
+        self.trim_out_btn = Button3D("[OUT]", variant="ghost", parent=self)
 
         self.play_pause_btn.clicked.connect(self._toggle_play_pause)
         self.prev_btn.clicked.connect(self.prev_frame_requested.emit)
@@ -42,6 +45,7 @@ class PlaybackControls(QWidget):
         self.mute_btn.clicked.connect(self._toggle_mute)
         self.snapshot_btn.clicked.connect(self.snapshot_requested.emit)
         self.trim_in_btn.clicked.connect(self.trim_in_requested.emit)
+        self.trim_clear_btn.clicked.connect(self.trim_clear_requested.emit)
         self.trim_out_btn.clicked.connect(self.trim_out_requested.emit)
 
         for button in (
@@ -51,6 +55,7 @@ class PlaybackControls(QWidget):
             self.mute_btn,
             self.snapshot_btn,
             self.trim_in_btn,
+            self.trim_clear_btn,
             self.trim_out_btn,
         ):
             layout.addWidget(button)

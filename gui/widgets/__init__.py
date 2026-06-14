@@ -17,6 +17,7 @@ from .playback_controls import PlaybackControls
 from .settings_dialog import SettingsDialog
 from .error_dialog import ErrorDialog
 from .log_viewer import LogViewer
+from .split_view import SplitViewWidget
 
 __all__ = [
     "Button3D",
@@ -36,4 +37,5 @@ __all__ = [
     "SettingsDialog",
     "ErrorDialog",
     "LogViewer",
+    "SplitViewWidget",
 ]

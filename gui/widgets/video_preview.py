@@ -1,12 +1,12 @@
-"""Central video / image preview widget backed by ``cv2.VideoCapture``."""
+"""Central video / image preview widget backed by ``cv2.VideoCapture`` with audio via QMediaPlayer."""
 
 from __future__ import annotations
 
 import os
 from typing import Optional
 
-from PySide6.QtCore import Qt, QTimer, Signal, QRectF
-from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
+from PySide6.QtCore import Qt, QTimer, Signal, QRectF, QUrl
+from PySide6.QtGui import QColor, QImage, QPainter, QPixmap, QWheelEvent
 from PySide6.QtWidgets import QWidget
 
 from ..theme import Colors, Dims, Fonts
@@ -20,6 +20,12 @@ try:
     import numpy as np  # type: ignore
 except Exception:  # pragma: no cover
     np = None  # type: ignore
+
+try:
+    from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput  # type: ignore
+    _HAS_MULTIMEDIA = True
+except Exception:  # pragma: no cover
+    _HAS_MULTIMEDIA = False  # type: ignore
 
 
 def _bgr_to_qimage(frame) -> QImage:
@@ -57,13 +63,31 @@ class VideoPreviewWidget(QWidget):
         self._current = 0
         self._path = ""
 
+        # Zoom (1.0 = fit-to-widget, >1.0 = zoomed in)
+        self._zoom = 1.0
+        self._zoom_min = 0.1
+        self._zoom_max = 8.0
+
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._advance)
         self._playing = False
 
+        # Audio via QMediaPlayer (optional)
+        self._media_player: Optional[object] = None
+        self._audio_output: Optional[object] = None
+        if _HAS_MULTIMEDIA:
+            try:
+                self._audio_output = QAudioOutput(self)
+                self._media_player = QMediaPlayer(self)
+                self._media_player.setAudioOutput(self._audio_output)
+            except Exception:
+                self._media_player = None
+                self._audio_output = None
+
     # ---------------------------------------------------------------- load
     def load_file(self, path: str) -> bool:
         self.cleanup()
+        self._zoom = 1.0
         if cv2 is None or not path or not os.path.isfile(path):
             self.update()
             return False
@@ -96,6 +120,12 @@ class VideoPreviewWidget(QWidget):
         self._fps = float(cap.get(cv2.CAP_PROP_FPS)) or 0.0
         self._frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self._frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        # Set up audio player.
+        if self._media_player is not None:
+            try:
+                self._media_player.setSource(QUrl.fromLocalFile(path))
+            except Exception:
+                pass
         self.seek_frame(0)
         return True
 
@@ -127,13 +157,31 @@ class VideoPreviewWidget(QWidget):
         fps = self._fps if self._fps > 0 else 25.0
         self._timer.start(int(1000 / fps))
         self._playing = True
+        # Start audio player synced to current position.
+        if self._media_player is not None:
+            try:
+                pos_ms = int(self._current * 1000 / fps)
+                self._media_player.setPosition(pos_ms)
+                self._media_player.play()
+            except Exception:
+                pass
 
     def pause(self) -> None:
         self._timer.stop()
         self._playing = False
+        if self._media_player is not None:
+            try:
+                self._media_player.pause()
+            except Exception:
+                pass
 
     def stop(self) -> None:
         self.pause()
+        if self._media_player is not None:
+            try:
+                self._media_player.stop()
+            except Exception:
+                pass
         self.seek_frame(0)
 
     def toggle_play(self) -> None:
@@ -172,32 +220,13 @@ class VideoPreviewWidget(QWidget):
             self.update()
 
     # ---------------------------------------------------------------- events
-    def mousePressEvent(self, event) -> None:  # noqa: N802
-        if event.button() == Qt.LeftButton:
-            self.toggle_play()
-        super().mousePressEvent(event)
-
-    def wheelEvent(self, event) -> None:  # noqa: N802
-        if event.angleDelta().y() > 0:
-            self.step_forward()
-        else:
-            self.step_backward()
+    def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802
+        """Zoom in/out on the preview with the mouse wheel."""
+        delta = event.angleDelta().y()
+        factor = 1.15 if delta > 0 else (1.0 / 1.15)
+        self._zoom = max(self._zoom_min, min(self._zoom_max, self._zoom * factor))
+        self.update()
         event.accept()
-
-    def keyPressEvent(self, event) -> None:  # noqa: N802
-        key = event.key()
-        if key == Qt.Key_Space:
-            self.toggle_play()
-        elif key == Qt.Key_Left:
-            self.step_backward()
-        elif key == Qt.Key_Right:
-            self.step_forward()
-        elif key == Qt.Key_Home:
-            self.seek_frame(0)
-        elif key == Qt.Key_End:
-            self.seek_frame(max(0, self._frame_count - 1))
-        else:
-            super().keyPressEvent(event)
 
     # ---------------------------------------------------------------- paint
     def paintEvent(self, event) -> None:  # noqa: N802
@@ -215,9 +244,12 @@ class VideoPreviewWidget(QWidget):
             return
 
         painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
-        scaled = self._pixmap.scaled(
-            self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-        )
+
+        # Fit-to-widget base size, then apply zoom.
+        base = self._pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        zoomed_w = int(base.width() * self._zoom)
+        zoomed_h = int(base.height() * self._zoom)
+        scaled = self._pixmap.scaled(zoomed_w, zoomed_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         x = (self.width() - scaled.width()) // 2
         y = (self.height() - scaled.height()) // 2
         painter.drawPixmap(x, y, scaled)
@@ -236,6 +268,8 @@ class VideoPreviewWidget(QWidget):
             )
         # Resolution (bottom-right).
         res = f"{self._frame_w}×{self._frame_h}"
+        if self._zoom != 1.0:
+            res += f"  {self._zoom:.1f}×"
         painter.drawText(
             QRectF(0, self.height() - 26, self.width() - 12, 18),
             Qt.AlignRight | Qt.AlignBottom,
@@ -254,6 +288,12 @@ class VideoPreviewWidget(QWidget):
 
     def cleanup(self) -> None:
         self.pause()
+        if self._media_player is not None:
+            try:
+                self._media_player.stop()
+                self._media_player.setSource(QUrl())
+            except Exception:
+                pass
         if self._cap is not None:
             try:
                 self._cap.release()
@@ -267,3 +307,4 @@ class VideoPreviewWidget(QWidget):
         self._frame_w = 0
         self._frame_h = 0
         self._current = 0
+        self._zoom = 1.0

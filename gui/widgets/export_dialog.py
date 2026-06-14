@@ -268,6 +268,10 @@ class ExportDialog(QDialog):
         vlay.addLayout(self._profile_row)
 
         # Bitrate mode.
+        self._bitrate_widget = QWidget()
+        br_inner = QVBoxLayout(self._bitrate_widget)
+        br_inner.setContentsMargins(0, 0, 0, 0)
+        br_inner.setSpacing(Dims.PADDING_SM)
         vlay.addWidget(self._section_label("Bitrate"))
         br_row = QHBoxLayout()
         self.br_dynamic_radio = QRadioButton("Dynamic")
@@ -280,7 +284,7 @@ class ExportDialog(QDialog):
         br_row.addWidget(self.br_dynamic_radio)
         br_row.addWidget(self.br_constant_radio)
         br_row.addStretch(1)
-        vlay.addLayout(br_row)
+        br_inner.addLayout(br_row)
 
         # Constant bitrate input.
         self.bitrate_spin = QSpinBox()
@@ -289,7 +293,8 @@ class ExportDialog(QDialog):
         self.bitrate_spin.setSuffix(" Mbps")
         self.bitrate_spin.valueChanged.connect(self._update_summary)
         self._bitrate_row = self._row("Target bitrate", self.bitrate_spin)
-        vlay.addLayout(self._bitrate_row)
+        br_inner.addLayout(self._bitrate_row)
+        vlay.addWidget(self._bitrate_widget)
 
         # Quality level.
         self._quality_label = self._section_label("Quality level")
@@ -430,6 +435,10 @@ class ExportDialog(QDialog):
                 self.profile_combo.setCurrentText("Main")
             elif codec == "H265":
                 self.profile_combo.setCurrentText("Main")
+            elif codec == "ProRes":
+                self.profile_combo.setCurrentText("Standard")
+            elif codec == "DNxHR":
+                self.profile_combo.setCurrentText("SQ")
         self.profile_combo.blockSignals(False)
         self._set_row_visible(self._profile_row, bool(profiles))
 
@@ -442,15 +451,34 @@ class ExportDialog(QDialog):
         self.container_combo.setEnabled(not locked)
         self.container_combo.blockSignals(False)
 
+        # For ProRes and DNxHR: quality is determined solely by the profile preset.
+        # Hide bitrate controls entirely.
+        # For FFV1 and uncompressed QT: hide bitrate and CRF quality.
+        # For everything else: show dynamic/constant bitrate selector.
+        profile_only = codec in ("ProRes", "DNxHR")
+        uncompressed = codec in ("QuickTime V210", "QuickTime R210", "QuickTime Animation")
+        ffv1 = codec == "FFV1"
+        show_bitrate_section = not profile_only and not uncompressed and not ffv1
+        self._bitrate_widget.setVisible(show_bitrate_section)
+
         # Quality labels (depend on codec + hardware).
         self._refresh_quality_labels()
         self._update_summary()
 
     def _refresh_quality_labels(self) -> None:
         codec = self.codec_combo.currentText()
-        # Uncompressed QuickTime codecs hide quality entirely.
+        # ProRes / DNxHR: quality is the profile — no CRF quality row needed.
+        # Uncompressed QT codecs: no quality control at all.
+        # FFV1: shows level as quality.
+        profile_only = codec in ("ProRes", "DNxHR")
         uncompressed = codec in ("QuickTime V210", "QuickTime R210", "QuickTime Animation")
-        show_quality = self.br_dynamic_radio.isChecked() and not uncompressed
+        ffv1 = codec == "FFV1"
+
+        show_quality = (
+            not profile_only
+            and not uncompressed
+            and (ffv1 or self.br_dynamic_radio.isChecked())
+        )
         self._quality_label.setVisible(show_quality)
         self._quality_row_widget.setVisible(show_quality)
 

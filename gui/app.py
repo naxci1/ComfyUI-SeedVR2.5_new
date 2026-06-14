@@ -44,11 +44,18 @@ def _custom_exception_hook(exctype, value, tb):
             f.write(error_msg + "\n")
     except Exception:
         pass
+    # Show OOM-specific advice.
+    oom_hint = ""
+    if "out of memory" in error_msg.lower() or "cuda oom" in error_msg.lower():
+        oom_hint = (
+            "\n\n⚠ Out of Memory suggestions:\n"
+            "• Reduce batch size\n• Enable VAE tiling\n• Enable DiT/VAE offload\n"
+            "• Lower resolution\n• Use a smaller model"
+        )
     app = QApplication.instance()
     if app:
         from gui.widgets.error_dialog import ErrorDialog
-
-        dlg = ErrorDialog(None, "Unhandled Exception", error_msg)
+        dlg = ErrorDialog(None, "Unhandled Exception", error_msg + oom_hint)
         dlg.exec()
 
 
@@ -68,6 +75,7 @@ try:
         ProjectPanel,
         SettingsDialog,
         SettingsPanel,
+        SplitViewWidget,
         Toast,
         ToggleSwitch,
         TrimTimeline,
@@ -94,6 +102,10 @@ except ImportError:  # pragma: no cover - direct-script execution fallback
         VideoPreviewWidget,
     )
     from workers import create_worker_thread, resolve_paths  # type: ignore
+    try:
+        from widgets import SplitViewWidget  # type: ignore
+    except ImportError:
+        SplitViewWidget = None  # type: ignore
 
 APP_NAME = "1-Click SeedVR2.5 (by Naxci1)"
 GITHUB_URL = "https://github.com/naxci1/1Click_SeedVR2.5"
@@ -180,8 +192,11 @@ class MainWindow(QMainWindow):
         self._gpu_name = "CPU"
         self._gpu_vram = "—"
         self._log_viewer: Optional[LogViewer] = None
+        self._preview_mode = "single"
 
         self._build_ui()
+        # Build hidden io_bar for path tracking.
+        self.io_bar = self._build_io_bar()
         self._connect_signals()
         self.input_path_edit.setText(self._config.get("input_path", ""))
         self.output_path_edit.setText(self._config.get("output_path", ""))
@@ -213,15 +228,22 @@ class MainWindow(QMainWindow):
         center_layout.addWidget(self._build_header())
         self.simple_mode_controls = self._build_simple_mode_bar()
         center_layout.addWidget(self.simple_mode_controls)
-        self.io_bar = self._build_io_bar()
-        center_layout.addWidget(self.io_bar)
+
+        # View mode buttons (replaces I/O path bar — fix #9).
+        center_layout.addWidget(self._build_view_mode_bar())
 
         self.center_stack = QStackedWidget(self)
         self.drop_zone = DropZone(self)
         self.preview_widget = VideoPreviewWidget(self)
-        self.center_stack.addWidget(self.drop_zone)
-        self.center_stack.addWidget(self.preview_widget)
+        self.split_view_widget = SplitViewWidget(self)
+        self.center_stack.addWidget(self.drop_zone)       # index 0
+        self.center_stack.addWidget(self.preview_widget)  # index 1
+        self.center_stack.addWidget(self.split_view_widget)  # index 2
         center_layout.addWidget(self.center_stack, 1)
+
+        # Video info bar below preview (fix #14).
+        self.video_info_bar = self._build_video_info_bar()
+        center_layout.addWidget(self.video_info_bar)
 
         self.trim_timeline = TrimTimeline(self)
         center_layout.addWidget(self.trim_timeline)
@@ -294,8 +316,126 @@ class MainWindow(QMainWindow):
         layout.addStretch(1)
         return widget
 
-    def _build_io_bar(self) -> QWidget:
+    def _build_view_mode_bar(self) -> QWidget:
+        """Three view mode buttons: Single View / Split View / Side by Side (fix #9)."""
         widget = QWidget(self)
+        layout = QHBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(Dims.PADDING_SM)
+
+        self.view_single_btn = Button3D("Single View", variant="primary", parent=widget)
+        self.view_split_btn = Button3D("Split View", variant="default", parent=widget)
+        self.view_sidebyside_btn = Button3D("Side by Side", variant="default", parent=widget)
+
+        self.view_single_btn.clicked.connect(lambda: self._set_preview_mode("single"))
+        self.view_split_btn.clicked.connect(lambda: self._set_preview_mode("split"))
+        self.view_sidebyside_btn.clicked.connect(lambda: self._set_preview_mode("sidebyside"))
+
+        layout.addWidget(self.view_single_btn)
+        layout.addWidget(self.view_split_btn)
+        layout.addWidget(self.view_sidebyside_btn)
+        layout.addStretch(1)
+        return widget
+
+    def _build_video_info_bar(self) -> QWidget:
+        """Detailed video info below preview (fix #14)."""
+        widget = QWidget(self)
+        layout = QHBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(Dims.PADDING_MD)
+
+        style = f"color: {Colors.TEXT_SECONDARY}; font-size: {Fonts.SIZE_SMALL}px;"
+        self.info_resolution_lbl = QLabel("—", widget)
+        self.info_fps_lbl = QLabel("—", widget)
+        self.info_duration_lbl = QLabel("—", widget)
+        self.info_frames_lbl = QLabel("—", widget)
+        self.info_filesize_lbl = QLabel("—", widget)
+        for lbl in (
+            self.info_resolution_lbl, self.info_fps_lbl,
+            self.info_duration_lbl, self.info_frames_lbl, self.info_filesize_lbl,
+        ):
+            lbl.setStyleSheet(style)
+            layout.addWidget(lbl)
+        layout.addStretch(1)
+        return widget
+
+    def _update_video_info(self) -> None:
+        """Populate the video info bar from the loaded file."""
+        path = self._current_file
+        w = self.preview_widget.get_frame_width()
+        h = self.preview_widget.get_frame_height()
+        fps = self.preview_widget.get_fps()
+        fc = self.preview_widget.get_frame_count()
+        dur = (fc / fps) if fps > 0 else 0.0
+        hours = int(dur // 3600)
+        mins = int((dur % 3600) // 60)
+        secs = int(dur % 60)
+        dur_str = f"{hours:02d}:{mins:02d}:{secs:02d}" if hours else f"{mins:02d}:{secs:02d}"
+        file_size = ""
+        if path and os.path.isfile(path):
+            sz = os.path.getsize(path)
+            if sz >= 1 << 30:
+                file_size = f"{sz / (1 << 30):.2f} GB"
+            elif sz >= 1 << 20:
+                file_size = f"{sz / (1 << 20):.1f} MB"
+            else:
+                file_size = f"{sz / 1024:.0f} KB"
+        self.info_resolution_lbl.setText(f"{w}×{h}" if w else "—")
+        self.info_fps_lbl.setText(f"{fps:.3f} fps" if fps else "—")
+        self.info_duration_lbl.setText(dur_str if fc else "—")
+        self.info_frames_lbl.setText(f"{fc} frames" if fc else "—")
+        self.info_filesize_lbl.setText(file_size or "—")
+
+    def _set_preview_mode(self, mode: str) -> None:
+        """Switch between Single / Split / Side-by-Side view modes."""
+        self._preview_mode = mode
+        # Update button states.
+        self.view_single_btn.setProperty("variant", "primary" if mode == "single" else "default")
+        self.view_split_btn.setProperty("variant", "primary" if mode == "split" else "default")
+        self.view_sidebyside_btn.setProperty("variant", "primary" if mode == "sidebyside" else "default")
+        for btn in (self.view_single_btn, self.view_split_btn, self.view_sidebyside_btn):
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+
+        if mode == "single":
+            if self._current_file:
+                self.center_stack.setCurrentWidget(self.preview_widget)
+            else:
+                self.center_stack.setCurrentWidget(self.drop_zone)
+        elif mode in ("split", "sidebyside"):
+            self._refresh_comparison_view()
+
+    def _refresh_comparison_view(self) -> None:
+        """Refresh split or side-by-side view with current images."""
+        mode = getattr(self, "_preview_mode", "single")
+        if mode not in ("split", "sidebyside"):
+            return
+        original_path = self._preview_source_frame_path or self._snapshot_fallback_path
+        processed_path = self._last_processed_preview_path
+        if not processed_path:
+            if self._active_output_path and os.path.isfile(self._active_output_path):
+                processed_path = self._active_output_path
+        if not original_path or not processed_path:
+            Toast.show(self, "Need both original and processed frames", "warning")
+            return
+
+        orig = QPixmap(original_path)
+        proc = QPixmap(processed_path)
+        if orig.isNull() or proc.isNull():
+            Toast.show(self, "Could not load comparison images", "warning")
+            return
+
+        if mode == "split":
+            self.split_view_widget.set_images(orig, proc)
+            self.center_stack.setCurrentWidget(self.split_view_widget)
+        else:
+            # Side-by-side: combine into single pixmap.
+            self._show_comparison(original_path, processed_path)
+
+    def _build_io_bar(self) -> QWidget:
+        """Legacy I/O path bar (still built for internal path tracking)."""
+        widget = QWidget(self)
+        widget.setVisible(False)  # Hidden — replaced by view mode buttons.
         layout = QHBoxLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(Dims.PADDING_SM)
@@ -394,6 +534,7 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self) -> None:
         self.project_panel.file_selected.connect(self.load_file)
+        self.project_panel.output_folder_requested.connect(self._on_output_folder_requested)
         self.drop_zone.file_dropped.connect(self._on_file_dropped)
 
         self.trim_timeline.in_point_changed.connect(lambda _=0: self._update_trim_labels())
@@ -408,6 +549,7 @@ class MainWindow(QMainWindow):
         self.playback_controls.snapshot_requested.connect(self._request_preview)
         self.playback_controls.trim_in_requested.connect(self._set_trim_in)
         self.playback_controls.trim_out_requested.connect(self._set_trim_out)
+        self.playback_controls.trim_clear_requested.connect(self._clear_trim)
 
         self.preview_btn.clicked.connect(self._request_preview)
         self.export_btn.clicked.connect(self._on_export_clicked)
@@ -433,10 +575,19 @@ class MainWindow(QMainWindow):
         self.simple_container_combo.currentTextChanged.connect(self._on_simple_container_changed)
         self.simple_auto_tune_toggle.toggled.connect(lambda _=False: self._apply_simple_controls())
 
+    def _clear_trim(self) -> None:
+        """Reset IN/OUT to full range (fix #8 — X clear button)."""
+        self.trim_timeline.set_full_range()
+        self._update_trim_labels()
+
+    def _on_output_folder_requested(self) -> None:
+        pass  # Already handled inside ProjectPanel._on_open_output_folder.
+
     def _apply_view_mode(self, mode: str) -> None:
         advanced = mode == "advanced"
         self.view_toggle_stack.setCurrentIndex(1 if advanced else 0)
         self.settings_panel.setVisible(advanced)
+        self.settings_panel.set_simple_mode(not advanced)
         self.simple_mode_controls.setVisible(not advanced)
 
     def _resolve_output_dir(self) -> Path:
@@ -584,8 +735,11 @@ class MainWindow(QMainWindow):
         self.preview_widget.load_file(path)
         self.trim_timeline.load_video(path)
         self.settings_panel.set_trim_range(0, 0, self.preview_widget.get_frame_count(), False)
-        self.center_stack.setCurrentWidget(self.preview_widget)
+        self._set_preview_mode("single")
         self._update_trim_labels()
+        self._update_video_info()
+        out_dir = self.output_path_edit.text().strip() or str(Path(path).parent)
+        self.project_panel.set_output_dir(out_dir)
         self.status_label.setText(f"Loaded {os.path.basename(path)}")
         self._config["input_path"] = path
         self._config["output_path"] = self.output_path_edit.text().strip()
@@ -908,11 +1062,14 @@ class MainWindow(QMainWindow):
             self._log_viewer.append_line(line)
 
     def _on_progress(self, current: int, total: int) -> None:
+        """Process (current phase) progress — right bar."""
         if total > 0:
             self.progress.setValue(100.0 * current / total)
 
     def _on_batch_progress(self, current: int, total: int) -> None:
+        """Total (phase) progress — left bar."""
         if total > 0:
+            self.progress.setTotalValue(100.0 * current / total)
             self.status_label.setText(f"Batch progress {current}/{total}")
 
     def _on_queue_status(self, file_path: str, current: int, total: int, done: int, remaining: int) -> None:
@@ -993,24 +1150,44 @@ class MainWindow(QMainWindow):
         if not original or not Path(original).exists():
             Toast.show(self, "No source frame available for split view", "warning")
             return
-        self._show_comparison(original, processed)
+        # Use SplitViewWidget for proper draggable split comparison.
+        orig = QPixmap(original)
+        proc = QPixmap(processed)
+        if orig.isNull() or proc.isNull():
+            self._show_comparison(original, processed)
+            return
+        self.split_view_widget.set_images(orig, proc)
+        self.center_stack.setCurrentWidget(self.split_view_widget)
+        self.status_label.setText("Split view: drag divider to compare")
 
     def _on_finished(self, success: bool, message: str) -> None:
         self._set_processing(False)
         self.playback_controls.set_playing(False)
         if success:
             self.progress.setValue(100.0)
+            self.progress.setTotalValue(100.0)
             self._play_success_sound()
             Toast.show(self, "Completed successfully", "success")
             loaded = self._load_preview_outputs()
             if loaded is not None:
                 original = self._preview_source_frame_path or self._snapshot_fallback_path
                 if original and Path(original).exists():
-                    self._show_comparison(original, str(loaded))
+                    # Use split view by default after processing.
+                    self._preview_source_frame_path = original
+                    self._last_processed_preview_path = str(loaded)
+                    self._set_preview_mode("split")
         else:
             Toast.show(self, message or "Processing failed", "error")
             if message and message != "Cancelled.":
-                dlg = ErrorDialog(self, "Processing failed", message)
+                # Add OOM hint if applicable.
+                oom_hint = ""
+                if "out of memory" in message.lower():
+                    oom_hint = (
+                        "\n\n⚠ Recovery suggestions:\n"
+                        "• Reduce batch size\n• Enable VAE tiling\n"
+                        "• Lower resolution\n• Enable offload"
+                    )
+                dlg = ErrorDialog(self, "Processing failed", message + oom_hint)
                 dlg.show()
         if self._thread is not None:
             self._thread.quit()

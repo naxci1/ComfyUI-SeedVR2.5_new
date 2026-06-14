@@ -1,11 +1,11 @@
-"""IN/OUT trim selection timeline with a cv2-extracted thumbnail strip."""
+"""IN/OUT trim selection timeline — scrubber only (no thumbnail strip)."""
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
-from PySide6.QtCore import Qt, Signal, QObject, QThread, QRectF, QPoint
-from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QPolygon
+from PySide6.QtCore import Qt, Signal, QRectF, QPoint
+from PySide6.QtGui import QColor, QPainter, QPen, QPolygon
 from PySide6.QtWidgets import QWidget
 
 from ..theme import Colors, Dims, Fonts
@@ -14,42 +14,6 @@ try:
     import cv2  # type: ignore
 except Exception:  # pragma: no cover
     cv2 = None  # type: ignore
-
-
-class _ThumbnailWorker(QObject):
-    """Extracts one thumbnail every ~2 seconds of video, off the GUI thread."""
-
-    ready = Signal(list)  # list[QImage]
-
-    def __init__(self, path: str, fps: float, frame_count: int, seconds_per_thumb: float) -> None:
-        super().__init__()
-        self._path = path
-        self._fps = fps if fps > 0 else 25.0
-        self._frame_count = frame_count
-        self._seconds_per_thumb = max(0.25, float(seconds_per_thumb))
-
-    def run(self) -> None:
-        thumbs: List[QImage] = []
-        if cv2 is not None and self._frame_count > 0:
-            try:
-                cap = cv2.VideoCapture(self._path)
-                if cap.isOpened():
-                    step = max(1, int(self._fps * self._seconds_per_thumb))
-                    idx = 0
-                    while idx < self._frame_count:
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-                        ok, frame = cap.read()
-                        if not ok:
-                            break
-                        frame = cv2.resize(frame, (80, 45))
-                        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        img = QImage(rgb.data, 80, 45, 3 * 80, QImage.Format_RGB888).copy()
-                        thumbs.append(img)
-                        idx += step
-                cap.release()
-            except Exception:
-                thumbs = []
-        self.ready.emit(thumbs)
 
 
 class TrimTimeline(QWidget):
@@ -74,16 +38,11 @@ class TrimTimeline(QWidget):
         self._out = 0
         self._playhead = 0
         self._path = ""
-        self._seconds_per_thumb = 2.0
-        self._thumbs: List[QImage] = []
         self._drag: Optional[str] = None  # "in" | "out" | "playhead"
-
-        self._thumb_thread: Optional[QThread] = None
-        self._thumb_worker: Optional[_ThumbnailWorker] = None
 
     # ---------------------------------------------------------------- load
     def load_video(self, path: str) -> None:
-        self._thumbs = []
+        self._thumbs_unused = []  # kept for API compat, not used
         self._frame_count = 0
         self._fps = 0.0
         self._path = path or ""
@@ -99,30 +58,6 @@ class TrimTimeline(QWidget):
         self._in = 0
         self._out = max(0, self._frame_count - 1)
         self._playhead = 0
-        self.update()
-        self._start_thumbnails(path)
-
-    def _start_thumbnails(self, path: str) -> None:
-        if cv2 is None or self._frame_count <= 0:
-            return
-        self._stop_thumbnails()
-        self._thumb_thread = QThread()
-        self._thumb_worker = _ThumbnailWorker(path, self._fps, self._frame_count, self._seconds_per_thumb)
-        self._thumb_worker.moveToThread(self._thumb_thread)
-        self._thumb_thread.started.connect(self._thumb_worker.run)
-        self._thumb_worker.ready.connect(self._on_thumbs_ready)
-        self._thumb_worker.ready.connect(self._thumb_thread.quit)
-        self._thumb_thread.start()
-
-    def _stop_thumbnails(self) -> None:
-        if self._thumb_thread is not None:
-            self._thumb_thread.quit()
-            self._thumb_thread.wait(200)
-            self._thumb_thread = None
-            self._thumb_worker = None
-
-    def _on_thumbs_ready(self, thumbs: list) -> None:
-        self._thumbs = thumbs
         self.update()
 
     # ---------------------------------------------------------------- api
@@ -224,18 +159,6 @@ class TrimTimeline(QWidget):
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         self._drag = None
 
-    def wheelEvent(self, event) -> None:  # noqa: N802
-        if self._frame_count <= 0 or not self._path:
-            super().wheelEvent(event)
-            return
-        delta = event.angleDelta().y()
-        if delta > 0:
-            self._seconds_per_thumb = max(0.25, self._seconds_per_thumb * 0.8)
-        elif delta < 0:
-            self._seconds_per_thumb = min(12.0, self._seconds_per_thumb * 1.25)
-        self._start_thumbnails(self._path)
-        event.accept()
-
     # ---------------------------------------------------------------- paint
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)
@@ -245,19 +168,6 @@ class TrimTimeline(QWidget):
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(Colors.SCRUB_TRACK))
         painter.drawRoundedRect(track, 4, 4)
-
-        # Thumbnail strip.
-        if self._thumbs:
-            painter.save()
-            painter.setClipRect(track)
-            tw = track.width() / len(self._thumbs)
-            for i, img in enumerate(self._thumbs):
-                pix = QPixmap.fromImage(img).scaled(
-                    int(tw) + 1, int(track.height()),
-                    Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation,
-                )
-                painter.drawPixmap(int(track.left() + i * tw), int(track.top()), pix)
-            painter.restore()
 
         in_x = self._x_from_frame(self._in)
         out_x = self._x_from_frame(self._out)
@@ -321,4 +231,4 @@ class TrimTimeline(QWidget):
         painter.drawRoundedRect(rect, 3, 3)
 
     def cleanup(self) -> None:
-        self._stop_thumbnails()
+        pass  # Nothing to clean up (no background threads)

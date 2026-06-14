@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from typing import List, Optional
 
 from PySide6.QtCore import Qt, Signal, QObject, QThread, QSize
@@ -77,11 +79,13 @@ class ProjectPanel(QWidget):
     """Project navigator listing imported media with thumbnails."""
 
     file_selected = Signal(str)
+    output_folder_requested = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setFixedWidth(Dims.PANEL_WIDTH_LEFT)
         self._threads: List[QThread] = []
+        self._output_dir: str = ""
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -103,13 +107,20 @@ class ProjectPanel(QWidget):
 
         self._browse = Button3D("＋ Browse Files", variant="default")
         self._browse.clicked.connect(self._on_browse)
+        self._output_btn = Button3D("📁 Output Folder", variant="ghost")
+        self._output_btn.clicked.connect(self._on_open_output_folder)
         wrap = QWidget()
         wrap_layout = QVBoxLayout(wrap)
         wrap_layout.setContentsMargins(Dims.PADDING_SM, Dims.PADDING_SM, Dims.PADDING_SM, Dims.PADDING_SM)
+        wrap_layout.setSpacing(Dims.PADDING_SM)
         wrap_layout.addWidget(self._browse)
+        wrap_layout.addWidget(self._output_btn)
         layout.addWidget(wrap)
 
     # ---------------------------------------------------------------- api
+    def set_output_dir(self, path: str) -> None:
+        self._output_dir = path or ""
+
     def add_file(self, path: str, select: bool = True) -> None:
         # Avoid duplicates.
         for i in range(self._list.count()):
@@ -144,6 +155,19 @@ class ProjectPanel(QWidget):
         thread.finished.connect(lambda t=thread: self._threads.remove(t) if t in self._threads else None)
         self._threads.append(thread)
         thread.start()
+
+    def _on_open_output_folder(self) -> None:
+        folder = self._output_dir or os.getcwd()
+        try:
+            if sys.platform == "win32":
+                os.startfile(folder)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", folder])
+            else:
+                subprocess.Popen(["xdg-open", folder])
+        except Exception:
+            pass
+        self.output_folder_requested.emit()
 
     def _on_item_clicked(self, item: QListWidgetItem) -> None:
         path = item.data(Qt.UserRole)
