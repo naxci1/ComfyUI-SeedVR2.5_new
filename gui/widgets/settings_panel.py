@@ -84,6 +84,10 @@ class SettingsPanel(QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setFixedWidth(max(Dims.PANEL_WIDTH_RIGHT, 280))
+        self._trim_in_frame = 0
+        self._trim_out_frame = 0
+        self._trim_frame_count = 0
+        self._trim_active = False
         self._model_fallback = [
             "seedvr2_ema_3b_fp8_e4m3fn.safetensors",
             "seedvr2_ema_3b_fp16.safetensors",
@@ -130,6 +134,12 @@ class SettingsPanel(QWidget):
         self._update_resolution_mode()
         self._update_vae_controls()
         self.update_vram_estimate()
+
+    def set_trim_range(self, trim_in: int, trim_out: int, frame_count: int, active: bool) -> None:
+        self._trim_in_frame = max(0, int(trim_in))
+        self._trim_out_frame = max(self._trim_in_frame, int(trim_out))
+        self._trim_frame_count = max(0, int(frame_count))
+        self._trim_active = bool(active) and self._trim_frame_count > 0
 
     def _group(self, title: str) -> QFormLayout:
         box = QGroupBox(title, self)
@@ -458,6 +468,11 @@ class SettingsPanel(QWidget):
         return ",".join(values)
 
     def get_all_settings(self) -> Dict[str, Any]:
+        skip_first_frames = 0
+        load_cap = 0
+        if self._trim_active:
+            skip_first_frames = self._trim_in_frame
+            load_cap = max(0, self._trim_out_frame - self._trim_in_frame)
         return {
             "resolution_mode": self.resolution_mode_combo.currentText(),
             "resolution": self.resolution_spin.value(),
@@ -474,8 +489,8 @@ class SettingsPanel(QWidget):
             "debug": self.debug_toggle.isChecked(),
             "uniform_batch_size": self.uniform_batch_toggle.isChecked(),
             "batch_size": self.batch_size_spin.value(),
-            "load_cap": self.load_cap_spin.value(),
-            "skip_first_frames": self.skip_first_frames_spin.value(),
+            "load_cap": load_cap,
+            "skip_first_frames": skip_first_frames,
             "only_frames": self.only_frames_edit.text().strip(),
             "vae_encode_tiled": self.vae_encode_tiled_toggle.isChecked(),
             "vae_encode_tile_size": self.vae_encode_tile_size_spin.value(),

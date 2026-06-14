@@ -403,6 +403,7 @@ class MainWindow(QMainWindow):
         self._current_file = path
         self.preview_widget.load_file(path)
         self.trim_timeline.load_video(path)
+        self.settings_panel.set_trim_range(0, 0, self.preview_widget.get_frame_count(), False)
         self.center_stack.setCurrentWidget(self.preview_widget)
         self._update_trim_labels()
         self.status_label.setText(f"Loaded {os.path.basename(path)}")
@@ -418,6 +419,12 @@ class MainWindow(QMainWindow):
 
     def _update_trim_labels(self) -> None:
         in_frame, out_frame = self.trim_timeline.get_selected_range()
+        self.settings_panel.set_trim_range(
+            in_frame,
+            out_frame,
+            self.preview_widget.get_frame_count(),
+            not self.trim_timeline.is_full_range(),
+        )
         self.in_label.setText(f"IN {self.trim_timeline.frame_to_timecode(in_frame)}")
         self.out_label.setText(f"OUT {self.trim_timeline.frame_to_timecode(out_frame)}")
         count = self.trim_timeline.get_selected_frame_count()
