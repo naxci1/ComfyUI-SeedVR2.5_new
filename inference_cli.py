@@ -73,7 +73,6 @@ if mp.get_start_method(allow_none=True) != 'spawn':
 
 # ── Blackwell / PyTorch performance environment variables ────────────────────
 # Must be injected BEFORE 'import torch' so the CUDA runtime picks them up.
-os.environ.setdefault("PYTORCH_ALLOC_CONF", "backend:cudaMallocAsync")
 os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
 os.environ.setdefault("TORCH_CUDNN_V8_API_ENABLED", "1")
 os.environ.setdefault("CUDA_CACHE_MAXSIZE", "4294967296")
@@ -89,7 +88,8 @@ else:
     # expandable_segments lets the CUDA allocator grow/shrink segment sizes on demand,
     # preventing the VRAM fragmentation that causes OOM during Phase 3 VAE decoding
     # (10.87 GiB allocated, 1.56 GiB reserved-but-unallocated, 1.32 GiB contiguous block missing).
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    # cudaMallocAsync further reduces fragmentation/allocation latency on recent CUDA runtimes.
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,backend:cudaMallocAsync"
 
     # Pre-parse arguments that must be handled before torch import
     _pre_parser = argparse.ArgumentParser(add_help=False)
@@ -241,11 +241,16 @@ class FFMPEGVideoWriter:
                     args += ["-cq", str(crf_val)]
 
                 # CPU-only presets are invalid for NVENC; map them to the closest NVENC preset.
-                # veryslow/slower → p7 (highest quality), veryfast/superfast/ultrafast → p1 (fastest).
+                # veryslow/slower/slow → p7 (highest quality), medium → p5,
+                # fast/faster → p2-p3, veryfast/superfast/ultrafast → p1 (fastest).
                 _CPU_TO_NVENC_PRESET = {
                     "veryslow": "p7",
                     "very slow": "p7",
                     "slower": "p7",
+                    "slow": "p7",
+                    "medium": "p5",
+                    "fast": "p3",
+                    "faster": "p2",
                     "veryfast": "p1",
                     "very fast": "p1",
                     "superfast": "p1",
@@ -260,6 +265,38 @@ class FFMPEGVideoWriter:
 
         return args
     
+    @staticmethod
+    def _detect_best_hw_encoder() -> Optional[List[str]]:
+        """Detect the best available HEVC hardware encoder via ``ffmpeg -encoders``.
+
+        Returns a list of ffmpeg ``-c:v`` + tuning args for the first available
+        hardware encoder (NVENC → QSV → AMF), or ``None`` when no hardware
+        encoder is found so the caller can fall back to software encoding.
+        Never raises: probing failures simply return ``None``.
+        """
+        encoders_to_try = [
+            ("hevc_nvenc", ["-c:v", "hevc_nvenc", "-preset", "p7", "-b:v", "8M",
+                            "-spatial-aq", "1", "-temporal-aq", "1"]),
+            ("hevc_qsv",   ["-c:v", "hevc_qsv", "-preset", "veryslow",
+                            "-global_quality", "18", "-look_ahead", "1"]),
+            ("hevc_amf",   ["-c:v", "hevc_amf", "-quality", "quality",
+                            "-rc", "cqp", "-qp_p", "18"]),
+        ]
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-encoders"],
+                capture_output=True, text=True, timeout=10,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                if sys.platform == "win32" else 0,
+            )
+            available = result.stdout or ""
+            for encoder_name, enc_args in encoders_to_try:
+                if encoder_name in available:
+                    return list(enc_args)
+        except Exception:
+            pass
+        return None  # Will use software encoding fallback
+    
     def __init__(self, path: str, width: int, height: int, fps: float, use_10bit: bool = False,
                  custom_video_args: Optional[List[str]] = None,
                  lut_path: Optional[str] = None):
@@ -267,9 +304,20 @@ class FFMPEGVideoWriter:
             video_enc_args = custom_video_args
         else:
             pix_fmt = 'yuv420p10le' if use_10bit else 'yuv420p'
-            # Dynamic GPU default path (resolution/fps come from width/height/fps args above).
-            bitrate = os.environ.get("SEEDVR2_DEFAULT_BITRATE", "8M")
-            video_enc_args = ['-c:v', 'hevc_nvenc', '-preset', 'p7', '-b:v', bitrate, '-pix_fmt', pix_fmt]
+            hw_args = self._detect_best_hw_encoder()
+            if hw_args is not None:
+                # Allow an explicit bitrate override for NVENC defaults.
+                bitrate = os.environ.get("SEEDVR2_DEFAULT_BITRATE")
+                if bitrate and "-b:v" in hw_args:
+                    b_idx = hw_args.index("-b:v")
+                    if b_idx + 1 < len(hw_args):
+                        hw_args[b_idx + 1] = bitrate
+                video_enc_args = hw_args + ['-pix_fmt', 'p010le' if use_10bit else 'yuv420p']
+            else:
+                # Software fallback when no hardware encoder is available
+                # (AMD/Intel/CPU-only systems without the matching ffmpeg build).
+                video_enc_args = ['-c:v', 'libx265', '-preset', 'slow', '-crf', '18',
+                                  '-pix_fmt', 'yuv420p10le' if use_10bit else 'yuv420p']
         video_enc_args = self._normalize_video_encoder_args(video_enc_args)
         
         filter_args: List[str] = []
@@ -867,20 +915,18 @@ def _apply_lanczos_downscale(frames_tensor: "torch.Tensor", factor: int) -> "tor
     """Downscale a float32 [T, H, W, C] tensor by *factor* using Lanczos filtering.
 
     Uses cv2.INTER_LANCZOS4 on each frame independently.  Returns a new tensor of shape
-    [T, H//factor, W//factor, C] with values still in [0, 1].
+    [T, H//factor, W//factor, C] with values still in [0, 1].  Uses module-level
+    ``cv2``, ``np`` and ``torch`` (no redundant local re-imports).
     """
-    import cv2 as _cv2
     frames_np = (frames_tensor.cpu().numpy() * 255.0).astype("uint8")  # [T,H,W,C]
     T, H, W, C = frames_np.shape
     new_h, new_w = H // factor, W // factor
     out = []
     for frame in frames_np:
-        frame_bgr = _cv2.cvtColor(frame, _cv2.COLOR_RGB2BGR)
-        resized = _cv2.resize(frame_bgr, (new_w, new_h), interpolation=_cv2.INTER_LANCZOS4)
-        out.append(_cv2.cvtColor(resized, _cv2.COLOR_BGR2RGB))
-    import numpy as _np
-    import torch as _torch
-    return _torch.from_numpy(_np.stack(out, axis=0).astype("float32") / 255.0)
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        resized = cv2.resize(frame_bgr, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+        out.append(cv2.cvtColor(resized, cv2.COLOR_BGR2RGB))
+    return torch.from_numpy(np.stack(out, axis=0).astype("float32") / 255.0)
 
 
 def _force_disable_cudagraphs_for_safe_mode(args: "argparse.Namespace", mode_label: str) -> None:
@@ -1000,7 +1046,7 @@ def _apply_oom_mitigation(args: "argparse.Namespace", stage: int) -> str:
         # Keep overlap strictly smaller than the (now smaller) tile.
         args.vae_encode_tile_overlap = min(getattr(args, "vae_encode_tile_overlap", 32), 32)
         args.vae_decode_tile_overlap = min(getattr(args, "vae_decode_tile_overlap", 32), 32)
-        changes.append("reduced tile_size=256")
+        changes.append("reduced tile_size=256 (WARNING: may cause visible seam artifacts)")
 
     elif stage == 4:
         args.batch_size = 45
@@ -1289,6 +1335,7 @@ def process_single_file(input_path: str, args: "argparse.Namespace", device_list
                 video_info = {
                     'video_path': input_path,
                     'start_frame': args.skip_first_frames,
+                    'end_frame': args.skip_first_frames + frames_to_process,
                     'frames_to_process': frames_to_process,
                 }
                 result = _gpu_processing(None, device_list, args, video_info=video_info)
@@ -1629,7 +1676,10 @@ def _strict_batch_flush(*objs: Any) -> None:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             if hasattr(torch.cuda, "ipc_collect"):
-                torch.cuda.ipc_collect()
+                try:
+                    torch.cuda.ipc_collect()
+                except RuntimeError:
+                    pass  # May fail on ROCm or after context destruction
     except Exception:
         pass
 
@@ -1657,7 +1707,10 @@ def _release_phase_memory(phase: str, debug: Optional['Debug'] = None) -> None:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             if hasattr(torch.cuda, "ipc_collect"):
-                torch.cuda.ipc_collect()
+                try:
+                    torch.cuda.ipc_collect()
+                except RuntimeError:
+                    pass  # May fail on ROCm or after context destruction
     except Exception:
         pass
     if debug is not None:
@@ -1737,7 +1790,9 @@ def save_frames_to_video(
             if not writer.isOpened():
                 raise ValueError(f"Cannot create video writer for: {output_path}")
 
-    gc_interval = 1
+    # Periodic (not per-frame) cleanup: forcing gc.collect()/empty_cache() on every
+    # frame adds ~30-50ms overhead per frame (tens of seconds over a long video).
+    gc_interval = 32
 
     for frame_idx in range(T):
         frame_np = (
@@ -1824,11 +1879,19 @@ def save_frames_to_image(
         filename = f"{base_name}_{start_index + idx:0{digits}d}{ext}"
         file_path = os.path.join(output_dir, filename)
         _save_image_bgr(frame, file_path)
-        gc.collect()
-        if frames_tensor.is_cuda:
-            torch.cuda.empty_cache()
+        # Periodic cleanup (every 32 frames) instead of per-frame to avoid
+        # ~30-50ms gc/empty_cache overhead on every single image.
+        if (idx + 1) % 32 == 0:
+            gc.collect()
+            if frames_tensor.is_cuda:
+                torch.cuda.empty_cache()
         if debug.enabled and (idx + 1) % 100 == 0:
             debug.log(f"Saved {idx + 1}/{total} images", category="file")
+
+    # Final cleanup after all frames are written.
+    gc.collect()
+    if frames_tensor.is_cuda:
+        torch.cuda.empty_cache()
 
     debug.log(f"Saved {total} images to '{output_dir}'", category="success")
     return total
@@ -1978,6 +2041,14 @@ def _process_frames_core(
     )
     log_generation_start(gen_info, debug)
     
+    # Inter-phase VRAM release is only worthwhile in streaming/chunked mode, where
+    # many chunks flow through the pipeline and defragmenting between phases keeps
+    # the peak working set bounded. In single-chunk (non-streaming) mode the extra
+    # empty_cache() calls just force VRAM reallocation and slow things down, so we
+    # skip them and rely on the final chunk-cleanup in the ``finally`` block.
+    is_streaming = (getattr(args, "chunk_size", 0) or 0) > 0 or \
+        (getattr(args, "chunk_duration_minutes", 0) or 0) > 0
+
     # 4-phase pipeline (PR #572): each phase runs in isolation and its VRAM is
     # explicitly offloaded/cleared before the next phase begins. The whole block
     # is wrapped in try/finally so that an OOM mid-phase still releases VRAM
@@ -1997,7 +2068,8 @@ def _process_frames_core(
             input_noise_scale=args.input_noise_scale,
             color_correction=args.color_correction
         )
-        _release_phase_memory("Encode", debug)
+        if is_streaming:
+            _release_phase_memory("Encode", debug)
 
         # Phase 2: Upscale
         ctx = upscale_all_batches(
@@ -2006,7 +2078,8 @@ def _process_frames_core(
             latent_noise_scale=args.latent_noise_scale,
             cache_model=cache_dit
         )
-        _release_phase_memory("Upscale", debug)
+        if is_streaming:
+            _release_phase_memory("Upscale", debug)
 
         # Phase 3: Decode
         ctx = decode_all_batches(
@@ -2014,7 +2087,8 @@ def _process_frames_core(
             cache_model=cache_vae,
             only_frames=args.only_frames
         )
-        _release_phase_memory("Decode", debug)
+        if is_streaming:
+            _release_phase_memory("Decode", debug)
 
         # Phase 4: Post-process
         ctx = postprocess_all_batches(
@@ -2024,7 +2098,8 @@ def _process_frames_core(
             temporal_overlap=args.temporal_overlap,
             batch_size=args.batch_size
         )
-        _release_phase_memory("Postprocess", debug)
+        if is_streaming:
+            _release_phase_memory("Postprocess", debug)
 
         result_tensor = ctx['final_video']
     finally:
