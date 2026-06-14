@@ -1647,12 +1647,18 @@ def _emit_gui_queue_status(file_path: str, current: int, total: int) -> None:
     print(f"__SEEDVR2_GUI_STATUS__|{json.dumps(payload, ensure_ascii=False)}", flush=True)
 
 
-def _emit_gui_phase_status(phase_name: str, phase_index: int, phase_total: int = 4) -> None:
+def _emit_gui_phase_status(
+    phase_name: str,
+    phase_index: int,
+    phase_total: int = 4,
+    phase_progress: float = 0.0,
+) -> None:
     """Emit a machine-readable phase update for the GUI worker."""
     payload = {
         "phase_name": phase_name,
         "phase_index": phase_index,
         "phase_total": phase_total,
+        "phase_progress": max(0.0, min(1.0, float(phase_progress))),
     }
     print(f"__SEEDVR2_GUI_PHASE__|{json.dumps(payload, ensure_ascii=False)}", flush=True)
 
@@ -1788,7 +1794,6 @@ def save_frames_to_video(
             )
 
     if writer is None:
-        _emit_gui_phase_status("Encoding", 4)
         debug.log(f"Saving {T} frames to video: {output_path} (backend={effective_backend})", category="file")
         os.makedirs(Path(output_path).parent, exist_ok=True)
         if effective_backend == "opencv":
@@ -2047,8 +2052,6 @@ def _process_frames_core(
     ctx['text_embeds'] = load_text_embeddings(script_directory, ctx['dit_device'], ctx['compute_dtype'], debug)
     debug.log("Loaded text embeddings for DiT", category="dit")
     
-    _emit_gui_phase_status("Pre-processing", 1)
-
     # Compute generation info and log start (handles prepending internally)
     frames_tensor, gen_info = compute_generation_info(
         ctx=ctx,
@@ -2076,53 +2079,71 @@ def _process_frames_core(
     # explicitly offloaded/cleared before the next phase begins. The whole block
     # is wrapped in try/finally so that an OOM mid-phase still releases VRAM
     # before the error propagates to the Auto Tune step-down retry.
+    def _phase_progress_callback(phase_index: int, phase_name: str):
+        def _callback(current: int, total: int, _frames: int, _phase_label: str) -> None:
+            if total <= 0:
+                return
+            _emit_gui_phase_status(
+                phase_name=phase_name,
+                phase_index=phase_index,
+                phase_total=4,
+                phase_progress=float(current) / float(total),
+            )
+        return _callback
+
     try:
-        _emit_gui_phase_status("AI Inference", 2)
         # Phase 1: Encode
+        _emit_gui_phase_status("Encode", 1, phase_progress=0.0)
         ctx = encode_all_batches(
             runner, ctx=ctx, images=frames_tensor,
             debug=debug, 
             batch_size=args.batch_size,
             uniform_batch_size=args.uniform_batch_size,
             seed=args.seed,
-            progress_callback=None, 
+            progress_callback=_phase_progress_callback(1, "Encode"),
             temporal_overlap=args.temporal_overlap,
             resolution=args.resolution,
             max_resolution=args.max_resolution,
             input_noise_scale=args.input_noise_scale,
             color_correction=args.color_correction
         )
+        _emit_gui_phase_status("Encode", 1, phase_progress=1.0)
         if is_streaming:
             _release_phase_memory("Encode", debug)
 
         # Phase 2: Upscale
+        _emit_gui_phase_status("Upscale", 2, phase_progress=0.0)
         ctx = upscale_all_batches(
-            runner, ctx=ctx, debug=debug, progress_callback=None,
+            runner, ctx=ctx, debug=debug, progress_callback=_phase_progress_callback(2, "Upscale"),
             seed=args.seed,
             latent_noise_scale=args.latent_noise_scale,
             cache_model=cache_dit
         )
+        _emit_gui_phase_status("Upscale", 2, phase_progress=1.0)
         if is_streaming:
             _release_phase_memory("Upscale", debug)
 
         # Phase 3: Decode
+        _emit_gui_phase_status("Decode", 3, phase_progress=0.0)
         ctx = decode_all_batches(
-            runner, ctx=ctx, debug=debug, progress_callback=None,
+            runner, ctx=ctx, debug=debug, progress_callback=_phase_progress_callback(3, "Decode"),
             cache_model=cache_vae,
             only_frames=args.only_frames
         )
+        _emit_gui_phase_status("Decode", 3, phase_progress=1.0)
         if is_streaming:
             _release_phase_memory("Decode", debug)
 
-        _emit_gui_phase_status("Post-processing", 3)
         # Phase 4: Post-process
+        _emit_gui_phase_status("Postprocess", 4, phase_progress=0.0)
         ctx = postprocess_all_batches(
-            ctx=ctx, debug=debug, progress_callback=None,
+            ctx=ctx, debug=debug, progress_callback=_phase_progress_callback(4, "Postprocess"),
             color_correction=args.color_correction,
             prepend_frames=0,  # Worker mode handles this in main process
             temporal_overlap=args.temporal_overlap,
             batch_size=args.batch_size
         )
+        _emit_gui_phase_status("Postprocess", 4, phase_progress=1.0)
         if is_streaming:
             _release_phase_memory("Postprocess", debug)
 

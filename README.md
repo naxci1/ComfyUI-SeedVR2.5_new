@@ -1,12 +1,38 @@
 # 1‑Click SeedVR2.5 — GUI Reference Guide
 
-> **Version 1.7 Beta** · A high‑performance AI video restoration GUI built on the ByteDance **SeedVR2** architecture.
+> **Version v.1.8b (2026-06-14)** · A high‑performance AI video restoration GUI built on the ByteDance **SeedVR2** architecture.
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![GitHub](https://img.shields.io/badge/GitHub-naxci1%2F1Click__SeedVR2.5-black)](https://github.com/naxci1/1Click_SeedVR2.5)
 
 > [!NOTE]
 > This document covers the **graphical interface only**. It is a complete, control‑by‑control reference for the desktop app — every checkbox, field, dropdown and button is documented below. Command‑line usage, installation and environment setup are intentionally out of scope here.
+
+---
+
+## v.1.8b Changelog (2026-06-14)
+
+- Dedicated export codec module (`gui/export_encoder.py`) with unified codec→encoder/container mapping.
+- Export pipeline now uses shared encoder mapping for ffmpeg argument generation (legacy conflicting codec paths removed).
+- 4-phase progress pipeline standardized to **Encode / Upscale / Decode / Postprocess** with total+phase progress updates.
+- Preset context menu changed from **Edit** to **Update** (save current settings directly to selected preset).
+- Max Resolution now has an on/off toggle and hides the value field when disabled.
+- Pre-downscale labels updated to **1:1** and **1:2**.
+- Simple/Advanced mode toggle removed; full settings remain visible.
+- Chunk size/chunk duration controls removed from GUI settings.
+- App title/version updated to **1-Click SeedVR2.5 v.1.8b (by Naxci1)**.
+- Project panel header renamed from **PROJECT** to **FILES**.
+- Header controls standardized with Button3D styling (Show Log, Settings, About, GitHub, Update).
+- Export default output path behavior verified for same-directory output when custom path is not set.
+
+## Screenshots (v.1.8b)
+
+- Updated UI screenshots should reflect:
+  - FILES panel label,
+  - always-visible full settings panel,
+  - Max Resolution toggle behavior,
+  - dual 4-phase progress state labels,
+  - updated app title/version text.
 
 ---
 
@@ -21,7 +47,7 @@
 | **Portable `python_embeded` integration** | The GUI launches the upscaling engine through a configurable Python executable (the bundled portable `python_embeded`, or any interpreter you point it at). No global Python install is assumed; paths are resolved through the **Settings** window. |
 | **Multi‑stage pipeline** | A staged DiT → VAE‑decode → encode pipeline with automatic fallbacks (tile throttling, batch step‑down, dynamic‑shape clamps) so heavy jobs degrade gracefully instead of crashing. |
 | **Native preview workflow** | A one‑click **Preview** captures a single frame, upscales it, and drops you straight into a live split‑screen original‑vs‑result comparison — no full render required. |
-| **Simple & Advanced modes** | A clean default surface for quick jobs, with an Advanced toggle that reveals memory, performance, caching and debugging controls. |
+| **Unified settings mode** | Full settings are always visible in v.1.8b (no Simple/Advanced split). |
 | **Container‑aware export** | A two‑step Container → Codec workflow plus a full image‑sequence pipeline (TIFF/PNG/DPX/EXR) for archival masters. |
 | **Broad hardware support** | NVIDIA CUDA, AMD ROCm, Intel XPU and CPU fallback, with single‑ and multi‑GPU inference. |
 
@@ -32,7 +58,7 @@
 This section walks through **every** section of the interface and documents **every individual control** — its purpose, its effect on upscale quality, and its impact on performance/VRAM.
 
 > [!NOTE]
-> Controls marked **[Advanced]** are hidden in Simple Mode and only appear once you toggle **Advanced Mode** in the header bar.
+> In v.1.8b, all controls are visible by default (no Simple/Advanced toggle).
 
 ### 2.0 Header Bar
 
@@ -40,7 +66,7 @@ This section walks through **every** section of the interface and documents **ev
 |---------|------|---------|
 | **About** | Button | Opens the About dialog (version / credits). |
 | **GitHub** | Button | Opens the project page in your browser. |
-| **Simple / Advanced Mode** | Toggle | Switches between the streamlined surface and the full control set. Advanced reveals BlockSwap memory, Performance, Quality Control, Model Cache and Debug groups. |
+| **Update** | Button | Opens the repository releases page for update checks. |
 | **Settings** | Button | Opens **Paths & Configuration** (Python executable, script folder, FFmpeg, models directory). |
 
 ---
@@ -344,6 +370,16 @@ When the preview completes, the dual **QPixmap** comparison engine:
 - **Auto Tune** (replaces "Auto Safeguard"): pre‑flight VRAM detection, forced VAE tile overlap of 32, and automatic batch‑size reduction on OOM (up to 5 retries).
 - **Container‑driven codec selection**: the **Container** dropdown filters the **Video Codec** list to compatible codecs only.
 - **Broader hardware detection**: NVIDIA CUDA, Intel XPU, AMD ROCm and CPU fallback.
+
+---
+
+## Installation & Launch (v.1.8b)
+
+1. Install dependencies from `requirements.txt` and GUI dependencies from `gui/gui_requirements.txt`.
+2. Ensure `ffmpeg` is installed and available in PATH (or configure it in the GUI Settings dialog).
+3. Launch the GUI from repository root:
+   - `python /home/runner/work/ComfyUI-SeedVR2.5_new/ComfyUI-SeedVR2.5_new/naxci1/ComfyUI-SeedVR2.5_new/gui/app.py`
+4. In-app, open **Settings** and confirm Python path, SeedVR2 folder, ffmpeg binary, and models directory.
 
 ---
 

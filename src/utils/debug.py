@@ -166,7 +166,7 @@ class Debug:
         padding = logo_width - len(left_part) - len(right_part) - emoji_compensation
         self.log(f"{left_part}{' ' * max(1, padding)}{right_part}", category="none", force=True, indent_level=1)
         # Branded application title
-        self.log("1-Click SeedVR2.5 (by Naxci1)", category="none", force=True, indent_level=1)
+        self.log("1-Click SeedVR2.5 v.1.8b (by Naxci1)", category="none", force=True, indent_level=1)
         self.log("https://github.com/naxci1/1Click_SeedVR2.5", category="none", force=True, indent_level=1)
         self.log("━" * logo_width, category="none", force=True, indent_level=1)
         self.log("", category="none", force=True)

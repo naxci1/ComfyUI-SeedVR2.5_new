@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from PySide6.QtCore import QObject, QThread, Signal
+from gui.export_encoder import build_ffmpeg_command  # noqa: F401
 
 try:
     import winsound
@@ -96,7 +97,7 @@ class InferenceWorker(QObject):
     progress_update = Signal(int, int)
     batch_progress_update = Signal(int, int)
     queue_status_update = Signal(str, int, int, int, int)
-    phase_update = Signal(str, int, int)
+    phase_update = Signal(str, int, int, float)
     finished = Signal(bool, str)
     started_signal = Signal()
     oom_detected = Signal(int, int, int)
@@ -184,6 +185,7 @@ class InferenceWorker(QObject):
                         str(payload.get("phase_name", "")),
                         int(payload.get("phase_index", 0)),
                         int(payload.get("phase_total", 0)),
+                        float(payload.get("phase_progress", 0.0)),
                     )
                 except Exception:
                     self.log_line.emit(line)

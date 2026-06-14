@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PySide6 application entry-point for 1-Click SeedVR2.5 (by Naxci1)."""
+"""PySide6 application entry-point for 1-Click SeedVR2.5 v.1.8b (by Naxci1)."""
 
 from __future__ import annotations
 
@@ -30,7 +30,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
-    QComboBox,
     QStackedWidget,
     QStatusBar,
     QVBoxLayout,
@@ -64,6 +63,7 @@ sys.excepthook = _custom_exception_hook
 
 try:
     from gui.config_manager import load_config, save_config
+    from gui.export_encoder import build_ffmpeg_command
     from gui.theme import Colors, Dims, Fonts, generate_stylesheet
     from gui.widgets import (
         AnimatedProgressBar,
@@ -78,13 +78,13 @@ try:
         SettingsPanel,
         SplitViewWidget,
         Toast,
-        ToggleSwitch,
         TrimTimeline,
         VideoPreviewWidget,
     )
     from gui.workers import create_worker_thread, resolve_paths
 except ImportError:  # pragma: no cover - direct-script execution fallback
     from config_manager import load_config, save_config  # type: ignore[no-redef]
+    from export_encoder import build_ffmpeg_command  # type: ignore
     from theme import Colors, Dims, Fonts, generate_stylesheet  # type: ignore
     from widgets import (  # type: ignore
         AnimatedProgressBar,
@@ -98,7 +98,6 @@ except ImportError:  # pragma: no cover - direct-script execution fallback
         SettingsDialog,
         SettingsPanel,
         Toast,
-        ToggleSwitch,
         TrimTimeline,
         VideoPreviewWidget,
     )
@@ -108,7 +107,7 @@ except ImportError:  # pragma: no cover - direct-script execution fallback
     except ImportError:
         SplitViewWidget = None  # type: ignore
 
-APP_NAME = "1-Click SeedVR2.5 (by Naxci1)"
+APP_NAME = "1-Click SeedVR2.5 v.1.8b (by Naxci1)"
 GITHUB_URL = "https://github.com/naxci1/1Click_SeedVR2.5"
 
 
@@ -122,7 +121,12 @@ class _HardwareProbe(QObject):
 
             if torch.cuda.is_available():
                 idx = torch.cuda.current_device()
-                name = torch.cuda.get_device_name(idx)
+                detected_name = torch.cuda.get_device_name(idx)
+                lowered = detected_name.lower()
+                if any(token in lowered for token in ("nvidia", "rtx", "geforce", "quadro", "rtx pro")):
+                    name = detected_name
+                else:
+                    name = f"NVIDIA {detected_name}"
                 total = torch.cuda.get_device_properties(idx).total_memory
                 vram = f"{total / (1024 ** 3):.1f} GB"
         except Exception:
@@ -189,8 +193,6 @@ class MainWindow(QMainWindow):
         self._snapshot_fallback_path = ""
         self._preview_source_frame_path = ""
         self._last_processed_preview_path = ""
-        self._simple_container_value = "MP4"
-        self._syncing_simple_controls = False
         self._codec_cache = {"nvenc": False, "qsv": False, "amf": False}
         self._gpu_name = "CPU"
         self._gpu_vram = "—"
@@ -206,7 +208,6 @@ class MainWindow(QMainWindow):
         self.output_path_edit.setText(self._config.get("output_path", ""))
         self._start_hardware_probe()
         self._start_codec_probe()
-        self._apply_view_mode("advanced")
         self._update_status_summary()
 
         self.export_requested.connect(self._spawn_worker)
@@ -230,11 +231,6 @@ class MainWindow(QMainWindow):
         root.addWidget(center, 1)
 
         center_layout.addWidget(self._build_header())
-        self.simple_mode_controls = self._build_simple_mode_bar()
-        center_layout.addWidget(self.simple_mode_controls)
-
-        # View mode buttons (replaces I/O path bar — fix #9).
-        center_layout.addWidget(self._build_view_mode_bar())
 
         self.center_stack = QStackedWidget(self)
         self.drop_zone = DropZone(self)
@@ -261,7 +257,6 @@ class MainWindow(QMainWindow):
 
         self.settings_panel = SettingsPanel(self)
         root.addWidget(self.settings_panel)
-        self._sync_simple_controls_from_settings()
 
         self._build_status_bar()
         self._build_shortcuts()
@@ -277,48 +272,14 @@ class MainWindow(QMainWindow):
         layout.addWidget(title)
 
         layout.addStretch(1)
-        self.view_toggle_stack = QStackedWidget(header)
-        self.view_toggle_stack.addWidget(self._build_view_toggle_page("simple"))
-        self.view_toggle_stack.addWidget(self._build_view_toggle_page("advanced"))
-        layout.addWidget(self.view_toggle_stack)
-
         self.show_log_btn = Button3D("Show Log", variant="ghost", parent=header)
         self.settings_btn = Button3D("Settings", variant="ghost", parent=header)
         self.about_btn = Button3D("About", variant="ghost", parent=header)
         self.github_btn = Button3D("GitHub", variant="ghost", parent=header)
-        for button in (self.show_log_btn, self.settings_btn, self.about_btn, self.github_btn):
+        self.update_btn = Button3D("Update", variant="ghost", parent=header)
+        for button in (self.show_log_btn, self.settings_btn, self.about_btn, self.github_btn, self.update_btn):
             layout.addWidget(button)
         return header
-
-    def _build_simple_mode_bar(self) -> QWidget:
-        widget = QWidget(self)
-        layout = QHBoxLayout(widget)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(Dims.PADDING_SM)
-
-        self.simple_resolution_combo = QComboBox(widget)
-        self.simple_model_combo = QComboBox(widget)
-        self.simple_quality_combo = QComboBox(widget)
-        self.simple_container_combo = QComboBox(widget)
-        self.simple_auto_tune_toggle = ToggleSwitch("", True, widget)
-
-        self.simple_resolution_combo.addItems(list(self._PRESET_TO_RESOLUTION.keys()))
-        self.simple_model_combo.addItems(["3B", "7B"])
-        self.simple_quality_combo.addItems(["Fast", "Balanced", "High Quality"])
-        self.simple_container_combo.addItems(["MP4", "MOV", "MKV", "WEBM"])
-
-        layout.addWidget(QLabel("Resolution", widget))
-        layout.addWidget(self.simple_resolution_combo)
-        layout.addWidget(QLabel("Model", widget))
-        layout.addWidget(self.simple_model_combo)
-        layout.addWidget(QLabel("Quality", widget))
-        layout.addWidget(self.simple_quality_combo)
-        layout.addWidget(QLabel("Container", widget))
-        layout.addWidget(self.simple_container_combo)
-        layout.addWidget(QLabel("Auto Tune", widget))
-        layout.addWidget(self.simple_auto_tune_toggle)
-        layout.addStretch(1)
-        return widget
 
     def _build_view_mode_bar(self) -> QWidget:
         """Three view mode buttons: Single View / Split View / Side by Side (fix #9)."""
@@ -461,21 +422,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.split_btn)
         return widget
 
-    def _build_view_toggle_page(self, selected: str) -> QWidget:
-        widget = QWidget(self)
-        layout = QHBoxLayout(widget)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(Dims.PADDING_XS)
-        simple_variant = "primary" if selected == "simple" else "default"
-        advanced_variant = "primary" if selected == "advanced" else "default"
-        simple_btn = Button3D("Simple", variant=simple_variant, parent=widget)
-        advanced_btn = Button3D("Advanced", variant=advanced_variant, parent=widget)
-        simple_btn.clicked.connect(lambda: self._apply_view_mode("simple"))
-        advanced_btn.clicked.connect(lambda: self._apply_view_mode("advanced"))
-        layout.addWidget(simple_btn)
-        layout.addWidget(advanced_btn)
-        return widget
-
     def _build_trim_bar(self) -> QWidget:
         widget = QWidget(self)
         layout = QHBoxLayout(widget)
@@ -564,9 +510,9 @@ class MainWindow(QMainWindow):
         self.settings_btn.clicked.connect(self._open_settings_dialog)
         self.about_btn.clicked.connect(self._show_about_dialog)
         self.github_btn.clicked.connect(lambda: webbrowser.open(GITHUB_URL))
+        self.update_btn.clicked.connect(lambda: webbrowser.open(f"{GITHUB_URL}/releases"))
 
         self.settings_panel.settings_changed.connect(self._update_status_summary)
-        self.settings_panel.settings_changed.connect(self._sync_simple_controls_from_settings)
 
         self.browse_input_btn.clicked.connect(self._browse_input_path)
         self.browse_output_btn.clicked.connect(self._browse_output_path)
@@ -574,11 +520,6 @@ class MainWindow(QMainWindow):
         self.input_path_edit.editingFinished.connect(self._on_input_path_edited)
         self.output_path_edit.editingFinished.connect(self._on_output_path_edited)
 
-        self.simple_resolution_combo.currentTextChanged.connect(self._apply_simple_controls)
-        self.simple_model_combo.currentTextChanged.connect(self._apply_simple_controls)
-        self.simple_quality_combo.currentTextChanged.connect(self._apply_simple_controls)
-        self.simple_container_combo.currentTextChanged.connect(self._on_simple_container_changed)
-        self.simple_auto_tune_toggle.toggled.connect(lambda _=False: self._apply_simple_controls())
 
     def _clear_trim(self) -> None:
         """Reset IN/OUT to full range (fix #8 — X clear button)."""
@@ -588,116 +529,42 @@ class MainWindow(QMainWindow):
     def _on_output_folder_requested(self) -> None:
         pass  # Already handled inside ProjectPanel._on_open_output_folder.
 
-    def _apply_view_mode(self, mode: str) -> None:
-        advanced = mode == "advanced"
-        self.view_toggle_stack.setCurrentIndex(1 if advanced else 0)
-        self.settings_panel.setVisible(True)
-        self.settings_panel.set_simple_mode(not advanced)
-        self.simple_mode_controls.setVisible(False)
-
-    def _select_video_encoder(self, codec: str) -> tuple[str, str]:
-        if codec == "H264":
-            if self._codec_cache.get("nvenc"):
-                return "h264_nvenc", "NVENC"
-            if self._codec_cache.get("qsv"):
-                return "h264_qsv", "QSV"
-            if self._codec_cache.get("amf"):
-                return "h264_amf", "AMF"
-            return "libx264", "SW"
-        if self._codec_cache.get("nvenc"):
-            return "hevc_nvenc", "NVENC"
-        if self._codec_cache.get("qsv"):
-            return "hevc_qsv", "QSV"
-        if self._codec_cache.get("amf"):
-            return "hevc_amf", "AMF"
-        return "libx265", "SW"
-
     @staticmethod
-    def _quality_level_index(level: str) -> int:
-        return {"Low": 0, "Medium": 1, "High": 2}.get(level, 1)
+    def _normalize_audio_mode(value: str) -> str:
+        text = (value or "").strip().lower()
+        if text in {"none", "no audio"}:
+            return "none"
+        if "copy" in text or "passthrough" in text:
+            return "copy"
+        if "aac" in text:
+            digits = "".join(ch for ch in text if ch.isdigit())
+            return f"aac_{digits}kbps" if digits else "aac_192kbps"
+        if "flac" in text:
+            return "flac"
+        return "copy"
 
     def _build_export_ffmpeg_args(self, export_settings: dict, settings: dict) -> list[str]:
-        codec = str(export_settings.get("codec", "H265"))
-        profile = str(export_settings.get("profile", "")).strip()
-        bitrate_mode = str(export_settings.get("bitrate_mode", "dynamic"))
-        bitrate_mbps = int(export_settings.get("bitrate_mbps", 20))
-        quality_level = str(export_settings.get("quality_level", "Medium"))
-        quality_index = self._quality_level_index(quality_level)
-        use_10bit = bool(settings.get("use_10bit", True))
-
-        args: list[str] = []
-        if codec == "ProRes":
-            profile_map = {
-                "Proxy": "0",
-                "LT": "1",
-                "Standard": "2",
-                "HQ": "3",
-                "4444": "4",
-                "4444 XQ": "5",
-            }
-            args += ["-c:v", "prores_ks", "-profile:v", profile_map.get(profile, "2"), "-pix_fmt", "yuv422p10le", "-vendor", "apl0"]
-        elif codec == "DNxHR":
-            profile_map = {
-                "LB": "dnxhr_lb",
-                "SQ": "dnxhr_sq",
-                "HQ": "dnxhr_hq",
-                "HQX": "dnxhr_hqx",
-                "444": "dnxhr_444",
-            }
-            args += ["-c:v", "dnxhd", "-profile:v", profile_map.get(profile, "dnxhr_sq")]
-        elif codec == "H264":
-            encoder, variant = self._select_video_encoder(codec)
-            profile_map = {"Baseline": "baseline", "Main": "main", "High": "high"}
-            args += ["-c:v", encoder, "-profile:v", profile_map.get(profile, "main"), "-pix_fmt", "yuv420p"]
-            if bitrate_mode == "constant":
-                args += ["-b:v", f"{bitrate_mbps}M"]
-            elif variant == "NVENC":
-                args += ["-cq", str((28, 23, 18)[quality_index])]
-            elif variant == "QSV":
-                args += ["-global_quality", str((28, 23, 18)[quality_index])]
-            elif variant == "AMF":
-                qp = str((28, 23, 18)[quality_index])
-                args += ["-rc", "cqp", "-qp_i", qp, "-qp_p", qp]
-            else:
-                args += ["-crf", str((28, 23, 18)[quality_index])]
-        elif codec == "H265":
-            encoder, variant = self._select_video_encoder(codec)
-            profile_map = {"Main": "main", "Main10": "main10", "Main12": "main12"}
-            pix_fmt = "yuv420p10le" if use_10bit or profile in {"Main10", "Main12"} else "yuv420p"
-            args += ["-c:v", encoder, "-profile:v", profile_map.get(profile, "main"), "-pix_fmt", pix_fmt]
-            if bitrate_mode == "constant":
-                args += ["-b:v", f"{bitrate_mbps}M"]
-            elif variant == "NVENC":
-                args += ["-cq", str((28, 23, 18)[quality_index])]
-            elif variant == "QSV":
-                args += ["-global_quality", str((28, 23, 18)[quality_index])]
-            elif variant == "AMF":
-                qp = str((28, 23, 18)[quality_index])
-                args += ["-rc", "cqp", "-qp_i", qp, "-qp_p", qp]
-            else:
-                args += ["-crf", str((28, 23, 18)[quality_index])]
-        elif codec == "AV1":
-            args += ["-c:v", "libsvtav1", "-pix_fmt", "yuv420p10le" if use_10bit else "yuv420p"]
-            if bitrate_mode == "constant":
-                args += ["-b:v", f"{bitrate_mbps}M"]
-            else:
-                args += ["-crf", str((35, 25, 18)[quality_index])]
-        elif codec == "VP9":
-            args += ["-c:v", "libvpx-vp9", "-pix_fmt", "yuv420p10le" if use_10bit else "yuv420p"]
-            if bitrate_mode == "constant":
-                args += ["-b:v", f"{bitrate_mbps}M"]
-            else:
-                args += ["-crf", str((35, 25, 18)[quality_index])]
-        elif codec == "FFV1":
-            level_map = {"Low": "1", "Medium": "3", "High": "4"}
-            args += ["-c:v", "ffv1", "-level", level_map.get(quality_level, "3")]
-        elif codec == "QuickTime V210":
-            args += ["-c:v", "v210", "-pix_fmt", "yuv422p10le"]
-        elif codec == "QuickTime R210":
-            args += ["-c:v", "r210", "-pix_fmt", "rgb48be"]
-        elif codec == "QuickTime Animation":
-            args += ["-c:v", "qtrle"]
-        return args
+        codec = str(export_settings.get("codec", "H265")).strip()
+        full_cmd = build_ffmpeg_command(
+            input_path=str(self._current_file or ""),
+            output_path=str(export_settings.get("output_path", "")),
+            codec=codec,
+            profile=str(export_settings.get("profile", "")).strip(),
+            quality_level=str(export_settings.get("quality_level", "medium")).lower(),
+            bitrate_mode=str(export_settings.get("bitrate_mode", "dynamic")).lower(),
+            bitrate_mbps=float(export_settings.get("bitrate_mbps", 0) or 0),
+            audio_mode=self._normalize_audio_mode(str(export_settings.get("audio_mode", "copy"))),
+            source_fps=float(export_settings.get("source_fps", self.preview_widget.get_fps() or 30.0)),
+            use_10bit=bool(settings.get("use_10bit", True)),
+            trim_in=int(export_settings.get("trim_in", -1)),
+            trim_out=int(export_settings.get("trim_out", -1)),
+        )
+        # CLI writer accepts only ffmpeg video args (not input/output/audio flags).
+        try:
+            cvidx = full_cmd.index("-c:v")
+        except ValueError:
+            return []
+        return full_cmd[cvidx:-1]
 
     def _on_input_folder_selected(self, folder: str) -> None:
         if not folder or self._processing:
@@ -746,60 +613,6 @@ class MainWindow(QMainWindow):
         raw = self.output_path_edit.text().strip()
         self._config["output_path"] = raw
         save_config(self._config)
-
-    def _sync_simple_controls_from_settings(self) -> None:
-        if self._syncing_simple_controls:
-            return
-        self._syncing_simple_controls = True
-        try:
-            settings = self.settings_panel.get_all_settings()
-            if settings.get("resolution_mode") == "presets":
-                self.simple_resolution_combo.setCurrentText(settings.get("resolution_presets", "720p"))
-            elif settings.get("resolution_mode") == "pixel":
-                resolution = int(settings.get("resolution", 720))
-                nearest = min(self._PRESET_TO_RESOLUTION.items(), key=lambda item: abs(item[1] - resolution))[0]
-                self.simple_resolution_combo.setCurrentText(nearest)
-            model_text = str(settings.get("dit_model", "")).lower()
-            self.simple_model_combo.setCurrentText("7B" if "7b" in model_text else "3B")
-            batch = int(settings.get("batch_size", 81))
-            if batch <= 41:
-                self.simple_quality_combo.setCurrentText("Fast")
-            elif batch >= 121:
-                self.simple_quality_combo.setCurrentText("High Quality")
-            else:
-                self.simple_quality_combo.setCurrentText("Balanced")
-            self.simple_auto_tune_toggle.setChecked(bool(settings.get("auto_tune", True)))
-        finally:
-            self._syncing_simple_controls = False
-
-    def _apply_simple_controls(self) -> None:
-        if self._syncing_simple_controls:
-            return
-        self.settings_panel.resolution_mode_combo.setCurrentText("presets")
-        self.settings_panel.resolution_presets_combo.setCurrentText(self.simple_resolution_combo.currentText())
-        if self.simple_model_combo.currentText() == "7B":
-            for i in range(self.settings_panel.dit_model_combo.count()):
-                text = self.settings_panel.dit_model_combo.itemText(i)
-                if "7b" in text.lower():
-                    self.settings_panel.dit_model_combo.setCurrentIndex(i)
-                    break
-        else:
-            for i in range(self.settings_panel.dit_model_combo.count()):
-                text = self.settings_panel.dit_model_combo.itemText(i)
-                if "3b" in text.lower():
-                    self.settings_panel.dit_model_combo.setCurrentIndex(i)
-                    break
-        quality = self.simple_quality_combo.currentText()
-        if quality == "Fast":
-            self.settings_panel.batch_size_spin.setValue(41)
-        elif quality == "High Quality":
-            self.settings_panel.batch_size_spin.setValue(121)
-        else:
-            self.settings_panel.batch_size_spin.setValue(81)
-        self.settings_panel.auto_tune_toggle.setChecked(self.simple_auto_tune_toggle.isChecked())
-
-    def _on_simple_container_changed(self, value: str) -> None:
-        self._simple_container_value = value or "MP4"
 
     def _start_hardware_probe(self) -> None:
         self._hw_thread = QThread(self)
@@ -937,8 +750,6 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _on_export_confirmed(self, export_settings: dict) -> None:
-        if not export_settings.get("container"):
-            export_settings["container"] = self._simple_container_value
         export_settings["source_fps"] = self.preview_widget.get_fps()
         payload = {
             "mode": "export",
@@ -1025,8 +836,6 @@ class MainWindow(QMainWindow):
         args += ["--latent_noise_scale", f"{float(settings.get('latent_noise_scale', 0.0)):.2f}"]
         args += ["--temporal_overlap", str(int(settings.get("temporal_overlap", 8)))]
         args += ["--prepend_frames", str(int(settings.get("prepend_frames", 4)))]
-        args += ["--chunk_size", str(int(settings.get("chunk_size", 0)))]
-        args += ["--chunk_duration_minutes", str(settings.get("chunk_duration_minutes", "0"))]
         args += ["--dit_offload_device", str(settings.get("dit_offload_device", "none"))]
         args += ["--vae_offload_device", str(settings.get("vae_offload_device", "cpu"))]
         args += ["--tensor_offload_device", str(settings.get("tensor_offload_device", "none"))]
@@ -1206,13 +1015,14 @@ class MainWindow(QMainWindow):
         if total > 0:
             self.progress.setValue(100.0 * current / total)
 
-    def _on_phase_update(self, phase_name: str, current: int, total: int) -> None:
+    def _on_phase_update(self, phase_name: str, current: int, total: int, phase_progress: float = 0.0) -> None:
         if total <= 0 or current <= 0:
             return
         self._current_phase_index = current
-        self.progress.setTotalLabel(phase_name)
-        self.progress.setTotalValue(100.0 * (current - 1) / total)
-        self.progress.setValue(0.0)
+        bounded_phase_progress = max(0.0, min(1.0, float(phase_progress)))
+        self.progress.setTotalLabel(f"{current}/{total} {phase_name}")
+        self.progress.setTotalValue(100.0 * ((current - 1) + bounded_phase_progress) / total)
+        self.progress.setValue(100.0 * bounded_phase_progress)
         self.status_label.setText(phase_name)
 
     def _on_queue_status(self, file_path: str, current: int, total: int, done: int, remaining: int) -> None:

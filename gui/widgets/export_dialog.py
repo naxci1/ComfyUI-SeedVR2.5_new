@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..theme import Colors, Dims, Fonts
+from ..export_encoder import get_export_extension
 from .button3d import Button3D
 
 # ---------------------------------------------------------------------------
@@ -596,7 +597,7 @@ class ExportDialog(QDialog):
 
         is_video = self.type_video_radio.isChecked()
         if is_video:
-            ext = self.container_combo.currentText().lower()
+            ext = get_export_extension(codec, self.container_combo.currentText().lower()).lstrip(".")
             output_path = os.path.join(out_dir, f"{name}.{ext}")
             if os.path.exists(output_path):
                 if QMessageBox.question(

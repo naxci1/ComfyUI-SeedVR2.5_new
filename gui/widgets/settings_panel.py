@@ -241,7 +241,6 @@ class SettingsPanel(QWidget):
         self._trim_out_frame = 0
         self._trim_frame_count = 0
         self._trim_active = False
-        self._simple_mode = False
         self._forms: List[QFormLayout] = []
         self._model_fallback = [
             "seedvr2_ema_3b_fp8_e4m3fn.safetensors",
@@ -291,46 +290,6 @@ class SettingsPanel(QWidget):
         self._update_resolution_mode()
         self._update_vae_controls()
         self._update_vram_prediction()
-
-    # ---------------------------------------------------------------- simple mode
-    def set_simple_mode(self, simple: bool) -> None:
-        """Show only resolution preset + quality chunk controls when simple=True."""
-        self._simple_mode = simple
-        advanced = not simple
-        for widget in self._advanced_only_widgets:
-            widget.setVisible(advanced)
-        self._preset_group_box.setVisible(advanced)
-        self._resolution_group_box.setVisible(True)
-        self._batch_group_box.setVisible(True)
-
-        self._set_field_visible(self.resolution_mode_combo, advanced)
-        self._set_field_visible(self.resolution_spin, advanced and self.resolution_mode_combo.currentText() == "pixel")
-        self._set_field_visible(self.resolution_scale_combo, advanced and self.resolution_mode_combo.currentText() == "xtimes")
-        self._set_field_visible(self.resolution_presets_combo, True)
-        self._set_field_visible(self.max_resolution_spin, advanced)
-        self._set_field_visible(self.pre_downscale_combo, advanced)
-
-        self._set_field_visible(self.color_correction_combo, advanced)
-        self._set_field_visible(self.input_noise_slider, advanced)
-        self._set_field_visible(self.latent_noise_slider, advanced)
-        self._set_field_visible(self.temporal_overlap_spin, advanced)
-        self._set_field_visible(self.prepend_frames_spin, advanced)
-        self._set_field_visible(self.chunk_duration_combo, advanced)
-        self._set_field_visible(self.chunk_size_spin, True)
-
-        if simple:
-            self.resolution_mode_combo.setCurrentText("presets")
-            label = self._batch_form.labelForField(self.chunk_size_spin)
-            if label is not None:
-                label.setText("Quality chunk")
-            res_label = self._resolution_form.labelForField(self.resolution_presets_combo)
-            if res_label is not None:
-                res_label.setText("Resolution")
-        else:
-            label = self._batch_form.labelForField(self.chunk_size_spin)
-            if label is not None:
-                label.setText("Chunk size")
-            self._update_resolution_mode()
 
     def set_trim_range(self, trim_in: int, trim_out: int, frame_count: int, active: bool) -> None:
         self._trim_in_frame = max(0, int(trim_in))
@@ -394,7 +353,7 @@ class SettingsPanel(QWidget):
         self._preset_list.itemDoubleClicked.connect(self._on_load_preset)
         vlay.addWidget(self._preset_list)
 
-        del_lbl = QLabel("(double-click to load • right-click to edit)", box)
+        del_lbl = QLabel("(double-click to load • right-click to update)", box)
         del_lbl.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; font-size: {Fonts.SIZE_TINY}px;")
         vlay.addWidget(del_lbl)
 
@@ -442,14 +401,27 @@ class SettingsPanel(QWidget):
         if item is None:
             return
         menu = QMenu(self)
-        edit_action = menu.addAction("Edit")
+        update_action = menu.addAction("Update")
         rename_action = menu.addAction("Rename")
         delete_action = menu.addAction("Delete")
         action = menu.exec(self._preset_list.viewport().mapToGlobal(pos))
-        if action in (edit_action, rename_action):
+        if action == update_action:
+            self._update_preset(item)
+        elif action == rename_action:
             self._rename_preset(item)
         elif action == delete_action:
             self._delete_preset(item)
+
+    def _update_preset(self, item: QListWidgetItem) -> None:
+        name = str(item.data(Qt.UserRole))
+        if not name:
+            return
+        try:
+            self._presets[name] = self.get_all_settings()
+        except Exception:
+            return
+        self._save_presets_to_disk()
+        self._refresh_preset_list()
 
     def _rename_preset(self, item: QListWidgetItem) -> None:
         current_name = str(item.data(Qt.UserRole))
@@ -595,8 +567,10 @@ class SettingsPanel(QWidget):
         self.resolution_spin = self._spin(128, 7680, 720, 1)
         self.resolution_scale_combo = self._combo(["2", "3", "4", "5"], "2")
         self.resolution_presets_combo = self._combo(list(self._PRESET_RESOLUTIONS.keys()), "720p")
+        self.max_resolution_toggle = self._toggle(True)
+        self.max_resolution_toggle.toggled.connect(self._update_resolution_mode)
         self.max_resolution_spin = self._spin(128, 7680, 3840, 1)
-        self.pre_downscale_combo = self._combo(["1", "2"], "1")
+        self.pre_downscale_combo = self._combo(["1:1", "1:2"], "1:1")
 
         self._resolution_label = self._label("Resolution")
         self._resolution_scale_label = self._label("Scale")
@@ -606,7 +580,8 @@ class SettingsPanel(QWidget):
         form.addRow(self._resolution_label, self.resolution_spin)
         form.addRow(self._resolution_scale_label, self.resolution_scale_combo)
         form.addRow(self._resolution_presets_label, self.resolution_presets_combo)
-        form.addRow(self._label("Max resolution"), self.max_resolution_spin)
+        form.addRow(self._label("Max resolution"), self.max_resolution_toggle)
+        form.addRow(self._label("Max px"), self.max_resolution_spin)
         form.addRow(self._label("Pre-downscale"), self.pre_downscale_combo)
 
     def _build_model_group(self) -> None:
@@ -650,9 +625,7 @@ class SettingsPanel(QWidget):
         form.addRow(self._label("Only frames"), self.only_frames_edit)
 
     def _build_batch_group(self) -> None:
-        form = self._group("QUALITY & CHUNKING")  # always visible — chunk_size = "Quality/chunk"
-        self._batch_form = form
-        self._batch_group_box = form.parentWidget()
+        form = self._group("QUALITY")
         self.color_correction_combo = self._combo(
             ["none", "lab", "wavelet", "wavelet_adaptive", "hsv", "adain"],
             "none",
@@ -661,16 +634,12 @@ class SettingsPanel(QWidget):
         self.latent_noise_slider = self._slider_row(0)
         self.temporal_overlap_spin = self._spin(0, 64, 8)
         self.prepend_frames_spin = self._spin(0, 16, 4)
-        self.chunk_size_spin = self._spin(0, 999999, 0)
-        self.chunk_duration_combo = self._combo([str(index) for index in range(6)], "0")
 
         form.addRow(self._label("Color correction"), self.color_correction_combo)
         form.addRow(self._label("Input noise"), self.input_noise_slider)
         form.addRow(self._label("Latent noise"), self.latent_noise_slider)
         form.addRow(self._label("Temporal overlap"), self.temporal_overlap_spin)
         form.addRow(self._label("Prepend frames"), self.prepend_frames_spin)
-        form.addRow(self._label("Chunk size"), self.chunk_size_spin)
-        form.addRow(self._label("Chunk minutes"), self.chunk_duration_combo)
 
     def _build_vae_group(self) -> None:
         form = self._group("VAE TILING", advanced_only=True)
@@ -752,15 +721,10 @@ class SettingsPanel(QWidget):
 
     def _update_resolution_mode(self) -> None:
         mode = self.resolution_mode_combo.currentText()
-        if self._simple_mode:
-            self._set_field_visible(self.resolution_mode_combo, False)
-            self._set_field_visible(self.resolution_spin, False)
-            self._set_field_visible(self.resolution_scale_combo, False)
-            self._set_field_visible(self.resolution_presets_combo, True)
-        else:
-            self._set_field_visible(self.resolution_spin, mode == "pixel")
-            self._set_field_visible(self.resolution_scale_combo, mode == "xtimes")
-            self._set_field_visible(self.resolution_presets_combo, mode == "presets")
+        self._set_field_visible(self.resolution_spin, mode == "pixel")
+        self._set_field_visible(self.resolution_scale_combo, mode == "xtimes")
+        self._set_field_visible(self.resolution_presets_combo, mode == "presets")
+        self._set_field_visible(self.max_resolution_spin, self.max_resolution_toggle.isChecked())
         self._emit_settings_changed()
 
     def _update_vae_controls(self) -> None:
@@ -837,8 +801,8 @@ class SettingsPanel(QWidget):
             "resolution": self.resolution_spin.value(),
             "resolution_scale": self.resolution_scale_combo.currentText(),
             "resolution_presets": self.resolution_presets_combo.currentText(),
-            "max_resolution": self.max_resolution_spin.value(),
-            "pre_downscale": self.pre_downscale_combo.currentText(),
+            "max_resolution": self.max_resolution_spin.value() if self.max_resolution_toggle.isChecked() else 0,
+            "pre_downscale": "2" if self.pre_downscale_combo.currentText() == "1:2" else "1",
             "dit_model": _filename_for_display(self.dit_model_combo.currentText()),
             "attention_mode": self.attention_mode_combo.currentText(),
             "auto_tune": self.auto_tune_toggle.isChecked(),
@@ -862,8 +826,6 @@ class SettingsPanel(QWidget):
             "latent_noise_scale": self.latent_noise_slider.value() / 100.0,
             "temporal_overlap": self.temporal_overlap_spin.value(),
             "prepend_frames": self.prepend_frames_spin.value(),
-            "chunk_size": self.chunk_size_spin.value(),
-            "chunk_duration_minutes": self.chunk_duration_combo.currentText(),
             "dit_offload_device": self.dit_offload_device_combo.currentText(),
             "vae_offload_device": self.vae_offload_device_combo.currentText(),
             "tensor_offload_device": self.tensor_offload_device_combo.currentText(),

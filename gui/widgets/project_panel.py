@@ -93,7 +93,7 @@ class ProjectPanel(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        header = QLabel("PROJECT")
+        header = QLabel("FILES")
         header.setStyleSheet(
             f"background-color: {Colors.BG_LIGHTER}; color: {Colors.TEXT_ACCENT};"
             f" font-weight: {Fonts.WEIGHT_BOLD}; font-size: {Fonts.SIZE_SMALL}px;"
