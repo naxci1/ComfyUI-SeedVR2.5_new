@@ -989,65 +989,180 @@ def _is_oom_error(err: BaseException) -> bool:
     return "out of memory" in str(err).lower()
 
 
-# Auto Tune OOM fail-safe chain configuration.
-_AUTOTUNE_BATCH_STEP = 4              # batch_size reduction per loop iteration
-_AUTOTUNE_BATCH_REDUCTION_ITERS = 10  # number of batch-reduction iterations
-# 4 fixed stages (1: batch=77/ds=2, 2: tiling, 3: tile=256, 4: batch=45) plus the
-# 10-iteration batch-reduction loop = 14 escalation stages before termination.
-_AUTOTUNE_MAX_STAGES = 4 + _AUTOTUNE_BATCH_REDUCTION_ITERS
+# ── Auto Tune helpers ────────────────────────────────────────────────────────
+
+def get_vram_gb() -> float:
+    """Return free VRAM in GB, or a conservative default (8 GB) if unavailable."""
+    try:
+        if torch.cuda.is_available():
+            free, _total = torch.cuda.mem_get_info()
+            return free / (1024 ** 3)
+    except Exception:
+        pass
+    return 8.0
 
 
-def _apply_oom_mitigation(args: "argparse.Namespace", stage: int) -> str:
-    """Apply the OOM mitigation prescribed for a given escalation *stage*.
+def get_starting_params(vram_gb: float) -> dict:
+    """VRAM-based starting parameters for Auto Tune.
 
-    Implements a fixed 10-step fail-safe chain (see :func:`_run_with_auto_tune`):
-
-      Stage 1  → batch_size=77, pre_downscale=2
-      Stage 2  → enable VAE encode/decode tiling, tile_size=512, tile_overlap=32
-      Stage 3  → reduce tile_size to 256
-      Stage 4  → batch_size=45
-      Stages 5-14 → reduce batch_size by 4 each iteration (45, 41, 37, …)
-
-    Returns a short human-readable summary of the change applied.
+    These are *starting points only*. Target resolution never changes.
     """
-    changes: List[str] = []
+    if vram_gb >= 12:
+        return {"batch_size": 81, "tile_size": 1024}
+    elif vram_gb >= 8:
+        return {"batch_size": 81, "tile_size": 256}
+    else:
+        return {"batch_size": 41, "tile_size": 256}
 
-    if stage == 1:
-        args.batch_size = 77
-        args.pre_downscale = 2
-        changes.append("batch_size=77, pre_downscale=2")
 
-    elif stage == 2:
+class BatchCache:
+    """Cache for VAE-encoded latent batches to avoid re-encoding on OOM retry.
+
+    After each successful VAE encode batch the caller saves the encoded latents
+    here.  On an OOM retry, already-cached batches are reused so processing
+    resumes from the failed batch rather than restarting from scratch.
+    """
+
+    def __init__(self, cache_dir: str) -> None:
+        self.cache_dir = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+
+    def save_batch(self, batch_idx: int, latents) -> None:
+        path = os.path.join(self.cache_dir, f"batch_{batch_idx:04d}.pt")
+        torch.save(latents.cpu(), path)
+
+    def load_batch(self, batch_idx: int):
+        path = os.path.join(self.cache_dir, f"batch_{batch_idx:04d}.pt")
+        if os.path.exists(path):
+            return torch.load(path, map_location="cuda")
+        return None
+
+    def has_batch(self, batch_idx: int) -> bool:
+        return os.path.exists(os.path.join(self.cache_dir, f"batch_{batch_idx:04d}.pt"))
+
+    def cleanup(self) -> None:
+        import shutil
+        if os.path.exists(self.cache_dir):
+            shutil.rmtree(self.cache_dir, ignore_errors=True)
+
+
+# Ordered tile sizes used by the OOM fallback chain.
+_AUTOTUNE_TILE_STEPS = [512, 256]
+# Block-swap escalation steps: (blocks_to_swap, enable_swap_io).
+_AUTOTUNE_SWAP_STEPS = [(16, True), (24, False), (32, False), (36, False)]
+# Batch-size constants.
+_AUTOTUNE_BATCH_MIN = 33      # hard floor — never go below this for video
+_AUTOTUNE_BATCH_STEP = 8      # reduction per OOM step
+
+
+def _build_oom_action_sequence(
+    is_video: bool,
+    starting_batch: int,
+    input_short_side: Optional[int],
+) -> List[tuple]:
+    """Build the ordered list of (action, …) tuples for the OOM fallback chain.
+
+    Video chain (in order):
+      1-2. Tile reduction: 1024→512→256
+      3-6. Block-swap escalation: 0→16(+swap_io)→24→32→36
+      7-N. Batch reduction by 8 each step, floor at 33
+      N+1. pre_downscale=2 (only when input short-side > 480 px)
+      N+2. Final-combo: tile=256, swap=36, swap_io, batch=33 [+pre_downscale if >480p]
+
+    Image chain (batch is always 1, so no batch reduction):
+      1-2. Tile reduction
+      3-6. Block-swap escalation
+      7.   pre_downscale=2
+      8.   Final-combo
+    """
+    seq: List[tuple] = []
+
+    # Tile reduction (shared)
+    for tile_size in _AUTOTUNE_TILE_STEPS:
+        seq.append(("tile", tile_size))
+
+    # Block-swap escalation (shared)
+    for swap_val, do_swap_io in _AUTOTUNE_SWAP_STEPS:
+        seq.append(("swap", swap_val, do_swap_io))
+
+    if is_video:
+        # Batch reduction — reduce from starting_batch by 8 until we hit the floor.
+        batch = starting_batch
+        while batch > _AUTOTUNE_BATCH_MIN:
+            batch = max(_AUTOTUNE_BATCH_MIN, batch - _AUTOTUNE_BATCH_STEP)
+            seq.append(("batch", batch))
+
+        # Pre-downscale only when input resolution warrants it.
+        if input_short_side is not None and input_short_side > 480:
+            seq.append(("pre_downscale", 2, input_short_side))
+
+        # Final combo.
+        seq.append(("final", is_video, input_short_side))
+    else:
+        # Images: no batch reduction (images use batch_size=1 implicitly).
+        seq.append(("pre_downscale", 2, None))  # last-resort for images
+        seq.append(("final", is_video, input_short_side))
+
+    return seq
+
+
+def _apply_oom_action(args: "argparse.Namespace", action: tuple) -> str:
+    """Apply a single OOM mitigation action and return a human-readable summary."""
+    kind = action[0]
+
+    if kind == "tile":
+        tile_size = action[1]
+        prev = getattr(args, "vae_encode_tile_size", 1024)
         args.vae_encode_tiled = True
         args.vae_decode_tiled = True
-        args.vae_encode_tile_size = 512
-        args.vae_decode_tile_size = 512
-        args.vae_encode_tile_overlap = 32
-        args.vae_decode_tile_overlap = 32
-        changes.append("enabled VAE tiling (tile_size=512, tile_overlap=32)")
+        args.vae_encode_tile_size = tile_size
+        args.vae_decode_tile_size = tile_size
+        args.vae_encode_tile_overlap = min(getattr(args, "vae_encode_tile_overlap", 128), 32)
+        args.vae_decode_tile_overlap = min(getattr(args, "vae_decode_tile_overlap", 128), 32)
+        return f"tile {prev}→{tile_size}, retrying..."
 
-    elif stage == 3:
+    elif kind == "swap":
+        swap_val, do_swap_io = action[1], action[2]
+        prev = getattr(args, "blocks_to_swap", 0)
+        args.blocks_to_swap = swap_val
+        if do_swap_io:
+            args.swap_io_components = True
+        extra = " + swap_io ON" if do_swap_io else ""
+        return f"swap {prev}→{swap_val}{extra}, retrying..."
+
+    elif kind == "batch":
+        new_batch = action[1]
+        prev = getattr(args, "batch_size", 81)
+        args.batch_size = new_batch
+        return f"batch {prev}→{new_batch}, retrying..."
+
+    elif kind == "pre_downscale":
+        factor = action[1]
+        short = action[2]
+        args.pre_downscale = factor
+        ctx = f" (input {short}px > 480p)" if short and short > 480 else ""
+        return f"pre_downscale={factor}{ctx}, retrying..."
+
+    elif kind == "final":
+        is_vid = action[1]
+        short = action[2]
+        args.vae_encode_tiled = True
+        args.vae_decode_tiled = True
         args.vae_encode_tile_size = 256
         args.vae_decode_tile_size = 256
-        # Keep overlap strictly smaller than the (now smaller) tile.
-        args.vae_encode_tile_overlap = min(getattr(args, "vae_encode_tile_overlap", 32), 32)
-        args.vae_decode_tile_overlap = min(getattr(args, "vae_decode_tile_overlap", 32), 32)
-        changes.append("reduced tile_size=256 (WARNING: may cause visible seam artifacts)")
+        args.vae_encode_tile_overlap = 32
+        args.vae_decode_tile_overlap = 32
+        args.blocks_to_swap = 36
+        args.swap_io_components = True
+        if is_vid:
+            args.batch_size = _AUTOTUNE_BATCH_MIN
+        msg = f"final fallback: tile=256 swap=36 swap_io batch={'33' if is_vid else '1'}"
+        if short and short > 480:
+            args.pre_downscale = 2
+            msg += " pre_downscale=2"
+        return f"Auto Tune: {msg}"
 
-    elif stage == 4:
-        args.batch_size = 45
-        changes.append("batch_size=45")
-
-    else:
-        # Stages 5..14: ten iterations stepping batch_size down by 4 each time.
-        iteration = stage - 4
-        args.batch_size = max(1, args.batch_size - _AUTOTUNE_BATCH_STEP)
-        changes.append(
-            f"batch_size→{args.batch_size} "
-            f"(reduction {iteration}/{_AUTOTUNE_BATCH_REDUCTION_ITERS})"
-        )
-
-    return ", ".join(changes) if changes else "no further mitigations available"
+    return "no-op"
 
 
 def _probe_input_short_side(input_path: str) -> Optional[int]:
@@ -1079,29 +1194,12 @@ def _probe_input_short_side(input_path: str) -> Optional[int]:
 
 
 def _autotune_precheck(args: "argparse.Namespace", input_path: str) -> None:
-    """Auto Tune pre-check: set ``pre_downscale`` from the input resolution.
+    """Auto Tune pre-check (no-op).
 
-    Runs once per input (before the retry loop) when Auto Tune is enabled:
-      * input short side > 480p  → force ``pre_downscale = 2``
-      * input short side <= 480p → force ``pre_downscale = 1``
+    Pre-downscale is now applied *only* as a last-resort fallback inside the
+    OOM retry chain, never upfront.  This function is kept for call-site
+    compatibility.
     """
-    if not getattr(args, "auto_tune", False):
-        return
-    short_side = _probe_input_short_side(input_path)
-    if short_side is None:
-        return
-    if short_side > 480:
-        args.pre_downscale = 2
-        debug.log(
-            f"Auto Tune pre-check: input short side {short_side}px > 480p → pre_downscale=2",
-            category="setup", force=True,
-        )
-    else:
-        args.pre_downscale = 1
-        debug.log(
-            f"Auto Tune pre-check: input short side {short_side}px <= 480p → pre_downscale=1",
-            category="setup", force=True,
-        )
 
 
 def _halve_chunk_size_on_oom(args: "argparse.Namespace") -> Optional[str]:
@@ -1130,58 +1228,112 @@ def _halve_chunk_size_on_oom(args: "argparse.Namespace") -> Optional[str]:
     return f"chunk_size {current}→{new_size}"
 
 
-def _run_with_auto_tune(process_fn, args: "argparse.Namespace",
-                        on_success=None) -> int:
+def _run_with_auto_tune(
+    process_fn,
+    args: "argparse.Namespace",
+    input_path: str = "",
+    on_success=None,
+) -> int:
     """Run ``process_fn`` and, when Auto Tune is on, retry through CUDA OOM.
 
-    On every CUDA out-of-memory error the allocator caches are flushed and the
-    next stage of a fixed 10-step fail-safe chain is applied (see
-    :func:`_apply_oom_mitigation`):
+    On the *first* call, VRAM-based starting parameters are applied
+    (batch_size and tile_size).  On every subsequent CUDA OOM the allocator
+    caches are flushed and the next action in the fallback chain is applied:
 
-        1. batch_size=77, pre_downscale=2
-        2. enable VAE tiling (tile_size=512, tile_overlap=32)
-        3. reduce tile_size to 256
-        4. batch_size=45
-        5-14. reduce batch_size by 4 each iteration (10 iterations)
+    Video chain:
+      1-2.   Tile reduction: 1024→512→256
+      3-6.   Block-swap escalation: 0→16(+swap_io)→24→32→36
+      7-N.   Batch reduction by 8 per step, floor at 33 (never goes below)
+      N+1.   pre_downscale=2 (only when input short-side > 480 px)
+      N+2.   Final combo: tile=256 + swap=36 + swap_io + batch=33 [+pre_ds if >480p]
 
-    If OOM persists after the 10th batch-reduction iteration the process is
-    terminated with a CRITICAL MEMORY ERROR message. Non-OOM errors, or OOMs when
-    Auto Tune is disabled, propagate unchanged.
+    Image chain (batch is always 1):
+      1-2.   Tile reduction
+      3-6.   Block-swap escalation
+      7.     pre_downscale=2
+      8.     Final combo
+
+    Non-OOM errors, or OOMs when Auto Tune is disabled, propagate unchanged.
+    A BatchCache instance is attached to ``args._batch_cache`` for use by the
+    VAE encode pipeline to avoid re-encoding already-cached batches on retry.
     """
-    stage = 0
+    auto_tune = getattr(args, "auto_tune", False)
+
+    if auto_tune:
+        # Apply VRAM-based starting parameters.
+        vram_gb = get_vram_gb()
+        params = get_starting_params(vram_gb)
+        args.batch_size = params["batch_size"]
+        tile_size = params["tile_size"]
+        if tile_size < 1024:
+            args.vae_encode_tiled = True
+            args.vae_decode_tiled = True
+            args.vae_encode_tile_size = tile_size
+            args.vae_decode_tile_size = tile_size
+        debug.log(
+            f"Auto Tune: free VRAM {vram_gb:.1f} GB → starting batch={params['batch_size']}"
+            f" tile={tile_size}",
+            category="setup", force=True,
+        )
+
+        # Probe input resolution once for pre_downscale decisions.
+        input_short_side = _probe_input_short_side(input_path) if input_path else None
+        input_type = get_input_type(input_path) if input_path else "video"
+        is_video = input_type == "video"
+
+        # Build the ordered action sequence.
+        oom_actions = _build_oom_action_sequence(is_video, args.batch_size, input_short_side)
+
+        # Attach a BatchCache so the VAE encode loop can resume from failed batch.
+        cache_dir = os.path.join(
+            getattr(args, "output", "") or ".", ".seedvr2_cache",
+            f"run_{int(time.time())}"
+        )
+        batch_cache = BatchCache(cache_dir)
+        args._batch_cache = batch_cache
+    else:
+        oom_actions = []
+        batch_cache = None
+
+    action_idx = 0
     while True:
         try:
-            frames = process_fn()
+            result = process_fn()
             if on_success is not None:
                 on_success()
-            return frames
+            if batch_cache is not None:
+                batch_cache.cleanup()
+            return result
         except (torch.cuda.OutOfMemoryError, RuntimeError) as err:
-            if not getattr(args, "auto_tune", False) or not _is_oom_error(err):
+            if not auto_tune or not _is_oom_error(err):
+                if batch_cache is not None:
+                    batch_cache.cleanup()
                 raise
-            if stage >= _AUTOTUNE_MAX_STAGES:
-                # Fail-safe chain exhausted: capture state and terminate.
+            if action_idx >= len(oom_actions):
                 _log_crash_diagnostics()
                 debug.log(
-                    "CRITICAL MEMORY ERROR: Unable to fit model in VRAM even with minimal settings.",
+                    "CRITICAL MEMORY ERROR: Unable to fit model in VRAM even with"
+                    " minimal settings.",
                     level="ERROR", category="generation", force=True,
                 )
+                if batch_cache is not None:
+                    batch_cache.cleanup()
                 sys.exit(1)
-            stage += 1
+
+            debug.log("Auto Tune: OOM detected", category="setup", force=True)
             if hasattr(torch, "cuda"):
                 torch.cuda.empty_cache()
             gc.collect()
-            # Dynamic step-down chunking: halve the streaming chunk size (when
-            # active) on every OOM so the retry re-reads the video in smaller,
-            # memory-bounded chunks and resumes the phase.
+
+            # Dynamic step-down chunking on every OOM (kept from previous logic).
             chunk_summary = _halve_chunk_size_on_oom(args)
-            summary = _apply_oom_mitigation(args, stage)
+
+            action = oom_actions[action_idx]
+            action_idx += 1
+            summary = _apply_oom_action(args, action)
             if chunk_summary:
-                summary = f"{chunk_summary}, {summary}"
-            debug.log(
-                f"Auto Tune: CUDA OOM caught — escalating fail-safe stage "
-                f"{stage}/{_AUTOTUNE_MAX_STAGES} ({summary})",
-                category="setup", force=True,
-            )
+                summary = f"{chunk_summary}; {summary}"
+            debug.log(f"Auto Tune: {summary}", category="setup", force=True)
 
 
 def process_single_file(input_path: str, args: "argparse.Namespace", device_list: "List[str]",
@@ -2942,6 +3094,7 @@ def main() -> None:
                         format_auto_detected=format_auto_detected,
                         runner_cache=runner_cache),
                     args,
+                    input_path=file_path,
                     on_success=_release_post_file_resources,
                 )
                 processing_entries[Path(file_path).name] = "done"
@@ -3003,6 +3156,7 @@ def main() -> None:
                     format_auto_detected=format_auto_detected,
                     runner_cache=runner_cache),
                 args,
+                input_path=args.input,
             )
 
         else:

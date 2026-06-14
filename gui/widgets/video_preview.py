@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from typing import Optional
 
 from PySide6.QtCore import Qt, QTimer, Signal, QRectF, QUrl
@@ -26,6 +28,45 @@ try:
     _HAS_MULTIMEDIA = True
 except Exception:  # pragma: no cover
     _HAS_MULTIMEDIA = False  # type: ignore
+
+
+# ── MPV detection ─────────────────────────────────────────────────────────────
+
+def _find_mpv_exe() -> Optional[str]:
+    """Return the path to mpv.exe if available in the app directory or on PATH.
+
+    Search order:
+      1. Directory containing this module's package root (app install dir).
+      2. The running executable's directory (bundled exe scenario).
+      3. System PATH via ``shutil.which``.
+    """
+    import shutil
+
+    candidates = []
+    # App / package root
+    try:
+        pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        candidates.append(os.path.join(pkg_dir, "mpv.exe"))
+        candidates.append(os.path.join(pkg_dir, "mpv"))
+    except Exception:
+        pass
+    # Running executable directory (pyinstaller bundle)
+    try:
+        exe_dir = os.path.dirname(sys.executable)
+        candidates.append(os.path.join(exe_dir, "mpv.exe"))
+        candidates.append(os.path.join(exe_dir, "mpv"))
+    except Exception:
+        pass
+
+    for path in candidates:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+
+    # Fall back to PATH
+    return shutil.which("mpv")
+
+
+_MPV_EXE: Optional[str] = _find_mpv_exe()
 
 
 def _bgr_to_qimage(frame) -> QImage:
@@ -212,9 +253,18 @@ class VideoPreviewWidget(QWidget):
         if self._cap is None or self._frame_count <= 0:
             return
         idx = max(0, min(idx, self._frame_count - 1))
+        # Primary seek: set position and read.
         self._cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ok, frame = self._cap.read()
-        if ok:
+        if not ok or frame is None:
+            # Fallback: re-open the capture and seek again (handles stuck decoders).
+            if self._path:
+                self._cap.release()
+                self._cap = cv2.VideoCapture(self._path)
+                if self._cap.isOpened():
+                    self._cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                    ok, frame = self._cap.read()
+        if ok and frame is not None:
             self._pixmap = QPixmap.fromImage(_bgr_to_qimage(frame))
             self._current = idx
             self.frame_changed.emit(idx)
@@ -292,6 +342,38 @@ class VideoPreviewWidget(QWidget):
         self.stop()
         self._pixmap = None
         self.update()
+
+    # ---------------------------------------------------------------- mpv
+    @staticmethod
+    def has_mpv() -> bool:
+        """Return True when an mpv executable was found at startup."""
+        return _MPV_EXE is not None
+
+    def open_in_mpv(self) -> bool:
+        """Open the currently loaded file in mpv for full-featured playback.
+
+        Uses mpv.exe found in the app directory (preferred) or on PATH.
+        Returns True when mpv was launched successfully.
+        """
+        if not self._path or not os.path.isfile(self._path):
+            return False
+        if _MPV_EXE is None:
+            return False
+        try:
+            # Start mpv detached so it doesn't block the GUI.
+            subprocess.Popen(
+                [_MPV_EXE, self._path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=(
+                    subprocess.DETACHED_PROCESS
+                    if sys.platform == "win32"
+                    else 0
+                ),
+            )
+            return True
+        except Exception:
+            return False
 
     def cleanup(self) -> None:
         self.pause()
