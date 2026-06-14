@@ -18,6 +18,20 @@ import platform
 import sys
 from typing import Optional
 
+# ---------------------------------------------------------------------------
+# Runtime sys.path bootstrap
+# ---------------------------------------------------------------------------
+# When frozen into an executable (PyInstaller / cx_Freeze) the import system
+# may not know about the ``gui`` package or its sibling modules (``theme`` …).
+# Explicitly add this script's own directory and its parent (the project root)
+# to ``sys.path`` so ``import gui.app`` and the legacy ``import theme`` both
+# resolve regardless of how the executable is launched.
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+_APP_ROOT = os.path.dirname(_APP_DIR)
+for _p in (_APP_ROOT, _APP_DIR):
+    if os.path.isdir(_p) and _p not in sys.path:
+        sys.path.insert(0, _p)
+
 from PySide6.QtCore import Qt, QThread, QObject, Signal, QTimer
 from PySide6.QtWidgets import (
     QApplication,
