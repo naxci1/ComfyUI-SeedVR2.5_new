@@ -124,18 +124,6 @@ def _sync_temp_dir_from_config(config: Optional[dict] = None) -> str:
     os.makedirs(temp_dir, exist_ok=True)
     return temp_dir
 
-try:
-    import psutil  # type: ignore
-except Exception:  # pragma: no cover
-    psutil = None  # type: ignore
-
-try:
-    import pynvml  # type: ignore
-    pynvml.nvmlInit()
-    _HAS_NVML = True
-except Exception:  # pragma: no cover
-    pynvml = None  # type: ignore
-    _HAS_NVML = False
 
 
 class _HardwareProbe(QObject):
@@ -235,10 +223,6 @@ class MainWindow(QMainWindow):
         self._batch_current = 0
         self._batch_total = 0
         self._phase_name = "idle"
-        self._device_timer = QTimer(self)
-        self._device_timer.setInterval(1500)
-        self._device_timer.timeout.connect(self._update_device_info)
-
         self._build_ui()
         self._connect_signals()
         self.input_path_edit.setText(self._config.get("input_path", ""))
@@ -246,8 +230,6 @@ class MainWindow(QMainWindow):
         self._start_hardware_probe()
         self._start_codec_probe()
         self._update_status_summary()
-        self._device_timer.start()
-        self._update_device_info()
 
         self.export_requested.connect(self._spawn_worker)
         self.preview_requested.connect(self._spawn_preview)
@@ -744,15 +726,6 @@ class MainWindow(QMainWindow):
         self._gpu_vram = vram
         self.gpu_label.setText(f"GPU: {name}")
         self.vram_label.setText(f"VRAM: {vram}")
-        self.settings_panel.set_device_info_lines([
-            f"GPU: {name}",
-            "GPU Load: —  |  —°C",
-            f"VRAM: — / {vram}" if vram and vram != "—" else "VRAM: — / —",
-            "Shared VRAM: — / —",
-            "CPU: —  |  —°C",
-            "RAM: — / —",
-            "Temp: CPU —°C | GPU —°C",
-        ])
 
     def _on_codec_detected(self, result: dict) -> None:
         self._codec_cache = result
@@ -768,92 +741,6 @@ class MainWindow(QMainWindow):
             f"Auto Tune {'On' if settings['auto_tune'] else 'Off'}"
         )
         self.settings_summary_label.setText(summary)
-
-    def _update_device_info(self) -> None:
-        cpu_pct = 0.0
-        cpu_temp = None
-        ram_used_gb = 0.0
-        ram_total_gb = 0.0
-        ram_pct = 0.0
-        if psutil is not None:
-            try:
-                cpu_pct = float(psutil.cpu_percent(interval=None))
-                vm = psutil.virtual_memory()
-                ram_used_gb = float(vm.used) / (1024 ** 3)
-                ram_total_gb = float(vm.total) / (1024 ** 3)
-                ram_pct = float(vm.percent)
-                temps = psutil.sensors_temperatures() if hasattr(psutil, "sensors_temperatures") else {}
-                if temps:
-                    for entries in temps.values():
-                        if entries:
-                            cpu_temp = getattr(entries[0], "current", None)
-                            if cpu_temp is not None:
-                                break
-            except Exception:
-                pass
-
-        gpu_name = self._gpu_name
-        gpu_util = None
-        gpu_temp = None
-        vram_used_gb = None
-        vram_total_gb = None
-        vram_shared_used_gb = None
-        vram_shared_total_gb = None
-        if _HAS_NVML and pynvml is not None:
-            try:
-                handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-                gpu_name = pynvml.nvmlDeviceGetName(handle)
-                if isinstance(gpu_name, bytes):
-                    gpu_name = gpu_name.decode("utf-8", errors="replace")
-                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-                gpu_util = float(util.gpu)
-                gpu_temp = float(pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU))
-                mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                vram_used_gb = float(mem.used) / (1024 ** 3)
-                vram_total_gb = float(mem.total) / (1024 ** 3)
-                try:
-                    mem2 = pynvml.nvmlDeviceGetMemoryInfo_v2(handle)
-                    reserved = float(getattr(mem2, "reserved", 0.0))
-                    vram_shared_used_gb = reserved / (1024 ** 3)
-                    vram_shared_total_gb = max(0.0, (vram_total_gb or 0.0) - (vram_used_gb or 0.0))
-                except Exception:
-                    pass
-            except Exception:
-                pass
-
-        gpu_line = (
-            f"GPU Load: {gpu_util:.0f}%  |  {gpu_temp:.0f}°C"
-            if gpu_util is not None and gpu_temp is not None
-            else "GPU Load: —  |  —°C"
-        )
-        if vram_used_gb is not None and vram_total_gb and vram_total_gb > 0:
-            vram_pct = (vram_used_gb / vram_total_gb) * 100.0
-            vram_line = f"VRAM: {vram_used_gb:.1f} / {vram_total_gb:.1f} GB ({vram_pct:.0f}%)"
-        else:
-            vram_line = f"VRAM: — / {self._gpu_vram}" if self._gpu_vram and self._gpu_vram != "—" else "VRAM: — / —"
-        if vram_shared_used_gb is not None and vram_shared_total_gb is not None:
-            shared_line = f"Shared VRAM: {vram_shared_used_gb:.1f} / {vram_shared_total_gb:.1f} GB"
-        else:
-            shared_line = "Shared VRAM: — / —"
-        cpu_line = f"CPU: {cpu_pct:.0f}%  |  {cpu_temp:.0f}°C" if cpu_temp is not None else f"CPU: {cpu_pct:.0f}%  |  —°C"
-        if ram_total_gb > 0:
-            ram_line = f"RAM: {ram_used_gb:.1f} / {ram_total_gb:.1f} GB ({ram_pct:.0f}%)"
-        else:
-            ram_line = "RAM: — / —"
-        temp_line = (
-            f"Temp: CPU {cpu_temp:.0f}°C | GPU {gpu_temp:.0f}°C"
-            if cpu_temp is not None and gpu_temp is not None
-            else "Temp: CPU —°C | GPU —°C"
-        )
-        self.settings_panel.set_device_info_lines([
-            f"GPU: {gpu_name}",
-            gpu_line,
-            vram_line,
-            shared_line,
-            cpu_line,
-            ram_line,
-            temp_line,
-        ])
 
     def _on_file_dropped(self, path: str) -> None:
         self.project_panel.add_file(path)

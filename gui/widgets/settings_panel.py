@@ -34,7 +34,6 @@ from PySide6.QtWidgets import (
 
 from ..theme import Colors, Dims, Fonts
 from .button3d import Button3D
-from .device_info import DeviceInfoPanel
 from .toggle_switch import ToggleSwitch
 
 try:
@@ -283,6 +282,8 @@ class SettingsPanel(QWidget):
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setFrameShape(QFrame.NoFrame)
         outer.addWidget(scroll)
 
         body = QWidget()
@@ -1139,9 +1140,7 @@ class SettingsPanel(QWidget):
         )
 
     def _build_vram_group(self) -> None:
-        self.device_info = DeviceInfoPanel(gpu_index=0, parent=self)
-        self._layout.addWidget(self.device_info)
-        self._advanced_only_widgets.append(self.device_info)
+        pass  # Device Info panel removed
 
     def _snap_batch_size(self, value: int) -> None:
         snapped = round((value - 1) / 4) * 4 + 1

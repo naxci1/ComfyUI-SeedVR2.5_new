@@ -317,11 +317,11 @@ class FFMPEGVideoWriter:
         try:
             result = subprocess.run(
                 ["ffmpeg", "-hide_banner", "-encoders"],
-                capture_output=True, text=True, timeout=10,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
                 if sys.platform == "win32" else 0,
             )
-            available = result.stdout or ""
+            available = result.stdout.decode("utf-8", errors="replace") if result.stdout else ""
             for encoder_name, enc_args in encoders_to_try:
                 if encoder_name in available:
                     return list(enc_args)
@@ -2023,7 +2023,6 @@ def _concat_chunk_videos(chunk_paths: List[str], output_path: str) -> None:
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
         check=False,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0,
     )
@@ -2032,7 +2031,8 @@ def _concat_chunk_videos(chunk_paths: List[str], output_path: str) -> None:
     except Exception:
         pass
     if run.returncode != 0:
-        raise RuntimeError(f"FFmpeg concat failed: {run.stdout[-1200:] if run.stdout else 'unknown error'}")
+        stdout = run.stdout.decode("utf-8", errors="replace") if run.stdout else ""
+        raise RuntimeError(f"FFmpeg concat failed: {stdout[-1200:] if stdout else 'unknown error'}")
 
 
 def _mux_original_audio(temp_concatenated_path: str, original_input_path: str, output_path: str) -> None:
@@ -2051,12 +2051,12 @@ def _mux_original_audio(temp_concatenated_path: str, original_input_path: str, o
         final_cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
         check=False,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0,
     )
     if run.returncode != 0:
-        raise RuntimeError(f"FFmpeg audio mux failed: {run.stdout[-1200:] if run.stdout else 'unknown error'}")
+        stdout = run.stdout.decode("utf-8", errors="replace") if run.stdout else ""
+        raise RuntimeError(f"FFmpeg audio mux failed: {stdout[-1200:] if stdout else 'unknown error'}")
 
 
 def _load_or_create_processing_list(list_path: Path, media_files: List[str]) -> Dict[str, str]:
