@@ -1188,3 +1188,9 @@ Special thanks to our community contributors including [naxci1](https://github.c
 ## 📜 License
 
 The code in this repository is released under the Apache 2.0 license as found in the [LICENSE](LICENSE) file.
+
+## Blackwell 16 GB VRAM Dynamic Optimizations
+
+- **Dynamic MLA with adaptive low-rank KV compression**: The new Multi-head Latent Attention path uses adaptive KV compression with dynamic `kv_lora_rank` resolution and bounded scaling limits (`192` to `256`) to reduce KV-cache pressure while preserving temporal attention quality across changing workloads.
+- **Native NVFP4 (E2M1) quantization on Blackwell Tensor Cores**: Quantization integrates TensorRT Model Optimizer and Transformer Engine with `Format.MXFP4`, enabling native NVFP4 execution on Blackwell Tensor Cores while running with `fp8_autocast(enabled=False)` in the runtime path.
+- **Dynamic Hybrid RingAttention + SageAttention 3 wrapper**: The wrapper is engineered for variable `(4k + 1)` temporal frame sequences and uses mathematically exact online log-sum-exp softmax accumulation, preventing memory spikes and NaNs on constrained 16 GB VRAM deployments.
