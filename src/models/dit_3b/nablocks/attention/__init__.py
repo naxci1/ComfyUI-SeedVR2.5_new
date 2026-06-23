@@ -13,9 +13,11 @@
 # // limitations under the License.
 
 from .mmattn import NaMMAttention
+from .mmattn_mla import NaMMAttentionMLA
 
 attns = {
     "mm_full": NaMMAttention,
+    "mm_mla":  NaMMAttentionMLA,
 }
 
 
