@@ -59,8 +59,9 @@ class NaMMAttentionMLA(nn.Module):
         Hidden dimensions of video and text streams.
     heads, head_dim : int
         Number of attention heads and dimension per head.
-    kv_lora_rank : int
-        Rank of the shared KV low-rank projection.  Default 512.
+    kv_lora_rank : int or None
+        Rank of the shared KV low-rank projection. If None, dynamically
+        selected for model dimensions and VRAM budget.
     q_lora_rank : int or None
         Rank for optional query low-rank projection.  Default None.
     qk_bias : bool
@@ -76,8 +77,11 @@ class NaMMAttentionMLA(nn.Module):
     attention_mode : str
         Inner attention kernel: ``sageattn_3``, ``sageattn_2``,
         ``flash_attn_3``, ``flash_attn_2``, or ``sdpa``.
-    ring_size : int
-        Number of ring attention chunks.  Set 1 to disable ring splitting.
+    ring_size : int or None
+        Optional chunk count. If None, ring chunking is selected dynamically.
+        Set 1 to disable ring splitting.
+    vram_budget_gb : float
+        Target VRAM budget passed to MLA/ring dynamic sizing.
     use_fp4 : bool
         Replace Linear layers with NVFP4/FP8/BF16 quantized layers.
     """
@@ -95,10 +99,11 @@ class NaMMAttentionMLA(nn.Module):
         rope_dim: int,
         shared_weights: bool,
         attention_mode: str = "sdpa",
-        kv_lora_rank: int = 512,
+        kv_lora_rank: Optional[int] = None,
         q_lora_rank: Optional[int] = None,
-        ring_size: int = 1,
+        ring_size: Optional[int] = None,
         use_fp4: bool = False,
+        vram_budget_gb: float = 16.0,
         **kwargs,
     ):
         super().__init__()
@@ -124,6 +129,7 @@ class NaMMAttentionMLA(nn.Module):
             q_lora_rank=q_lora_rank,
             qk_norm_eps=qk_norm_eps,
             bias=qk_bias,
+            vram_budget_gb=vram_budget_gb,
         )
         self.mla_vid = MLALayer(**mla_kwargs)
         if not shared_weights:
@@ -140,10 +146,11 @@ class NaMMAttentionMLA(nn.Module):
         self.rope = get_na_rope(rope_type=rope_type, dim=rope_dim)
 
         # Inner attention backend (used by MLA forward)
-        if ring_size > 1:
+        if ring_size is None or ring_size > 1:
             self.attn = RingMLAAttention(
                 ring_size=ring_size,
                 attention_mode=attention_mode,
+                vram_budget_gb=vram_budget_gb,
             )
             self._use_ring = True
         else:

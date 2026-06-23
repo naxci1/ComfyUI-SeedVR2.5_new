@@ -21,23 +21,14 @@ Inspired by the DeepSeek-V2/V3 MLA architecture:
   to kv_lora_rank + heads*head_dim (RoPE keys only) per token.
 - Optional query low-rank compression (q_lora_rank) for extra parameter efficiency.
 - Full compatibility with the existing FlashAttentionVarlen / SageAttention backends.
-
-Target hardware: NVIDIA Blackwell (64 GB+ VRAM). The default `kv_lora_rank=512`
-is tuned to saturate memory bandwidth on large-VRAM devices without leaving
-execution pipelines idle (ring_size is handled by RingMLAAttention below).
-
-Dimensions used in the SeedVR2 DiT:
-  hidden_dim = 1152
-  heads      = 16
-  head_dim   = 64
+- Dynamic KV rank selection from model dimensions + VRAM budget, so there are
+  no static axis-size assumptions at runtime.
 """
 
-import math
 from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class MLALayer(nn.Module):
@@ -56,15 +47,17 @@ class MLALayer(nn.Module):
     Parameters
     ----------
     hidden_dim : int
-        Model hidden dimension (default 1152 for SeedVR2-3B).
+        Model hidden dimension.
     heads : int
-        Number of attention heads (default 16).
+        Number of attention heads.
     head_dim : int
-        Dimension per head (default 64).
-    kv_lora_rank : int
+        Dimension per head.
+    kv_lora_rank : int or None
         Rank of the joint KV low-rank projection. Larger values use more VRAM
-        bandwidth but recover more expressiveness. Recommended 256–512 for 64 GB
-        VRAM devices.
+        bandwidth but recover more expressiveness. If None, it is selected
+        dynamically from runtime model dimensions and `vram_budget_gb`.
+    vram_budget_gb : float
+        Target VRAM budget used when `kv_lora_rank` is not explicitly set.
     q_lora_rank : int or None
         If set, Q is also computed through a low-rank bottleneck of this size.
         Set to None to use a direct full-rank Q projection.
@@ -79,17 +72,25 @@ class MLALayer(nn.Module):
         hidden_dim: int = 1152,
         heads: int = 16,
         head_dim: int = 64,
-        kv_lora_rank: int = 512,
+        kv_lora_rank: Optional[int] = None,
         q_lora_rank: Optional[int] = None,
         qk_norm_eps: float = 1e-6,
         bias: bool = False,
+        vram_budget_gb: float = 16.0,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.heads = heads
         self.head_dim = head_dim
         self.inner_dim = heads * head_dim
-        self.kv_lora_rank = kv_lora_rank
+        self.vram_budget_gb = vram_budget_gb
+        self.kv_lora_rank = resolve_kv_lora_rank(
+            hidden_dim=hidden_dim,
+            heads=heads,
+            head_dim=head_dim,
+            requested_rank=kv_lora_rank,
+            vram_budget_gb=vram_budget_gb,
+        )
         self.q_lora_rank = q_lora_rank
         self.scale = head_dim ** -0.5
 
@@ -105,14 +106,14 @@ class MLALayer(nn.Module):
 
         # ----------- Low-rank KV compression -----------
         # Down-projection: hidden → kv_lora_rank
-        self.W_DKV = nn.Linear(hidden_dim, kv_lora_rank, bias=bias)
+        self.W_DKV = nn.Linear(hidden_dim, self.kv_lora_rank, bias=bias)
 
         # Normalise before up-projection (improves stability)
-        self.norm_kv = nn.RMSNorm(kv_lora_rank, eps=qk_norm_eps)
+        self.norm_kv = nn.RMSNorm(self.kv_lora_rank, eps=qk_norm_eps)
 
         # Up-projections: kv_lora_rank → K and V
-        self.W_UK = nn.Linear(kv_lora_rank, self.inner_dim, bias=bias)
-        self.W_UV = nn.Linear(kv_lora_rank, self.inner_dim, bias=bias)
+        self.W_UK = nn.Linear(self.kv_lora_rank, self.inner_dim, bias=bias)
+        self.W_UV = nn.Linear(self.kv_lora_rank, self.inner_dim, bias=bias)
 
         self.norm_k = nn.RMSNorm(head_dim, eps=qk_norm_eps)
 
@@ -224,10 +225,7 @@ class MLAConfig:
     """
     Configuration dataclass for MLA hyper-parameters.
 
-    Recommended defaults for Blackwell 64 GB VRAM
-    (hidden_dim=1152, heads=16, head_dim=64):
-      kv_lora_rank = 512   — half the inner_dim, good VRAM/expressiveness balance
-      q_lora_rank  = None  — direct Q projection (fewer parameters to tune)
+    Uses dynamic defaults so rank adapts to model dimensions and VRAM budget.
     """
 
     def __init__(
@@ -235,10 +233,11 @@ class MLAConfig:
         hidden_dim: int = 1152,
         heads: int = 16,
         head_dim: int = 64,
-        kv_lora_rank: int = 512,
+        kv_lora_rank: Optional[int] = None,
         q_lora_rank: Optional[int] = None,
         qk_norm_eps: float = 1e-6,
         bias: bool = False,
+        vram_budget_gb: float = 16.0,
     ):
         self.hidden_dim = hidden_dim
         self.heads = heads
@@ -247,6 +246,7 @@ class MLAConfig:
         self.q_lora_rank = q_lora_rank
         self.qk_norm_eps = qk_norm_eps
         self.bias = bias
+        self.vram_budget_gb = vram_budget_gb
 
     def build(self) -> MLALayer:
         return MLALayer(
@@ -257,4 +257,40 @@ class MLAConfig:
             q_lora_rank=self.q_lora_rank,
             qk_norm_eps=self.qk_norm_eps,
             bias=self.bias,
+            vram_budget_gb=self.vram_budget_gb,
         )
+
+
+def resolve_kv_lora_rank(
+    hidden_dim: int,
+    heads: int,
+    head_dim: int,
+    requested_rank: Optional[int] = None,
+    vram_budget_gb: float = 16.0,
+) -> int:
+    """
+    Resolve KV latent rank without static sequence assumptions.
+
+    The selected rank is constrained by model dimensions and scaled for VRAM
+    budget.
+    """
+    inner_dim = heads * head_dim
+    granularity = max(1, min(heads, head_dim))
+
+    # For 16 GB targets keep rank in a conservative quarter-inner band;
+    # larger budgets may scale toward half-inner.
+    if vram_budget_gb <= 16.0:
+        max_rank = max(granularity, inner_dim // 4)
+    else:
+        max_rank = max(granularity, inner_dim // 2)
+    min_rank = max(granularity, head_dim)
+
+    if requested_rank is not None:
+        rank = int(requested_rank)
+    else:
+        budget_scale = max(0.5, min(vram_budget_gb / 16.0, 2.0))
+        rank = int((hidden_dim / 6.0) * budget_scale)
+
+    rank = max(min_rank, min(rank, max_rank))
+    rank = max(granularity, (rank // granularity) * granularity)
+    return rank
