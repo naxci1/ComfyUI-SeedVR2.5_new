@@ -793,7 +793,16 @@ def upscale_all_batches(
                             category="blockswap", indent_level=1)
 
         # Cleanup DiT as it's no longer needed after upscaling
-        cleanup_dit(runner=runner, debug=debug, cache_model=cache_model)
+        # Only cleanup if model is not on meta device
+        try:
+            first_param = next(runner.dit.parameters())
+            if first_param.device.type != 'meta':
+                cleanup_dit(runner=runner, debug=debug, cache_model=cache_model)
+            else:
+                debug.log("Skipping DiT cleanup - model still on meta device", category="warning")
+        except (StopIteration, AttributeError):
+            # No parameters or no dit model, safe to cleanup
+            cleanup_dit(runner=runner, debug=debug, cache_model=cache_model)
         
         # Cleanup text embeddings as they're no longer needed after upscaling
         cleanup_text_embeddings(ctx, debug)

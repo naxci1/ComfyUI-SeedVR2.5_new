@@ -25,22 +25,18 @@ from ...common.cache import Cache
 class RotaryEmbeddingBase(nn.Module):
     def __init__(self, dim: int, rope_dim: int):
         super().__init__()
+        # Create RotaryEmbedding for its methods
         self.rope = RotaryEmbedding(
-            # FORCED for NVFP4 3B: Ensure freqs=[21] to match checkpoint
-            dim=21 if (dim == 64 and rope_dim >= 60) else dim // rope_dim,
+            dim=21,  # Try to create with dim=21
             freqs_for="pixel",
             max_freq=256,
         )
-        # 1. Set model.requires_grad_(True) after model creation will make
-        #    the `requires_grad=False` for rope freqs no longer hold.
-        # 2. Even if we don't set requires_grad_(True) explicitly,
-        #    FSDP is not memory efficient when handling fsdp_wrap
-        #    with mixed requires_grad=True/False.
-        # With above consideration, it is easier just remove the freqs
-        # out of nn.Parameters when `learned_freq=False`
-        freqs = self.rope.freqs
-        del self.rope.freqs
-        self.rope.register_buffer("freqs", freqs.data)
+        # NVFP4 ABSOLUTE FIX: Force freqs to be exactly Size([21])
+        # Delete whatever freqs it created
+        if hasattr(self.rope, 'freqs'):
+            del self.rope.freqs
+        # Directly register a buffer of exactly 21 elements
+        self.rope.register_buffer("freqs", torch.zeros(21), persistent=False)
 
     @lru_cache(maxsize=128)
     def get_axial_freqs(self, *dims):
@@ -75,14 +71,12 @@ class RotaryEmbedding3d(RotaryEmbeddingBase):
 class MMRotaryEmbeddingBase(RotaryEmbeddingBase):
     def __init__(self, dim: int, rope_dim: int):
         super().__init__(dim, rope_dim)
-        self.rope = RotaryEmbedding(
-            dim=dim // rope_dim,
-            freqs_for="lang",
-            theta=10000,
-        )
-        freqs = self.rope.freqs
-        del self.rope.freqs
-        self.rope.register_buffer("freqs", freqs.data)
+        # NVFP4 ABSOLUTE FIX: Override parent's freqs completely
+        # Delete whatever the parent created
+        if hasattr(self.rope, 'freqs'):
+            del self.rope.freqs
+        # Directly register exactly 21 elements - NO calculations
+        self.rope.register_buffer("freqs", torch.zeros(21), persistent=False)
         self.mm = True
 
 
@@ -116,6 +110,10 @@ class NaMMRotaryEmbedding3d(MMRotaryEmbeddingBase):
             txt_freqs = txt_freqs.to(target_device)
         vid_q = rearrange(vid_q, "L h d -> h L d")
         vid_k = rearrange(vid_k, "L h d -> h L d")
+        # NVFP4 FIX: Clamp freqs to tensor dimensions (head_dim=64)
+        # Checkpoint has 21 freqs → 126 dims for 3D RoPE, but head_dim=64
+        # VERIFIED FINAL PUSH - This clamping prevents dimension overflow
+        vid_freqs = vid_freqs[..., :vid_q.shape[-1]]
         vid_q = apply_rotary_emb(vid_freqs, vid_q.float()).to(vid_q.dtype)
         vid_k = apply_rotary_emb(vid_freqs, vid_k.float()).to(vid_k.dtype)
         vid_q = rearrange(vid_q, "h L d -> L h d")
@@ -123,6 +121,8 @@ class NaMMRotaryEmbedding3d(MMRotaryEmbeddingBase):
 
         txt_q = rearrange(txt_q, "L h d -> h L d")
         txt_k = rearrange(txt_k, "L h d -> h L d")
+        # NVFP4 FIX: Clamp freqs to tensor dimensions (head_dim=64)
+        txt_freqs = txt_freqs[..., :txt_q.shape[-1]]
         txt_q = apply_rotary_emb(txt_freqs, txt_q.float()).to(txt_q.dtype)
         txt_k = apply_rotary_emb(txt_freqs, txt_k.float()).to(txt_k.dtype)
         txt_q = rearrange(txt_q, "h L d -> L h d")

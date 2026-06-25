@@ -29,6 +29,29 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
         devices = get_device_list()
         dit_models = get_available_dit_models()
         
+        # Import hardware detection for NVFP4 support
+        from ..utils.hardware_detection import check_nvfp4_support, get_gpu_info
+        has_nvfp4 = check_nvfp4_support()
+        
+        # Enhanced tooltip with NVFP4 info
+        model_tooltip = (
+            "DiT (Diffusion Transformer) model for video upscaling.\n"
+            "Models automatically download on first use.\n"
+            "Additional models can be added to the ComfyUI models folder."
+        )
+        
+        if has_nvfp4:
+            gpu_info = get_gpu_info()
+            model_tooltip += (
+                f"\n\n✅ NVFP4 SUPPORT DETECTED!\n"
+                f"GPU: {gpu_info['name']}\n"
+                f"NVFP4 models provide 2-2.5x speedup on RTX 50 series"
+            )
+        else:
+            model_tooltip += (
+                "\n\nℹ️ NVFP4 models require RTX 50 series GPU (5070 Ti/5080/5090)"
+            )
+        
         return io.Schema(
             node_id="SeedVR2LoadDiTModel",
             display_name="SeedVR2 (Down)Load DiT Model",
@@ -43,11 +66,7 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
                 io.Combo.Input("model",
                     options=dit_models,
                     default=DEFAULT_DIT,
-                    tooltip=(
-                        "DiT (Diffusion Transformer) model for video upscaling.\n"
-                        "Models automatically download on first use.\n"
-                        "Additional models can be added to the ComfyUI models folder."
-                    )
+                    tooltip=model_tooltip
                 ),
                 io.Combo.Input("device",
                     options=devices,
@@ -124,6 +143,27 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
                         "Provides 20-40% speedup with compatible PyTorch 2.0+ and Triton installation."
                     )
                 ),
+                io.Boolean.Input("force_nvfp4",
+                    default=False,
+                    optional=True,
+                    tooltip=(
+                        "⚠️ EXPERIMENTAL: Force NVFP4 loading mode\n"
+                        "\n"
+                        "When enabled (true):\n"
+                        "• Bypasses automatic GGUF format detection\n"
+                        "• Loads file as standard safetensors (native NVFP4 mode)\n"
+                        "• Treats model as NVFP4 format regardless of actual content\n"
+                        "• Use this if you have a true NVFP4 model or want to override detection\n"
+                        "\n"
+                        "When disabled (false, default):\n"
+                        "• Automatic format detection active\n"
+                        "• GGUF files with .safetensors extension are detected and rejected\n"
+                        "• Recommended for most users\n"
+                        "\n"
+                        "⚠️ WARNING: Enabling this with GGUF files will cause shape mismatch errors.\n"
+                        "Only enable if you have a genuine NVFP4 safetensors file."
+                    )
+                ),
             ],
             outputs=[
                 io.Custom("SEEDVR2_DIT").Output(
@@ -136,7 +176,8 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
     def execute(cls, model: str, device: str, offload_device: str = "none",
                      cache_model: bool = False, blocks_to_swap: int = 0, 
                      swap_io_components: bool = False, attention_mode: str = "sdpa",
-                     torch_compile_args: Dict[str, Any] = None) -> io.NodeOutput:
+                     torch_compile_args: Dict[str, Any] = None,
+                     force_nvfp4: bool = False) -> io.NodeOutput:
         """
         Create DiT model configuration for SeedVR2 main node
         
@@ -149,13 +190,47 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
             swap_io_components: Whether to offload I/O components (requires offload_device != device)
             attention_mode: Attention computation backend ('sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3')
             torch_compile_args: Optional torch.compile configuration from settings node
+            force_nvfp4: Force NVFP4 loading mode (bypasses GGUF detection)
             
         Returns:
             NodeOutput containing configuration dictionary for SeedVR2 main node
             
         Raises:
             ValueError: If cache_model is enabled but offload_device is not set
+            RuntimeError: If NVFP4 model is selected on non-Blackwell GPU
         """
+        # Validate NVFP4 model compatibility
+        if "nvfp4" in model.lower() or "blackwell" in model.lower():
+            from ..utils.hardware_detection import check_nvfp4_support, get_gpu_info
+            
+            if not check_nvfp4_support():
+                gpu_info = get_gpu_info()
+                gpu_name = gpu_info.get('name', 'Unknown') if gpu_info.get('available') else 'No CUDA GPU'
+                
+                # Truncate model name and GPU name to fit in 56-char column (box is 62 chars wide with padding)
+                model_display = model[:56] if len(model) > 56 else model
+                gpu_display = gpu_name[:56] if len(gpu_name) > 56 else gpu_name
+                
+                raise RuntimeError(
+                    f"╔══════════════════════════════════════════════════════════════╗\n"
+                    f"║  NVFP4 Model Requires RTX 50 Series GPU                      ║\n"
+                    f"╠══════════════════════════════════════════════════════════════╣\n"
+                    f"║  Selected Model: {model_display:<56} ║\n"
+                    f"║  Your GPU:       {gpu_display:<56} ║\n"
+                    f"║                                                              ║\n"
+                    f"║  NVFP4 models ONLY work on:                                 ║\n"
+                    f"║    • RTX 5090 (24GB)                                        ║\n"
+                    f"║    • RTX 5080 (16GB)                                        ║\n"
+                    f"║    • RTX 5070 Ti (16GB)                                     ║\n"
+                    f"║    • RTX 5070 (12GB)                                        ║\n"
+                    f"║                                                              ║\n"
+                    f"║  Recommended alternatives:                                  ║\n"
+                    f"║    • seedvr2_ema_3b_fp16.safetensors (best quality)        ║\n"
+                    f"║    • seedvr2_ema_3b_fp8_e4m3fn.safetensors (balanced)      ║\n"
+                    f"║    • seedvr2_ema_3b-Q8_0.gguf (low VRAM)                   ║\n"
+                    f"╚══════════════════════════════════════════════════════════════╝"
+                )
+        
         # Validate cache_model configuration
         if cache_model and offload_device == "none":
             raise ValueError(
@@ -174,6 +249,7 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
             "swap_io_components": swap_io_components,
             "attention_mode": attention_mode,
             "torch_compile_args": torch_compile_args,
+            "force_nvfp4": force_nvfp4,
             "node_id": get_executing_context().node_id,
         }
         

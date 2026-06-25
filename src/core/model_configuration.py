@@ -749,7 +749,8 @@ def configure_runner(
     tile_debug: str = "false",
     attention_mode: str = 'sdpa',
     torch_compile_args_dit: Optional[Dict[str, Any]] = None,
-    torch_compile_args_vae: Optional[Dict[str, Any]] = None
+    torch_compile_args_vae: Optional[Dict[str, Any]] = None,
+    force_nvfp4: bool = False
 ) -> Tuple[VideoDiffusionInfer, Dict[str, Any]]:
     """
     Configure VideoDiffusionInfer runner with model loading and settings.
@@ -777,6 +778,7 @@ def configure_runner(
         attention_mode: Attention computation backend ('sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3')
         torch_compile_args_dit: Optional torch.compile configuration for DiT model
         torch_compile_args_vae: Optional torch.compile configuration for VAE model
+        force_nvfp4: Force NVFP4 loading mode (bypasses GGUF detection)
         
     Returns:
         Tuple[VideoDiffusionInfer, Dict[str, Any]]: (configured runner, cache context dict)
@@ -828,7 +830,7 @@ def configure_runner(
     # Phase 4: Setup models (load from cache or create new)
     _setup_models(
         runner, cache_context, dit_model, vae_model, 
-        base_cache_dir, block_swap_config, debug
+        base_cache_dir, block_swap_config, force_nvfp4, debug
     )
     
     return runner, cache_context
@@ -916,6 +918,7 @@ def _setup_models(
     vae_model: str,
     base_cache_dir: str,
     block_swap_config: Optional[Dict[str, Any]],
+    force_nvfp4: bool,
     debug: Optional['Debug'] = None
 ) -> None:
     """
@@ -941,13 +944,14 @@ def _setup_models(
         vae_model: VAE model filename for loading/validation
         base_cache_dir: Base directory containing model files
         block_swap_config: BlockSwap configuration (passed to DiT setup)
+        force_nvfp4: Force NVFP4 loading mode (bypasses GGUF detection)
         debug: Debug instance for logging and timing
     """
     debug.start_timer("model_structures")
     
     # Setup DiT
     dit_created = _setup_dit_model(runner, cache_context, dit_model, base_cache_dir, 
-                                   block_swap_config, debug)
+                                   block_swap_config, force_nvfp4, debug)
     
     # Only update DiT config if model was cached/reused (not newly created)
     if not dit_created and hasattr(runner, 'dit') and runner.dit is not None:
@@ -993,6 +997,7 @@ def _setup_dit_model(
     dit_model: str,
     base_cache_dir: str,
     block_swap_config: Optional[Dict[str, Any]],
+    force_nvfp4: bool,
     debug: Optional['Debug'] = None
 ) -> bool:
     """
@@ -1011,6 +1016,7 @@ def _setup_dit_model(
         dit_model: DiT model filename (e.g., "seedvr2_ema_3b_fp16.safetensors")
         base_cache_dir: Base directory containing model files
         block_swap_config: BlockSwap configuration to store (not applied here)
+        force_nvfp4: Force NVFP4 loading mode (bypasses GGUF detection)
         debug: Debug instance for logging
         
     Returns:
@@ -1053,7 +1059,7 @@ def _setup_dit_model(
         
         dit_checkpoint_path = find_model_file(dit_model, base_cache_dir)
         runner = prepare_model_structure(runner, "dit", dit_checkpoint_path, 
-                                        runner.config, debug, block_swap_config)
+                                        runner.config, debug, block_swap_config, force_nvfp4)
         runner._dit_model_name = dit_model
         return True
     else:
