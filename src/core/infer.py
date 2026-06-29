@@ -12,7 +12,6 @@
 # // See the License for the specific language governing permissions and
 # // limitations under the License.
 
-import gc
 from typing import List, Optional, Tuple, Union
 import torch
 from einops import rearrange
@@ -261,9 +260,7 @@ class VideoDiffusionInfer():
                 )
 
                 if use_temporal_chunks:
-                    sample = self._decode_with_temporal_chunks(
-                        latent, device, vae_dtype, temporal_downsample_factor
-                    )
+                    sample = self._decode_with_temporal_chunks(latent).sample
                 else:
                     # Single-pass decode (original path)
                     if vae_dtype != latent.dtype:
@@ -335,130 +332,16 @@ class VideoDiffusionInfer():
     def _decode_with_temporal_chunks(
         self,
         latent: torch.Tensor,
-        device: torch.device,
-        vae_dtype: torch.dtype,
-        temporal_downsample_factor: int,
-    ) -> torch.Tensor:
-        """Decode video latents with aggressive temporal granularity for low VRAM.
-
-        Uses small latent chunks (CHUNK_LAT=3) with overlap and sequential concat to
-        avoid retaining a list of decoded chunks in memory.
-        """
-        CHUNK_LAT = 3
-        OVERLAP_LAT = 2
-        STRIDE_LAT = max(1, CHUNK_LAT - OVERLAP_LAT)
-        VRAM_THRESHOLD_GB = 13.5
-
-        T_lat = latent.shape[2]
-        if T_lat <= CHUNK_LAT:
-            return self._decode_single_chunk(latent, device, vae_dtype)
-
-        if hasattr(self.vae, "enable_slicing"):
-            self.vae.enable_slicing()
-
-        chunk_starts: List[int] = list(range(0, max(T_lat - CHUNK_LAT + 1, 1), STRIDE_LAT))
-        last_start = T_lat - CHUNK_LAT
-        if chunk_starts[-1] != last_start:
-            chunk_starts.append(last_start)
-
-        self.debug.log(
-            f"Aggressive temporal decode: {T_lat} latent frames, "
-            f"{len(chunk_starts)} chunks (chunk={CHUNK_LAT}, overlap={OVERLAP_LAT})",
-            category="vae", indent_level=1,
-        )
-
-        T_vid_total = (T_lat - 1) * temporal_downsample_factor + 1
-        decode_dtype = torch.bfloat16
-        final_output: Optional[torch.Tensor] = None
-        prev_vid_end = 0
-
+    ):
+        """Decode the full latent tensor in a single pass."""
         with torch.inference_mode():
-            for chunk_idx, s in enumerate(chunk_starts):
-                e = min(s + CHUNK_LAT, T_lat)
-                vid_start = s * temporal_downsample_factor
-
-                chunk_lat = latent[:, :, s:e, :, :].clone()
-                if chunk_lat.dtype != decode_dtype:
-                    chunk_lat = chunk_lat.to(decode_dtype)
-
-                if device.type == "cuda":
-                    current_vram_gb = torch.cuda.memory_allocated(device) / (1024 ** 3)
-                    if current_vram_gb > VRAM_THRESHOLD_GB:
-                        self.debug.log(
-                            f"High VRAM before decode ({current_vram_gb:.2f} GB); flushing cache.",
-                            category="vae",
-                            indent_level=2,
-                        )
-                        torch.cuda.empty_cache()
-
-                if decode_dtype != vae_dtype:
-                    with torch.autocast(device.type, decode_dtype, enabled=True):
-                        chunk_sample = self.vae.decode(
-                            chunk_lat,
-                            tiled=self.decode_tiled,
-                            tile_size=self.decode_tile_size,
-                            tile_overlap=self.decode_tile_overlap,
-                        ).sample
-                else:
-                    chunk_sample = self.vae.decode(
-                        chunk_lat,
-                        tiled=self.decode_tiled,
-                        tile_size=self.decode_tile_size,
-                        tile_overlap=self.decode_tile_overlap,
-                    ).sample
-                del chunk_lat
-
-                self.debug.log(
-                    f"  Chunk {chunk_idx + 1}/{len(chunk_starts)}: lat [{s},{e}) → "
-                    f"vid [{vid_start},{vid_start + chunk_sample.shape[2]})",
-                    category="vae",
-                    indent_level=2,
+            with torch.cuda.amp.autocast(dtype=torch.float16):
+                return self.vae.decode(
+                    latent,
+                    tiled=self.decode_tiled,
+                    tile_size=self.decode_tile_size,
+                    tile_overlap=self.decode_tile_overlap,
                 )
-
-                if final_output is None:
-                    final_output = chunk_sample
-                    prev_vid_end = vid_start + chunk_sample.shape[2]
-                    continue
-
-                overlap_frames = max(0, prev_vid_end - vid_start)
-                blend_len = min(
-                    overlap_frames,
-                    chunk_sample.shape[2],
-                    max(0, final_output.shape[2] - vid_start),
-                )
-                if blend_len > 0:
-                    alpha = torch.linspace(
-                        0.0, 1.0, blend_len, dtype=final_output.dtype, device=device
-                    ).view(1, 1, blend_len, 1, 1)
-                    prev_vals = final_output[:, :, vid_start : vid_start + blend_len].clone()
-                    cur_vals = chunk_sample[:, :, :blend_len]
-                    final_output[:, :, vid_start : vid_start + blend_len] = (
-                        prev_vals * (1.0 - alpha) + cur_vals * alpha
-                    )
-                    del prev_vals, cur_vals, alpha
-
-                tail_start = blend_len
-                if tail_start < chunk_sample.shape[2]:
-                    append_tail = chunk_sample[:, :, tail_start:]
-                    old_output = final_output
-                    final_output = torch.cat([old_output, append_tail], dim=2)
-                    del old_output, append_tail
-                    gc.collect()
-
-                prev_vid_end = max(prev_vid_end, vid_start + chunk_sample.shape[2])
-                del chunk_sample
-
-        if final_output is None:
-            return self._decode_single_chunk(latent, device, vae_dtype)
-
-        if final_output.shape[2] > T_vid_total:
-            final_output = final_output[:, :, :T_vid_total]
-        elif final_output.shape[2] < T_vid_total:
-            pad_len = T_vid_total - final_output.shape[2]
-            pad_frame = final_output[:, :, -1:].expand(-1, -1, pad_len, -1, -1)
-            final_output = torch.cat([final_output, pad_frame], dim=2)
-
-        return final_output
 
 
     def timestep_transform(self, timesteps: Tensor, latents_shapes: Tensor):
