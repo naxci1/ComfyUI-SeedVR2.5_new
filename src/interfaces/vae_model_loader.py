@@ -63,7 +63,7 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                 io.Int.Input("encode_tile_size",
                     default=1024,
                     min=64,
-                    step=32,
+                    step=16,
                     optional=True,
                     tooltip=(
                         "Encoding tile size in pixels (default: 1024).\n"
@@ -75,7 +75,7 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                 io.Int.Input("encode_tile_overlap",
                     default=128,
                     min=0,
-                    step=32,
+                    step=16,
                     optional=True,
                     tooltip=(
                         "Pixel overlap between encoding tiles (default: 128).\n"
@@ -92,7 +92,7 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                 io.Int.Input("decode_tile_size",
                     default=1024,
                     min=64,
-                    step=32,
+                    step=16,
                     optional=True,
                     tooltip=(
                         "Decoding tile size in pixels (default: 1024).\n"
@@ -104,7 +104,7 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                 io.Int.Input("decode_tile_overlap",
                     default=128,
                     min=0,
-                    step=32,
+                    step=16,
                     optional=True,
                     tooltip=(
                         "Pixel overlap between decoding tiles (default: 128).\n"
