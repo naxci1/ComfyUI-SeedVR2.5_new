@@ -12,6 +12,7 @@
 # // See the License for the specific language governing permissions and
 # // limitations under the License.
 
+import gc
 from typing import List, Optional, Tuple, Union
 import torch
 from einops import rearrange
@@ -338,87 +339,59 @@ class VideoDiffusionInfer():
         vae_dtype: torch.dtype,
         temporal_downsample_factor: int,
     ) -> torch.Tensor:
-        """Decode a video latent tensor using macro-chunk temporal splitting.
+        """Decode video latents with aggressive temporal granularity for low VRAM.
 
-        The latent [1, C, T_lat, H, W] is split into at most 3 large macro-chunks
-        (2 chunks for shorter sequences, 3 for longer ones).  All decoding and
-        blending is done natively on GPU; no CPU offloading or cache-clearing occurs
-        inside the decode loop, keeping the CUDA allocator efficient.
-
-        Macro-chunk geometry:
-          num_chunks  = 2  (T_lat ≤ 25) or 3  (T_lat > 25)
-          OVERLAP_LAT = 2  latent frames (≈ 4 video frames) at each boundary
-          chunk_size  = ceil(T_lat / num_chunks) with overlap added to each boundary
-
-        Pipeline:
-          1. Enable VAE slicing if the model supports it.
-          2. Wrap all decoding in torch.inference_mode() and force bfloat16.
-          3. Clone each slice to break the parent-tensor reference before passing to VAE.
-          4. Delete intermediate tensors explicitly; let the allocator reclaim freely.
-          5. Blend overlap boundaries with a linear alpha ramp (0 → 1) on GPU.
-          6. Concatenate and return on the original CUDA device.
-
-        Args:
-            latent: Video latent [1, C, T_lat, H, W] on CUDA.
-            device: CUDA device of the VAE model.
-            vae_dtype: Weight dtype of the VAE model.
-            temporal_downsample_factor: Temporal downsampling factor (typically 4).
-
-        Returns:
-            Decoded video tensor [1, C, T_vid, H_out, W_out] on *device*.
+        Uses small latent chunks (CHUNK_LAT=3) with overlap and sequential concat to
+        avoid retaining a list of decoded chunks in memory.
         """
-        OVERLAP_LAT = 2  # latent frames shared at each boundary → ~4 video frames
+        CHUNK_LAT = 3
+        OVERLAP_LAT = 2
+        STRIDE_LAT = max(1, CHUNK_LAT - OVERLAP_LAT)
+        VRAM_THRESHOLD_GB = 13.5
 
         T_lat = latent.shape[2]
+        if T_lat <= CHUNK_LAT:
+            return self._decode_single_chunk(latent, device, vae_dtype)
 
-        # Enable VAE slicing for lower-level VRAM savings when supported
         if hasattr(self.vae, "enable_slicing"):
             self.vae.enable_slicing()
 
-        # Choose 2 or 3 macro-chunks based on sequence length
-        num_chunks = 3 if T_lat > 25 else 2
-
-        # Compute evenly-sized chunk boundaries (start, end) in latent frames
-        # Each boundary except the last shares OVERLAP_LAT frames with its neighbour
-        base = T_lat // num_chunks
-        remainder = T_lat % num_chunks
-        boundaries: List[Tuple[int, int]] = []
-        s = 0
-        for i in range(num_chunks):
-            chunk_len = base + (1 if i < remainder else 0)
-            e = s + chunk_len
-            # Extend right boundary by overlap (clamp to T_lat)
-            e_ext = min(e + OVERLAP_LAT, T_lat) if i < num_chunks - 1 else T_lat
-            # Extend left boundary by overlap so blend zone is covered
-            s_ext = max(s - OVERLAP_LAT, 0) if i > 0 else 0
-            boundaries.append((s_ext, e_ext))
-            s = e
-
-        if len(boundaries) == 0:
-            return self._decode_single_chunk(latent, device, vae_dtype)
+        chunk_starts: List[int] = list(range(0, max(T_lat - CHUNK_LAT + 1, 1), STRIDE_LAT))
+        last_start = T_lat - CHUNK_LAT
+        if chunk_starts[-1] != last_start:
+            chunk_starts.append(last_start)
 
         self.debug.log(
-            f"Macro-chunk decode: {T_lat} latent frames → {len(boundaries)} chunks "
-            f"(overlap={OVERLAP_LAT}): {boundaries}",
+            f"Aggressive temporal decode: {T_lat} latent frames, "
+            f"{len(chunk_starts)} chunks (chunk={CHUNK_LAT}, overlap={OVERLAP_LAT})",
             category="vae", indent_level=1,
         )
 
-        # ── Decode each macro-chunk entirely on GPU ─────────────────────────
-        decoded_chunks: List[Tuple[torch.Tensor, int]] = []  # (tensor on GPU, vid_start)
+        T_vid_total = (T_lat - 1) * temporal_downsample_factor + 1
+        decode_dtype = torch.bfloat16
+        final_output: Optional[torch.Tensor] = None
+        prev_vid_end = 0
 
         with torch.inference_mode():
-            decode_dtype = torch.bfloat16
+            for chunk_idx, s in enumerate(chunk_starts):
+                e = min(s + CHUNK_LAT, T_lat)
+                vid_start = s * temporal_downsample_factor
 
-            for chunk_idx, (cs, ce) in enumerate(boundaries):
-                # .clone() breaks the view relationship with the parent latent tensor,
-                # allowing the graph / reference count on older slices to drop to zero.
-                chunk_lat = latent[:, :, cs:ce, :, :].clone()
-
+                chunk_lat = latent[:, :, s:e, :, :].clone()
                 if chunk_lat.dtype != decode_dtype:
                     chunk_lat = chunk_lat.to(decode_dtype)
 
-                chunk_vae_dtype = decode_dtype
-                if chunk_vae_dtype != vae_dtype:
+                if device.type == "cuda":
+                    current_vram_gb = torch.cuda.memory_allocated(device) / (1024 ** 3)
+                    if current_vram_gb > VRAM_THRESHOLD_GB:
+                        self.debug.log(
+                            f"High VRAM before decode ({current_vram_gb:.2f} GB); flushing cache.",
+                            category="vae",
+                            indent_level=2,
+                        )
+                        torch.cuda.empty_cache()
+
+                if decode_dtype != vae_dtype:
                     with torch.autocast(device.type, decode_dtype, enabled=True):
                         chunk_sample = self.vae.decode(
                             chunk_lat,
@@ -433,67 +406,59 @@ class VideoDiffusionInfer():
                         tile_size=self.decode_tile_size,
                         tile_overlap=self.decode_tile_overlap,
                     ).sample
-
-                global_vid_start = cs * temporal_downsample_factor
-                decoded_chunks.append((chunk_sample, global_vid_start))
-
-                self.debug.log(
-                    f"  Chunk {chunk_idx + 1}/{len(boundaries)}: "
-                    f"lat [{cs},{ce}) → vid [{global_vid_start},"
-                    f"{global_vid_start + chunk_sample.shape[2]})",
-                    category="vae", indent_level=2,
-                )
-
-                # Explicitly release the cloned latent slice; allocator reclaims freely
                 del chunk_lat
 
-        # ── Assemble on GPU with linear blend at overlap boundaries ─────────
-        T_vid_total = (T_lat - 1) * temporal_downsample_factor + 1
-        sample_ref = decoded_chunks[0][0]
-        C_out = sample_ref.shape[1]
-        H_out = sample_ref.shape[3]
-        W_out = sample_ref.shape[4]
-
-        output = torch.zeros(
-            (1, C_out, T_vid_total, H_out, W_out),
-            dtype=sample_ref.dtype,
-            device=device,
-        )
-
-        prev_vid_end = 0  # exclusive end of the already-written region
-
-        for chunk_sample, vid_start in decoded_chunks:
-            T_vid_chunk = chunk_sample.shape[2]
-            vid_end = min(vid_start + T_vid_chunk, T_vid_total)
-
-            overlap_frames = max(0, prev_vid_end - vid_start)
-
-            if overlap_frames > 0:
-                blend_len = min(overlap_frames, T_vid_total - vid_start)
-                # Linear alpha 0→1 ramp on GPU
-                alpha = torch.linspace(
-                    0.0, 1.0, blend_len, dtype=output.dtype, device=device
-                ).view(1, 1, blend_len, 1, 1)
-
-                prev_vals = output[:, :, vid_start : vid_start + blend_len].clone()
-                cur_vals = chunk_sample[:, :, :blend_len]
-                output[:, :, vid_start : vid_start + blend_len] = (
-                    prev_vals * (1.0 - alpha) + cur_vals * alpha
-                )
-                del prev_vals, alpha
-
-            write_start = max(vid_start + overlap_frames, prev_vid_end)
-            local_offset = write_start - vid_start
-            write_end = min(vid_end, T_vid_total)
-            if write_start < write_end:
-                output[:, :, write_start:write_end] = (
-                    chunk_sample[:, :, local_offset : local_offset + (write_end - write_start)]
+                self.debug.log(
+                    f"  Chunk {chunk_idx + 1}/{len(chunk_starts)}: lat [{s},{e}) → "
+                    f"vid [{vid_start},{vid_start + chunk_sample.shape[2]})",
+                    category="vae",
+                    indent_level=2,
                 )
 
-            prev_vid_end = max(prev_vid_end, vid_end)
-            del chunk_sample
+                if final_output is None:
+                    final_output = chunk_sample
+                    prev_vid_end = vid_start + chunk_sample.shape[2]
+                    continue
 
-        return output
+                overlap_frames = max(0, prev_vid_end - vid_start)
+                blend_len = min(
+                    overlap_frames,
+                    chunk_sample.shape[2],
+                    max(0, final_output.shape[2] - vid_start),
+                )
+                if blend_len > 0:
+                    alpha = torch.linspace(
+                        0.0, 1.0, blend_len, dtype=final_output.dtype, device=device
+                    ).view(1, 1, blend_len, 1, 1)
+                    prev_vals = final_output[:, :, vid_start : vid_start + blend_len].clone()
+                    cur_vals = chunk_sample[:, :, :blend_len]
+                    final_output[:, :, vid_start : vid_start + blend_len] = (
+                        prev_vals * (1.0 - alpha) + cur_vals * alpha
+                    )
+                    del prev_vals, cur_vals, alpha
+
+                tail_start = blend_len
+                if tail_start < chunk_sample.shape[2]:
+                    append_tail = chunk_sample[:, :, tail_start:]
+                    old_output = final_output
+                    final_output = torch.cat([old_output, append_tail], dim=2)
+                    del old_output, append_tail
+                    gc.collect()
+
+                prev_vid_end = max(prev_vid_end, vid_start + chunk_sample.shape[2])
+                del chunk_sample
+
+        if final_output is None:
+            return self._decode_single_chunk(latent, device, vae_dtype)
+
+        if final_output.shape[2] > T_vid_total:
+            final_output = final_output[:, :, :T_vid_total]
+        elif final_output.shape[2] < T_vid_total:
+            pad_len = T_vid_total - final_output.shape[2]
+            pad_frame = final_output[:, :, -1:].expand(-1, -1, pad_len, -1, -1)
+            final_output = torch.cat([final_output, pad_frame], dim=2)
+
+        return final_output
 
 
     def timestep_transform(self, timesteps: Tensor, latents_shapes: Tensor):
