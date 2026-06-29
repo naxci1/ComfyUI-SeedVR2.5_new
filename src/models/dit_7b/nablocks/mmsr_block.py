@@ -140,6 +140,8 @@ class NaSwinAttention(MMWindowAttention):
             ),
             max_seqlen_q=cache_win("vid_max_seqlen_q", lambda: all_len_win.max()),
             max_seqlen_k=cache_win("vid_max_seqlen_k", lambda: all_len_win.max()),
+            video_token_counts=vid_len_win,
+            text_token_counts=txt_len_win,
         ).type_as(vid_q)
 
         # text pooling

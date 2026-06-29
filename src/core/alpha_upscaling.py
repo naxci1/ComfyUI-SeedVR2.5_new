@@ -8,10 +8,8 @@ to maintain alignment between upscaled RGB and Alpha channels.
 
 import torch
 import torch.nn.functional as F
-import cv2
-import numpy as np
 from typing import Optional, Any, List
-from ..common.half_precision_fixes import ensure_float32_precision
+from ..common.half_precision_fixes import ensure_float32_precision, safe_interpolate_operation
 from ..optimization.memory_manager import manage_tensor
 
 
@@ -43,6 +41,7 @@ def process_alpha_for_batch(
         tensor=alpha_original,
         target_device=device,
         tensor_name="alpha_original",
+        non_blocking=True,
         debug=debug,
         reason="Alpha processing",
         indent_level=1
@@ -51,6 +50,7 @@ def process_alpha_for_batch(
         tensor=rgb_original,
         target_device=device,
         tensor_name="rgb_original",
+        non_blocking=True,
         debug=debug,
         reason="Alpha processing",
         indent_level=1
@@ -65,6 +65,7 @@ def process_alpha_for_batch(
             tensor=rgb_sample,
             target_device=device,
             tensor_name="rgb_sample",
+            non_blocking=True,
             debug=debug,
             reason="Alpha processing",
             indent_level=1
@@ -138,58 +139,58 @@ def detect_edges_batch(
     Returns:
         Edge map tensor of shape (T, 1, H, W) in range [0, 1]
     """
-    # Convert to float32 for OpenCV processing (will be converted to numpy anyway)
     images, images_dtype = ensure_float32_precision(images, force_float32=True)
-    
-    images_np = images.cpu().numpy()
-    T, C, H, W = images_np.shape
-    
-    # Denormalize if needed
-    if images_np.min() < 0:
-        images_np = (images_np + 1) / 2
-    
-    # Convert to 0-255 uint8
-    images_np = (images_np * 255).clip(0, 255).astype(np.uint8)
-    
-    edges = []
-    for t in range(T):
-        frame = images_np[t].transpose(1, 2, 0)
-        
-        if C == 3:
-            gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        else:
-            gray = frame[..., 0]
-        
-        if method == 'sobel':
-            sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-            sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-            edge = np.sqrt(sobelx**2 + sobely**2)
-            edge = (edge / edge.max() * 255).astype(np.uint8)
-        else:
-            edge = cv2.Canny(gray, 50, 150)
-        
-        edges.append(edge)
-    
-    edges = np.stack(edges)
-    edges = torch.from_numpy(edges).float() / 255.0
-    edges = edges.unsqueeze(1)
-    
-    # Move back to images device after CPU numpy processing
-    edges = manage_tensor(
-        tensor=edges,
-        target_device=images.device,
-        tensor_name="edge_map",
-        dtype=images_dtype,
-        debug=debug,
-        reason="edge detection result",
-        indent_level=1
-    )
-    
+
+    if images.amin() < 0:
+        images = (images + 1.0) * 0.5
+
+    if images.shape[1] == 3:
+        gray = (
+            images[:, 0:1] * 0.2989 +
+            images[:, 1:2] * 0.5870 +
+            images[:, 2:3] * 0.1140
+        )
+    else:
+        gray = images[:, 0:1]
+
+    sobel_x = torch.tensor(
+        [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+        device=gray.device,
+        dtype=gray.dtype,
+    ).view(1, 1, 3, 3)
+    sobel_y = torch.tensor(
+        [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
+        device=gray.device,
+        dtype=gray.dtype,
+    ).view(1, 1, 3, 3)
+
+    grad_x = F.conv2d(gray, sobel_x, padding=1)
+    grad_y = F.conv2d(gray, sobel_y, padding=1)
+    edges = torch.sqrt(grad_x.square() + grad_y.square() + 1e-12)
+
+    if method == 'canny':
+        edges = torch.where(edges > edges.mean(dim=(-2, -1), keepdim=True), edges, torch.zeros_like(edges))
+
+    edge_scale = edges.amax(dim=(-2, -1), keepdim=True).clamp_min_(1e-6)
+    edges = edges / edge_scale
+
+    if edges.dtype != images_dtype:
+        edges = manage_tensor(
+            tensor=edges,
+            target_device=edges.device,
+            tensor_name="edge_map",
+            dtype=images_dtype,
+            debug=debug,
+            reason="edge detection result",
+            indent_level=1
+        )
+
     return edges
 
 
 def guided_filter_pytorch(guide: torch.Tensor, src: torch.Tensor, 
-                          radius: int = 8, eps: float = 0.01) -> torch.Tensor:
+                          radius: int = 8, eps: float = 0.01,
+                          debug: Optional['Debug'] = None) -> torch.Tensor:
     """
     Apply guided filter for edge-preserving smoothing.
     
@@ -224,6 +225,7 @@ def guided_filter_pytorch(guide: torch.Tensor, src: torch.Tensor,
             target_device=output.device,
             tensor_name="filtered_output",
             dtype=guide_dtype,
+            non_blocking=True,
             debug=debug,
             reason="dtype restoration"
         )
@@ -337,7 +339,6 @@ def edge_guided_alpha_upscale(
     rgb_edges = detect_edges_batch(images=rgb_normalized, method='sobel', debug=debug)
     
     # Step 1: Initial bicubic upscale provides smooth base before edge refinement
-    # MPS on PyTorch < 2.8 doesn't support bicubic+antialias - use CPU fallback
     try:
         alpha_upscaled = F.interpolate(
             input_alpha,
@@ -347,13 +348,12 @@ def edge_guided_alpha_upscale(
             antialias=True
         ).clamp(0, 1)
     except NotImplementedError:
-        alpha_upscaled = F.interpolate(
-            input_alpha.cpu(),
+        alpha_upscaled = safe_interpolate_operation(
+            input_alpha,
             size=(H_out, W_out),
             mode='bicubic',
-            align_corners=False,
-            antialias=True
-        ).to(device).clamp(0, 1)
+            align_corners=False
+        ).clamp(0, 1)
     
     if is_binary_mask:
         if debug:
@@ -364,7 +364,8 @@ def edge_guided_alpha_upscale(
             guide=rgb_normalized,
             src=alpha_upscaled,
             radius=2,  # Reduced from 3 for tighter edges
-            eps=0.002
+            eps=0.002,
+            debug=debug
         )
         
         # Step 3: Create tight transition zone using 3x3 max pooling on edge map
@@ -419,7 +420,8 @@ def edge_guided_alpha_upscale(
             guide=rgb_normalized,
             src=alpha_final,
             radius=3,
-            eps=0.002
+            eps=0.002,
+            debug=debug
         )
     
    # Clamp output to valid alpha range [0, 1]

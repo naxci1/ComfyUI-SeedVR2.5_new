@@ -177,12 +177,15 @@ def validate_attention_mode(requested_mode: str, debug=None) -> str:
     Validate attention mode availability with automatic fallback.
     
     Args:
-        requested_mode: 'sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3'
+        requested_mode: 'sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', 'sageattn_3', or 'local_block_sparse'
         debug: Optional debug instance for logging
         
     Returns:
         Validated mode that is available
     """
+    if requested_mode == 'local_block_sparse':
+        return requested_mode
+
     # Flash Attention 3
     if requested_mode == 'flash_attn_3':
         if FLASH_ATTN_3_AVAILABLE:

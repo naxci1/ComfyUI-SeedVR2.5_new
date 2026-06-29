@@ -171,7 +171,7 @@ def _describe_attention_mode(attention_mode: Optional[str]) -> str:
     Generate human-readable description of attention mode configuration.
     
     Args:
-        attention_mode: Attention mode string ('sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3')
+        attention_mode: Attention mode string ('sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', 'sageattn_3', or 'local_block_sparse')
         
     Returns:
         Human-readable description string
@@ -184,7 +184,8 @@ def _describe_attention_mode(attention_mode: Optional[str]) -> str:
         'flash_attn_2': 'Flash Attention 2',
         'flash_attn_3': 'Flash Attention 3',
         'sageattn_2': 'SageAttention 2',
-        'sageattn_3': 'SageAttention 3 (Blackwell)'
+        'sageattn_3': 'SageAttention 3 (Blackwell)',
+        'local_block_sparse': 'Local block-sparse SDPA',
     }
     
     return mode_descriptions.get(attention_mode, attention_mode)

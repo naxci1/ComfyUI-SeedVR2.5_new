@@ -14,6 +14,7 @@
 
 import torch
 import torch.nn.functional as F
+import math
 
 # Import flash/sage attn with automatic fallback from compatibility layer
 from ...optimization.compatibility import (
@@ -64,6 +65,80 @@ def pytorch_varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q=N
     return torch.cat(output_splits, dim=0)
 
 
+def _resolve_local_window_size(local_window_size, video_tokens: int) -> int:
+    if torch.is_tensor(local_window_size):
+        local_window_size = int(local_window_size.item())
+    elif isinstance(local_window_size, (list, tuple)):
+        local_window_size = int(local_window_size[0]) if local_window_size else 0
+
+    if local_window_size is None or local_window_size <= 0:
+        local_window_size = max(8, min(video_tokens, int(math.sqrt(max(video_tokens, 1))) * 4))
+
+    return max(1, min(int(local_window_size), max(video_tokens, 1)))
+
+
+def pytorch_local_varlen_attention(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q=None,
+    max_seqlen_k=None,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    deterministic=False,
+    video_token_counts=None,
+    text_token_counts=None,
+    local_window_size=None,
+):
+    q_splits = list(torch.tensor_split(q, cu_seqlens_q[1:-1].long().cpu(), dim=0))
+    k_splits = list(torch.tensor_split(k, cu_seqlens_k[1:-1].long().cpu(), dim=0))
+    v_splits = list(torch.tensor_split(v, cu_seqlens_k[1:-1].long().cpu(), dim=0))
+
+    output_splits = []
+    for seq_idx, (q_i, k_i, v_i) in enumerate(zip(q_splits, k_splits, v_splits)):
+        seq_q = q_i.shape[0]
+        seq_k = k_i.shape[0]
+        txt_q = int(text_token_counts[seq_idx].item()) if text_token_counts is not None else 0
+        txt_k = int(text_token_counts[seq_idx].item()) if text_token_counts is not None else 0
+        vid_q = int(video_token_counts[seq_idx].item()) if video_token_counts is not None else max(seq_q - txt_q, 0)
+        vid_k = int(video_token_counts[seq_idx].item()) if video_token_counts is not None else max(seq_k - txt_k, 0)
+        radius = _resolve_local_window_size(local_window_size, vid_k)
+
+        q_sdpa = q_i.permute(1, 0, 2).unsqueeze(0)
+        k_sdpa = k_i.permute(1, 0, 2).unsqueeze(0)
+        v_sdpa = v_i.permute(1, 0, 2).unsqueeze(0)
+
+        if vid_q > 0 and vid_k > 0:
+            q_pos = torch.arange(vid_q, device=q_i.device)[:, None]
+            k_pos = torch.arange(vid_k, device=q_i.device)[None, :]
+            video_keep = (q_pos - k_pos).abs() <= radius
+            mask = torch.full((seq_q, seq_k), float("-inf"), device=q_i.device, dtype=q_i.dtype)
+            mask[:vid_q, :vid_k] = torch.where(video_keep, torch.zeros((), device=q_i.device, dtype=q_i.dtype), mask[:vid_q, :vid_k])
+            if txt_k > 0:
+                mask[:vid_q, vid_k:vid_k + txt_k] = 0
+            if txt_q > 0:
+                mask[vid_q:vid_q + txt_q, :] = 0
+            mask = mask.unsqueeze(0).unsqueeze(0)
+        else:
+            mask = None
+
+        output_i = F.scaled_dot_product_attention(
+            q_sdpa,
+            k_sdpa,
+            v_sdpa,
+            attn_mask=mask,
+            dropout_p=dropout_p if not deterministic else 0.0,
+            is_causal=causal and mask is None,
+            scale=softmax_scale,
+        )
+        output_splits.append(output_i.squeeze(0).permute(1, 0, 2))
+
+    return torch.cat(output_splits, dim=0)
+
+
 class TorchAttention(nn.Module):
     def tflops(self, args, kwargs, output) -> float:
         assert len(args) == 0 or len(args) > 2, "query, key should both provided by args / kwargs"
@@ -96,7 +171,7 @@ class FlashAttentionVarlen(nn.Module):
         Initialize with specified attention backend.
         
         Args:
-            attention_mode: 'sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3'
+            attention_mode: 'sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', 'sageattn_3', or 'local_block_sparse'
             compute_dtype: Compute dtype for attention (set by pipeline, defaults to None for auto-detection)
         """
         super().__init__()
@@ -137,6 +212,11 @@ class FlashAttentionVarlen(nn.Module):
             )
         elif self.attention_mode == 'sageattn_2':
             return call_sage_attn_2_varlen(
+                q, k, v, cu_seqlens_q, cu_seqlens_k,
+                max_seqlen_q, max_seqlen_k, **kwargs
+            )
+        elif self.attention_mode == 'local_block_sparse':
+            return pytorch_local_varlen_attention(
                 q, k, v, cu_seqlens_q, cu_seqlens_k,
                 max_seqlen_q, max_seqlen_k, **kwargs
             )

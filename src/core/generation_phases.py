@@ -382,6 +382,7 @@ def encode_all_batches(
                 target_device=ctx['vae_device'],
                 tensor_name=f"video_batch_{encode_idx+1}",
                 dtype=ctx['compute_dtype'],
+                non_blocking=True,
                 debug=debug,
                 reason="VAE encoding",
                 indent_level=1
@@ -454,6 +455,7 @@ def encode_all_batches(
                         tensor=alpha_channel,
                         target_device=ctx['tensor_offload_device'],
                         tensor_name=f"alpha_channel_{encode_idx+1}",
+                        non_blocking=True,
                         debug=debug,
                         reason="storing Alpha channel for upscaling",
                         indent_level=1
@@ -462,6 +464,7 @@ def encode_all_batches(
                         tensor=rgb_video_original,
                         target_device=ctx['tensor_offload_device'],
                         tensor_name=f"rgb_original_{encode_idx+1}",
+                        non_blocking=True,
                         debug=debug,
                         reason="storing RGB edge guidance for Alpha upscaling",
                         indent_level=1
@@ -480,6 +483,7 @@ def encode_all_batches(
                 target_device=ctx['vae_device'],
                 tensor_name=f"transformed_video_{encode_idx+1}",
                 dtype=ctx['compute_dtype'],
+                non_blocking=True,
                 debug=debug,
                 reason="VAE encoding",
                 indent_level=1
@@ -498,6 +502,7 @@ def encode_all_batches(
                     target_device=ctx['tensor_offload_device'],
                     tensor_name=f"latent_{encode_idx+1}",
                     dtype=ctx['compute_dtype'],
+                    non_blocking=True,
                     debug=debug,
                     reason="storing encoded latents for upscaling",
                     indent_level=1
@@ -671,6 +676,7 @@ def upscale_all_batches(
                 target_device=ctx['dit_device'],
                 tensor_name=f"latent_{upscale_idx+1}",
                 dtype=ctx['compute_dtype'],
+                non_blocking=True,
                 debug=debug,
                 reason="DiT upscaling",
                 indent_level=1
@@ -736,6 +742,7 @@ def upscale_all_batches(
                     tensor=upscaled_latents[0],
                     target_device=ctx['tensor_offload_device'],
                     tensor_name=f"upscaled_latent_{upscale_idx+1}",
+                    non_blocking=True,
                     debug=debug,
                     reason="storing upscaled latents for decoding",
                     indent_level=1
@@ -927,6 +934,7 @@ def decode_all_batches(
                 target_device=ctx['vae_device'],
                 tensor_name=f"upscaled_latent_{decode_idx+1}",
                 dtype=ctx['compute_dtype'],
+                non_blocking=True,
                 debug=debug,
                 reason="VAE decoding",
                 indent_level=1
@@ -1005,6 +1013,7 @@ def decode_all_batches(
                 target_device=target_device,
                 tensor_name=f"sample_{decode_idx+1}",
                 dtype=ctx['compute_dtype'],
+                non_blocking=True,
                 debug=debug,
                 reason="writing to final_video",
                 indent_level=1
@@ -1189,6 +1198,7 @@ def postprocess_all_batches(
                     target_device=ctx['final_video'].device,
                     tensor_name=f"alpha_channel_{batch_idx+1}",
                     dtype=ctx['compute_dtype'],
+                    non_blocking=True,
                     debug=debug,
                     reason="writing alpha channel to final_video",
                     indent_level=1
@@ -1241,6 +1251,7 @@ def postprocess_all_batches(
                 target_device=ctx['vae_device'],
                 tensor_name=f"sample_{info_idx+1}",
                 dtype=ctx['compute_dtype'],
+                non_blocking=True,
                 debug=debug,
                 reason="post-processing",
                 indent_level=1
@@ -1290,6 +1301,7 @@ def postprocess_all_batches(
                         tensor=input_video,
                         target_device=sample.device,
                         tensor_name=f"input_video_{info_idx+1}",
+                        non_blocking=True,
                         debug=debug,
                         reason="color correction",
                         indent_level=1
@@ -1360,6 +1372,7 @@ def postprocess_all_batches(
                 target_device=ctx['final_video'].device,
                 tensor_name=f"sample_{info_idx+1}_final",
                 dtype=ctx['compute_dtype'],
+                non_blocking=True,
                 debug=debug,
                 reason="writing processed result to final_video",
                 indent_level=1

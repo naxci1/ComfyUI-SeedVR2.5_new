@@ -50,6 +50,7 @@ import argparse
 import time
 import platform
 import multiprocessing as mp
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, List, Optional, Tuple, Literal, Generator
 from datetime import datetime
 from pathlib import Path
@@ -187,11 +188,25 @@ class FFMPEGVideoWriter:
     def write(self, frame_bgr: np.ndarray):
         if not self.isOpened():
             raise RuntimeError("FFMPEGVideoWriter: ffmpeg process is not running")
-        
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+        frame_rgb = np.ascontiguousarray(frame_bgr[..., ::-1])
         try:
-            self.proc.stdin.write(frame_rgb.astype(np.uint8).tobytes())
+            self.proc.stdin.write(frame_rgb.astype(np.uint8, copy=False).tobytes())
             self.proc.stdin.flush()  # Critical: prevent buffering issues
+        except BrokenPipeError:
+            raise RuntimeError(
+                "FFMPEGVideoWriter: ffmpeg process terminated unexpectedly. "
+                "Check video path, codec support, and disk space."
+            )
+
+    def write_rgb_frames(self, frames_rgb: np.ndarray):
+        if not self.isOpened():
+            raise RuntimeError("FFMPEGVideoWriter: ffmpeg process is not running")
+
+        contiguous_frames = np.ascontiguousarray(frames_rgb.astype(np.uint8, copy=False))
+        try:
+            self.proc.stdin.write(contiguous_frames.tobytes())
+            self.proc.stdin.flush()
         except BrokenPipeError:
             raise RuntimeError(
                 "FFMPEGVideoWriter: ffmpeg process terminated unexpectedly. "
@@ -683,7 +698,10 @@ def _read_frames_from_cap(cap: cv2.VideoCapture, max_frames: int) -> Optional[to
     
     if not frames:
         return None
-    return torch.from_numpy(np.stack(frames)).to(torch.float32)
+    frames_tensor = torch.from_numpy(np.stack(frames)).to(torch.float32)
+    if torch.cuda.is_available():
+        frames_tensor = frames_tensor.pin_memory()
+    return frames_tensor
 
 
 def _stream_video_chunks(
@@ -730,60 +748,73 @@ def _stream_video_chunks(
     chunk_idx = 0
     streaming = chunk_size < frames_to_process
     
-    while frames_read < frames_to_process:
-        read_count = min(chunk_size, frames_to_process - frames_read)
-        new_frames = _read_frames_from_cap(cap, read_count)
-        if new_frames is None:
-            break
-        frames_read += new_frames.shape[0]
-        chunk_idx += 1
-        
-        # Disable prepend_frames after first chunk
-        if chunk_idx > 1:
-            chunk_args.prepend_frames = 0
-        
-        # Prepend context from previous chunk
-        if prev_raw_tail is not None and overlap > 0:
-            context_count = min(overlap, prev_raw_tail.shape[0])
-            frames = torch.cat([prev_raw_tail[-context_count:], new_frames], dim=0)
-        else:
-            frames = new_frames
-            context_count = 0
-        
-        # Log progress if enabled
-        if log_progress and streaming:
+    with ThreadPoolExecutor(max_workers=1) as prefetch_pool:
+        pending_read = None
+
+        def _schedule_next_read() -> Optional[int]:
+            remaining = frames_to_process - frames_read
+            if remaining <= 0:
+                return None
+            next_count = min(chunk_size, remaining)
+            return prefetch_pool.submit(_read_frames_from_cap, cap, next_count)
+
+        pending_read = _schedule_next_read()
+
+        while frames_read < frames_to_process and pending_read is not None:
+            new_frames = pending_read.result()
+            if new_frames is None:
+                break
+
+            frames_read += new_frames.shape[0]
+            chunk_idx += 1
+            pending_read = _schedule_next_read()
+
+            # Disable prepend_frames after first chunk
             if chunk_idx > 1:
+                chunk_args.prepend_frames = 0
+        
+            # Prepend context from previous chunk
+            if prev_raw_tail is not None and overlap > 0:
+                context_count = min(overlap, prev_raw_tail.shape[0])
+                frames = torch.cat([prev_raw_tail[-context_count:], new_frames], dim=0)
+            else:
+                frames = new_frames
+                context_count = 0
+        
+            # Log progress if enabled
+            if log_progress and streaming:
+                if chunk_idx > 1:
+                    debug.log("", category="none", force=True)
+                    debug.log("━" * 60, category="none", force=True)
                 debug.log("", category="none", force=True)
-                debug.log("━" * 60, category="none", force=True)
-            debug.log("", category="none", force=True)
-            debug.log(f"{log_prefix}Chunk {chunk_idx}/{total_chunks}: {new_frames.shape[0]} new + {context_count} context frames", 
-                     category="generation", force=True)
-            debug.log("", category="none", force=True)
+                debug.log(f"{log_prefix}Chunk {chunk_idx}/{total_chunks}: {new_frames.shape[0]} new + {context_count} context frames", 
+                        category="generation", force=True)
+                debug.log("", category="none", force=True)
         
-        # Process chunk
-        result = _process_frames_core(
-            frames_tensor=frames.to(torch.float16),
-            args=chunk_args,
-            device_id=device_id,
-            debug=debug,
-            runner_cache=runner_cache
-        )
+            # Process chunk
+            result = _process_frames_core(
+                frames_tensor=frames.to(torch.float16),
+                args=chunk_args,
+                device_id=device_id,
+                debug=debug,
+                runner_cache=runner_cache
+            )
         
-        # Remove context frames from output
-        if context_count > 0:
-            result = result[context_count:]
+            # Remove context frames from output
+            if context_count > 0:
+                result = result[context_count:]
         
-        # Save tail for next chunk context
-        prev_raw_tail = new_frames[-overlap:].clone() if overlap > 0 else None
+            # Save tail for next chunk context
+            prev_raw_tail = new_frames[-overlap:].detach() if overlap > 0 else None
         
-        # Cleanup before yield
-        del frames
+            # Cleanup before yield
+            del frames
         
-        yield result
+            yield result
         
-        # Memory cleanup between chunks
-        if streaming:
-            clear_memory(debug=debug, deep=True, force=True, timer_name=cleanup_timer_name)
+            # Memory cleanup between chunks
+            if streaming:
+                clear_memory(debug=debug, deep=False, force=False, timer_name=cleanup_timer_name)
 
 
 def _save_image_bgr(frame_np: np.ndarray, file_path: str) -> None:
@@ -847,11 +878,9 @@ def save_frames_to_video(
         if not writer.isOpened():
             raise ValueError(f"Cannot create video writer for: {output_path}")
     
-    for i, frame in enumerate(frames_np):
-        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        writer.write(frame_bgr)
-        if debug.enabled and (i + 1) % 100 == 0:
-            debug.log(f"Written {i + 1}/{T} frames", category="file")
+    writer.write_rgb_frames(frames_np)
+    if debug.enabled and T >= 100:
+        debug.log(f"Written {T} frames", category="file")
     
     return writer  # Caller always closes
 
@@ -1524,8 +1553,8 @@ Examples:
     # Performance
     perf_group = parser.add_argument_group('Performance optimization')
     perf_group.add_argument("--attention_mode", type=str, default="sdpa",
-                        choices=["sdpa", "flash_attn_2", "flash_attn_3", "sageattn_2", "sageattn_3"],
-                        help="Attention backend: 'sdpa' (default), 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3' (Blackwell GPUs)")
+                        choices=["sdpa", "flash_attn_2", "flash_attn_3", "sageattn_2", "sageattn_3", "local_block_sparse"],
+                        help="Attention backend: 'sdpa' (default), 'flash_attn_2', 'flash_attn_3', 'sageattn_2', 'sageattn_3' (Blackwell GPUs), or 'local_block_sparse'")
     perf_group.add_argument("--compile_dit", action="store_true", 
                         help="Enable torch.compile for DiT model (20-40%% speedup, requires PyTorch 2.0+ and Triton)")
     perf_group.add_argument("--compile_vae", action="store_true",

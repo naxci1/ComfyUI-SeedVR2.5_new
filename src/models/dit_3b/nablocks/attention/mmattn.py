@@ -131,6 +131,8 @@ class NaMMAttention(nn.Module):
             cu_seqlens_k=cache("mm_seqlens", lambda: safe_pad_operation(all_len.cumsum(0), (1, 0)).int()),
             max_seqlen_q=cache("mm_maxlen", lambda: all_len.max()),
             max_seqlen_k=cache("mm_maxlen", lambda: all_len.max()),
+            video_token_counts=vid_len,
+            text_token_counts=txt_len,
         ).type_as(vid_q)
 
         attn = rearrange(attn, "l h d -> l (h d)")
@@ -254,6 +256,8 @@ class NaSwinAttention(NaMMAttention):
             ),
             max_seqlen_q=cache_win("vid_max_seqlen_q", lambda: all_len_win.max()),
             max_seqlen_k=cache_win("vid_max_seqlen_k", lambda: all_len_win.max()),
+            video_token_counts=vid_len_win,
+            text_token_counts=txt_len_win,
         ).type_as(vid_q)
 
         # text pooling
