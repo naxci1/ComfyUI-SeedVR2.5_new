@@ -1153,7 +1153,7 @@ class MainWindow(QMainWindow):
         g, f = _make_group("Performance")
         self.attention_mode_combo = QComboBox()
         self.attention_mode_combo.addItems([
-            "sdpa", "flash_attn_2", "flash_attn_3", "sageattn_2", "sageattn_3"
+            "sdpa", "flash_attn_2", "flash_attn_3", "sageattn_2", "sageattn_3", "local_block_sparse"
         ])
         _attn_idx = self.attention_mode_combo.findText("sageattn_3")
         if _attn_idx >= 0:
