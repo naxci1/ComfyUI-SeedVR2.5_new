@@ -246,13 +246,6 @@ class VideoDiffusionInfer():
                 except StopIteration:
                     vae_dtype = dtype  # Fallback
 
-                # Temporal chunking: enabled for 5-D video tensors on CUDA when the
-                # temporal dimension exceeds the fallback threshold (T_lat > 9, i.e.,
-                # > 33 video frames in 4n+1 format).  MPS uses unified memory so
-                # offloading to CPU brings no VRAM benefit there.
-                temporal_downsample_factor = self.config.vae.model.get(
-                    "temporal_downsample_factor", 4
-                )
                 use_temporal_chunks = (
                     latent.ndim == 5
                     and latent.shape[2] > 9
@@ -297,37 +290,6 @@ class VideoDiffusionInfer():
                 samples = [sample.squeeze(0) for sample in samples]
 
         return samples
-
-    def _decode_single_chunk(
-        self,
-        chunk_lat: torch.Tensor,
-        device: torch.device,
-        vae_dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """Decode a single latent chunk, handling dtype/autocast automatically.
-
-        Args:
-            chunk_lat: Latent chunk [1, C, T_chunk, H, W] already on *device*.
-            device: VAE device.
-            vae_dtype: Actual dtype of the VAE model weights.
-
-        Returns:
-            Decoded sample [1, C, T_vid_chunk, H_out, W_out] on *device*.
-        """
-        if vae_dtype != chunk_lat.dtype:
-            with torch.autocast(device.type, chunk_lat.dtype, enabled=True):
-                return self.vae.decode(
-                    chunk_lat,
-                    tiled=self.decode_tiled,
-                    tile_size=self.decode_tile_size,
-                    tile_overlap=self.decode_tile_overlap,
-                ).sample
-        return self.vae.decode(
-            chunk_lat,
-            tiled=self.decode_tiled,
-            tile_size=self.decode_tile_size,
-            tile_overlap=self.decode_tile_overlap,
-        ).sample
 
     def _decode_with_temporal_chunks(
         self,
