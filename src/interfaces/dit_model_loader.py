@@ -33,29 +33,6 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
     ]
 
     @classmethod
-    def INPUT_TYPES(cls):
-        devices = get_device_list()
-        dit_models = get_available_dit_models()
-
-        return {
-            "required": {
-                "model": (dit_models, {"default": DEFAULT_DIT}),
-                "device": (devices, {"default": devices[0]}),
-                "attention_mode": (cls.ATTENTION_MODE_OPTIONS, {"default": "sdpa"}),
-            },
-            "optional": {
-                "offload_device": (
-                    get_device_list(include_none=True, include_cpu=True),
-                    {"default": "none"},
-                ),
-                "cache_model": ("BOOLEAN", {"default": False}),
-                "blocks_to_swap": ("INT", {"default": 0, "min": 0, "max": 36, "step": 1}),
-                "swap_io_components": ("BOOLEAN", {"default": False}),
-                "torch_compile_args": ("TORCH_COMPILE_ARGS",),
-            },
-        }
-    
-    @classmethod
     def define_schema(cls) -> io.Schema:        
         devices = get_device_list()
         dit_models = get_available_dit_models()
