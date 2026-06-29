@@ -201,7 +201,13 @@ class VideoDiffusionInfer():
 
     @torch.no_grad()
     def vae_decode(self, latents: List[Tensor]) -> List[Tensor]:
-        """VAE decode with configured dtype - converts latents to samples with optional tiling"""
+        """VAE decode with configured dtype - converts latents to samples with optional tiling.
+
+        For large video batches (T_lat > 9) on CUDA, temporal chunking is used to reduce
+        peak VRAM: the latent is split into overlapping 5-latent-frame chunks that are
+        decoded independently and moved to CPU immediately.  Chunk boundaries are
+        smoothed via linear blending over the overlap region, eliminating flickering.
+        """
         samples = []
         if len(latents) > 0:
             # Use VAE model's current device
@@ -240,30 +246,47 @@ class VideoDiffusionInfer():
                 except StopIteration:
                     vae_dtype = dtype  # Fallback
 
-                # Use autocast if VAE dtype differs from latent dtype
-                # Skip autocast on MPS (only supports bf16, unified memory = no benefit)
-                if vae_dtype != latent.dtype:
-                    if device.type == 'mps':
-                        # MPS: explicit dtype conversion instead of autocast
-                        latent = latent.to(vae_dtype)
-                        sample = self.vae.decode(
-                            latent,
-                            tiled=self.decode_tiled, tile_size=self.decode_tile_size,
-                            tile_overlap=self.decode_tile_overlap
-                        ).sample
-                    else:
-                        with torch.autocast(device.type, latent.dtype, enabled=True):
+                # Temporal chunking: enabled for 5-D video tensors on CUDA when the
+                # temporal dimension exceeds the fallback threshold (T_lat > 9, i.e.,
+                # > 33 video frames in 4n+1 format).  MPS uses unified memory so
+                # offloading to CPU brings no VRAM benefit there.
+                temporal_downsample_factor = self.config.vae.model.get(
+                    "temporal_downsample_factor", 4
+                )
+                use_temporal_chunks = (
+                    latent.ndim == 5
+                    and latent.shape[2] > 9
+                    and device.type == 'cuda'
+                )
+
+                if use_temporal_chunks:
+                    sample = self._decode_with_temporal_chunks(
+                        latent, device, vae_dtype, temporal_downsample_factor
+                    )
+                else:
+                    # Single-pass decode (original path)
+                    if vae_dtype != latent.dtype:
+                        if device.type == 'mps':
+                            # MPS: explicit dtype conversion instead of autocast
+                            latent = latent.to(vae_dtype)
                             sample = self.vae.decode(
                                 latent,
                                 tiled=self.decode_tiled, tile_size=self.decode_tile_size,
                                 tile_overlap=self.decode_tile_overlap
                             ).sample
-                else:
-                    sample = self.vae.decode(
-                        latent,
-                        tiled=self.decode_tiled, tile_size=self.decode_tile_size,
-                        tile_overlap=self.decode_tile_overlap
-                    ).sample
+                        else:
+                            with torch.autocast(device.type, latent.dtype, enabled=True):
+                                sample = self.vae.decode(
+                                    latent,
+                                    tiled=self.decode_tiled, tile_size=self.decode_tile_size,
+                                    tile_overlap=self.decode_tile_overlap
+                                ).sample
+                    else:
+                        sample = self.vae.decode(
+                            latent,
+                            tiled=self.decode_tiled, tile_size=self.decode_tile_size,
+                            tile_overlap=self.decode_tile_overlap
+                        ).sample
 
                 if hasattr(self.vae, "postprocess"):
                     sample = self.vae.postprocess(sample)
@@ -276,6 +299,163 @@ class VideoDiffusionInfer():
                 samples = [sample.squeeze(0) for sample in samples]
 
         return samples
+
+    def _decode_single_chunk(
+        self,
+        chunk_lat: torch.Tensor,
+        device: torch.device,
+        vae_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Decode a single latent chunk, handling dtype/autocast automatically.
+
+        Args:
+            chunk_lat: Latent chunk [1, C, T_chunk, H, W] already on *device*.
+            device: VAE device.
+            vae_dtype: Actual dtype of the VAE model weights.
+
+        Returns:
+            Decoded sample [1, C, T_vid_chunk, H_out, W_out] on *device*.
+        """
+        if vae_dtype != chunk_lat.dtype:
+            with torch.autocast(device.type, chunk_lat.dtype, enabled=True):
+                return self.vae.decode(
+                    chunk_lat,
+                    tiled=self.decode_tiled,
+                    tile_size=self.decode_tile_size,
+                    tile_overlap=self.decode_tile_overlap,
+                ).sample
+        return self.vae.decode(
+            chunk_lat,
+            tiled=self.decode_tiled,
+            tile_size=self.decode_tile_size,
+            tile_overlap=self.decode_tile_overlap,
+        ).sample
+
+    def _decode_with_temporal_chunks(
+        self,
+        latent: torch.Tensor,
+        device: torch.device,
+        vae_dtype: torch.dtype,
+        temporal_downsample_factor: int,
+    ) -> torch.Tensor:
+        """Decode a video latent tensor using temporal chunking to cut peak VRAM.
+
+        The latent [1, C, T_lat, H, W] is split into overlapping 5-latent-frame chunks
+        (17 video frames each at 4n+1).  Each chunk is decoded independently, moved to
+        CPU memory immediately, and CUDA cache is freed.  Boundaries between adjacent
+        chunks are smoothed via a linear alpha fade over the overlap region to prevent
+        luminance jumps or flickering.
+
+        Chunk geometry (4n+1 temporal format, factor=4):
+          CHUNK_LAT  = 5  → 17 video frames per chunk
+          OVERLAP_LAT = 2  → 5 video frames of blend zone at each boundary
+          STRIDE_LAT  = 3  → 12 new video frames per chunk advance
+
+        Args:
+            latent: Video latent [1, C, T_lat, H, W] on CUDA.
+            device: CUDA device of the VAE model.
+            vae_dtype: Weight dtype of the VAE model.
+            temporal_downsample_factor: Temporal downsampling factor (typically 4).
+
+        Returns:
+            Decoded video tensor [1, C, T_vid, H_out, W_out] back on *device*.
+        """
+        CHUNK_LAT = 5    # latent frames per chunk → (5-1)*4+1 = 17 video frames
+        OVERLAP_LAT = 2  # latent frames shared between adjacent chunks
+        STRIDE_LAT = CHUNK_LAT - OVERLAP_LAT  # = 3
+
+        T_lat = latent.shape[2]
+        T_vid_total = (T_lat - 1) * temporal_downsample_factor + 1
+
+        # Build chunk start positions along the latent temporal dimension
+        chunk_starts: List[int] = []
+        s = 0
+        while s + CHUNK_LAT <= T_lat:
+            chunk_starts.append(s)
+            s += STRIDE_LAT
+        # Append an explicit last chunk if it would not be fully covered
+        if not chunk_starts or chunk_starts[-1] + CHUNK_LAT < T_lat:
+            last_start = T_lat - CHUNK_LAT
+            if not chunk_starts or last_start > chunk_starts[-1]:
+                chunk_starts.append(last_start)
+
+        if not chunk_starts:
+            # Safety fallback: T_lat < CHUNK_LAT – single-pass decode
+            return self._decode_single_chunk(latent, device, vae_dtype)
+
+        self.debug.log(
+            f"Temporal chunked decode: {T_lat} latent frames, "
+            f"{len(chunk_starts)} chunks (chunk={CHUNK_LAT}, overlap={OVERLAP_LAT})",
+            category="vae", indent_level=1,
+        )
+
+        # ── Decode each chunk, offload to CPU immediately ──────────────────
+        # Each entry: (cpu_tensor [1,C,T_vid_chunk,H,W], global_vid_start)
+        decoded_chunks: List[Tuple[torch.Tensor, int]] = []
+
+        for chunk_idx, s in enumerate(chunk_starts):
+            e = min(s + CHUNK_LAT, T_lat)
+            chunk_lat = latent[:, :, s:e, :, :]  # [1, C, T_chunk, H, W]
+
+            chunk_sample = self._decode_single_chunk(chunk_lat, device, vae_dtype)
+
+            global_vid_start = s * temporal_downsample_factor
+            chunk_sample_cpu = chunk_sample.cpu()
+            del chunk_sample
+            torch.cuda.empty_cache()
+
+            decoded_chunks.append((chunk_sample_cpu, global_vid_start))
+
+            self.debug.log(
+                f"  Chunk {chunk_idx + 1}/{len(chunk_starts)}: "
+                f"lat [{s},{e}) → vid [{global_vid_start},"
+                f"{global_vid_start + chunk_sample_cpu.shape[2]})",
+                category="vae", indent_level=2,
+            )
+
+        # ── Assemble on CPU with linear blend at overlap boundaries ────────
+        sample_ref = decoded_chunks[0][0]
+        C_out, H_out, W_out = sample_ref.shape[1], sample_ref.shape[3], sample_ref.shape[4]
+
+        output_cpu = torch.zeros(
+            (1, C_out, T_vid_total, H_out, W_out),
+            dtype=sample_ref.dtype,
+            device='cpu',
+        )
+
+        prev_vid_end = 0  # exclusive end of the already-written region
+
+        for chunk_sample_cpu, vid_start in decoded_chunks:
+            T_vid_chunk = chunk_sample_cpu.shape[2]
+            vid_end = vid_start + T_vid_chunk  # exclusive
+
+            overlap_frames = max(0, prev_vid_end - vid_start)
+
+            if overlap_frames > 0:
+                # Linear alpha: 0 (keep previous) → 1 (take current) over overlap zone
+                blend_len = min(overlap_frames, T_vid_total - vid_start)
+                alpha = torch.linspace(0.0, 1.0, blend_len, dtype=sample_ref.dtype)
+                alpha = alpha.view(1, 1, blend_len, 1, 1)  # broadcast over B,C,H,W
+
+                prev_vals = output_cpu[:, :, vid_start : vid_start + blend_len]
+                cur_vals = chunk_sample_cpu[:, :, :blend_len]
+                output_cpu[:, :, vid_start : vid_start + blend_len] = (
+                    prev_vals * (1.0 - alpha) + cur_vals * alpha
+                )
+
+            # Write non-overlapping tail of this chunk
+            write_start = max(vid_start + overlap_frames, prev_vid_end)
+            local_offset = write_start - vid_start
+            write_end = min(vid_end, T_vid_total)
+            if write_start < write_end:
+                output_cpu[:, :, write_start:write_end] = (
+                    chunk_sample_cpu[:, :, local_offset : local_offset + (write_end - write_start)]
+                )
+
+            prev_vid_end = max(prev_vid_end, vid_end)
+
+        # Return on the original CUDA device
+        return output_cpu.to(device)
 
 
     def timestep_transform(self, timesteps: Tensor, latents_shapes: Tensor):
