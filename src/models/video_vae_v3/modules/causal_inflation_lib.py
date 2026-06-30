@@ -227,30 +227,7 @@ class InflatedCausalConv3d(Conv3d):
             and get_sequence_parallel_group() is None
         ):
             return self.basic_forward(input, memory_state)
-        if (
-            torch.is_tensor(input)
-            and get_sequence_parallel_group() is None
-            and memory_state == MemoryState.DISABLED
-        ):
-            return self._single_tensor_slicing_forward(input, memory_state)
         return self.slicing_forward(input, memory_state)
-
-    def _single_tensor_slicing_forward(
-        self,
-        input: Tensor,
-        memory_state: MemoryState = MemoryState.UNSET,
-    ) -> Tensor:
-        cache_size = self.kernel_size[0] - self.stride[0]
-        cache = cache_send_recv(
-            [input], cache_size=cache_size, memory=self.memory, times=self.temporal_padding * 2
-        )
-
-        padding = tuple(x for x in reversed(self.padding) for _ in range(2))
-        return self.memory_limit_conv(
-            input,
-            padding=padding,
-            prev_cache=cache,
-        )
 
     def basic_forward(self, input: Tensor, memory_state: MemoryState = MemoryState.UNSET):
         mem_size = self.stride[0] - self.kernel_size[0]
@@ -278,6 +255,12 @@ class InflatedCausalConv3d(Conv3d):
         input: Union[Tensor, List[Tensor]],
         memory_state: MemoryState = MemoryState.UNSET,
     ) -> Tensor:
+        if (
+            torch.is_tensor(input)
+            and get_sequence_parallel_group() is None
+            and memory_state == MemoryState.DISABLED
+        ):
+            return self.basic_forward(input, memory_state)
         squeeze_out = False
         if torch.is_tensor(input):
             input = [input]
