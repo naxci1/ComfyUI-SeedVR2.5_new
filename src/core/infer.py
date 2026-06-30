@@ -120,12 +120,16 @@ class VideoDiffusionInfer():
         if getattr(self, '_fp8_compute_failed', False):
             return False
         try:
-            dt = next(self.vae.parameters()).dtype
-            _fp8 = tuple(
+            fp8_types = tuple(
                 getattr(torch, n) for n in ('float8_e4m3fn', 'float8_e5m2')
                 if hasattr(torch, n)
             )
-            return bool(_fp8) and dt in _fp8
+            if not fp8_types:
+                return False
+            for name, param in self.vae.named_parameters():
+                if 'norm' not in name and param.dtype in fp8_types:
+                    return True
+            return False
         except (StopIteration, AttributeError):
             return False
 
