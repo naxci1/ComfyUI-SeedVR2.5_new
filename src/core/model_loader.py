@@ -677,6 +677,8 @@ def _prepare_fp8_vae_state(state: Dict[str, torch.Tensor],
 
 
 
+def _convert_state_dtype(state: Dict[str, torch.Tensor], target_dtype: torch.dtype,
+                         model_type: str, debug: Optional['Debug'] = None) -> Dict[str, torch.Tensor]:
     """Convert floating point tensors in state dict to target dtype."""
     debug.log(f"Converting {model_type} weights to {target_dtype} during loading", category="precision")
     debug.start_timer(f"{model_type.lower()}_dtype_convert")
