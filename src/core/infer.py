@@ -50,6 +50,8 @@ class VideoDiffusionInfer():
         self.decode_tile_size = decode_tile_size
         self.decode_tile_overlap = decode_tile_overlap
         self.tile_debug = tile_debug
+        # FP8 VAE compute: set to True once any FP8 forward fails → forces BF16 for session
+        self._fp8_compute_failed = False
         
     def get_condition(self, latent: Tensor, latent_blur: Tensor, task: str) -> Tensor:
         t, h, w, c = latent.shape
@@ -113,6 +115,20 @@ class VideoDiffusionInfer():
 
     # -------------------------------- Helper ------------------------------- #
 
+    def _vae_is_fp8(self) -> bool:
+        """Return True if the VAE model carries FP8 weights and FP8 compute has not failed yet."""
+        if getattr(self, '_fp8_compute_failed', False):
+            return False
+        try:
+            dt = next(self.vae.parameters()).dtype
+            _fp8 = tuple(
+                getattr(torch, n) for n in ('float8_e4m3fn', 'float8_e5m2')
+                if hasattr(torch, n)
+            )
+            return bool(_fp8) and dt in _fp8
+        except (StopIteration, AttributeError):
+            return False
+
     @torch.no_grad()
     def vae_encode(self, samples: List[Tensor]) -> List[Tensor]:
         """VAE encode with configured dtype - converts samples to latents with optional tiling"""
@@ -166,6 +182,26 @@ class VideoDiffusionInfer():
                         else:
                             latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
                                                 tile_overlap=self.encode_tile_overlap).posterior.mode().squeeze(2)
+                    elif self._vae_is_fp8():
+                        # FP8 VAE: skip autocast so Conv3d weights stay in FP8 during compute
+                        try:
+                            print(f"[FP8 DEBUG] encoder param dtype={vae_dtype}, input dtype={sample.dtype}")
+                            if use_sample:
+                                latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
+                                                        tile_overlap=self.encode_tile_overlap).latent
+                            else:
+                                latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
+                                                    tile_overlap=self.encode_tile_overlap).posterior.mode().squeeze(2)
+                        except Exception as _fp8_err:
+                            print(f"[WARNING] FP8 compute failed: {_fp8_err}, falling back to BF16")
+                            self._fp8_compute_failed = True
+                            with torch.autocast(device.type, torch.bfloat16, enabled=True):
+                                if use_sample:
+                                    latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
+                                                            tile_overlap=self.encode_tile_overlap).latent
+                                else:
+                                    latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
+                                                        tile_overlap=self.encode_tile_overlap).posterior.mode().squeeze(2)
                     else:
                         with torch.autocast(device.type, sample.dtype, enabled=True):
                             if use_sample:
@@ -255,6 +291,24 @@ class VideoDiffusionInfer():
                             tiled=self.decode_tiled, tile_size=self.decode_tile_size,
                             tile_overlap=self.decode_tile_overlap
                         ).sample
+                    elif self._vae_is_fp8():
+                        # FP8 VAE: skip autocast so Conv3d weights stay in FP8 during compute
+                        try:
+                            print(f"[FP8 DEBUG] decoder param dtype={vae_dtype}, input dtype={latent.dtype}")
+                            sample = self.vae.decode(
+                                latent,
+                                tiled=self.decode_tiled, tile_size=self.decode_tile_size,
+                                tile_overlap=self.decode_tile_overlap
+                            ).sample
+                        except Exception as _fp8_err:
+                            print(f"[WARNING] FP8 compute failed: {_fp8_err}, falling back to BF16")
+                            self._fp8_compute_failed = True
+                            with torch.autocast(device.type, torch.bfloat16, enabled=True):
+                                sample = self.vae.decode(
+                                    latent,
+                                    tiled=self.decode_tiled, tile_size=self.decode_tile_size,
+                                    tile_overlap=self.decode_tile_overlap
+                                ).sample
                     else:
                         with torch.autocast(device.type, latent.dtype, enabled=True):
                             sample = self.vae.decode(

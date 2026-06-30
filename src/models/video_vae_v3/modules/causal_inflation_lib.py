@@ -92,6 +92,45 @@ class InflatedCausalConv3d(Conv3d):
         Workaround: Call torch.cudnn_convolution directly to bypass buggy layer.
         Status is logged at startup in compatibility.py.
         """
+        # FP8 fast path — native FP8 Conv3d kernel (Blackwell / cuDNN 9)
+        _fp8_types = tuple(
+            getattr(torch, _n) for _n in ('float8_e4m3fn', 'float8_e5m2')
+            if hasattr(torch, _n)
+        )
+        if _fp8_types and weight.dtype in _fp8_types:
+            _cudnn_ok = (
+                hasattr(torch.backends, 'cudnn') and
+                torch.backends.cudnn.is_available() and
+                getattr(torch.backends.cudnn, 'enabled', True)
+            )
+            if _cudnn_ok:
+                try:
+                    out = torch.cudnn_convolution(
+                        input, weight, self.padding, self.stride, self.dilation, self.groups,
+                        benchmark=False, deterministic=False, allow_tf32=True
+                    )
+                    if bias is not None:
+                        out += bias.reshape((1, -1) + (1,) * (out.ndim - 2))
+                    return out
+                except RuntimeError:
+                    pass
+                # Try aten convolution path (avoids dispatch bug)
+                try:
+                    return torch.ops.aten.convolution.default(
+                        input, weight, bias,
+                        list(self.stride), list(self.padding), list(self.dilation),
+                        False, [0] * len(self.stride), self.groups
+                    )
+                except RuntimeError:
+                    pass
+            # BF16 fallback: cast input+weight to bf16, return in original dtype
+            _orig_dtype = input.dtype
+            _fb_input = input.to(torch.bfloat16)
+            _fb_weight = weight.to(torch.bfloat16)
+            _fb_bias = bias.to(torch.bfloat16) if bias is not None else None
+            _result = super()._conv_forward(_fb_input, _fb_weight, _fb_bias, *args, **kwargs)
+            return _result.to(_orig_dtype)
+
         if (self._use_nvidia_conv3d_workaround and 
             weight.dtype in (torch.float16, torch.bfloat16) and 
             hasattr(torch.backends.cudnn, 'is_available') and
@@ -369,6 +408,16 @@ def causal_norm_wrapper(norm_layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
     else:
         channel_last_memory_format = None
 
+    # FP8 tensors are not supported by norm layers — cast to BF16, restore afterwards
+    _fp8_types = tuple(
+        getattr(torch, _n) for _n in ('float8_e4m3fn', 'float8_e5m2')
+        if hasattr(torch, _n)
+    )
+    _original_dtype = x.dtype
+    _is_fp8_input = bool(_fp8_types) and _original_dtype in _fp8_types
+    if _is_fp8_input:
+        x = x.to(torch.bfloat16)
+
     if isinstance(norm_layer, (nn.LayerNorm, RMSNorm)):
         if x.ndim == 4:
             x = x.permute(0, 2, 3, 1).contiguous()
@@ -376,6 +425,8 @@ def causal_norm_wrapper(norm_layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
             x = x.permute(0, 3, 1, 2).contiguous()
             if channel_last_memory_format is not None:
                 x = x.contiguous(memory_format=channel_last_memory_format)
+            if _is_fp8_input:
+                x = x.to(_original_dtype)
             return x
         if x.ndim == 5:
             x = x.permute(0, 2, 3, 4, 1).contiguous()
@@ -383,10 +434,15 @@ def causal_norm_wrapper(norm_layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
             x = x.permute(0, 4, 1, 2, 3).contiguous()
             if channel_last_memory_format is not None:
                 x = x.contiguous(memory_format=channel_last_memory_format)
+            if _is_fp8_input:
+                x = x.to(_original_dtype)
             return x
     if isinstance(norm_layer, (nn.GroupNorm, nn.BatchNorm2d, nn.SyncBatchNorm)):
         if x.ndim <= 4:
-            return norm_layer(x)
+            result = norm_layer(x)
+            if _is_fp8_input:
+                result = result.to(_original_dtype)
+            return result
         if x.ndim == 5:
             b, c, t, h, w = x.shape
             b_int, t_int, c_int, h_int, w_int = int(b), int(t), int(c), int(h), int(w)
@@ -438,6 +494,8 @@ def causal_norm_wrapper(norm_layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
             x = x.reshape(b_int, t_int, c_int, h_int, w_int).permute(0, 2, 1, 3, 4).contiguous()
             if channel_last_memory_format is not None:
                 x = x.contiguous(memory_format=channel_last_memory_format)
+            if _is_fp8_input:
+                x = x.to(_original_dtype)
             return x
     raise NotImplementedError
 
