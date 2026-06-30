@@ -389,7 +389,8 @@ def causal_norm_wrapper(norm_layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
             return norm_layer(x)
         if x.ndim == 5:
             b, c, t, h, w = x.shape
-            x = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+            b_int, t_int, c_int, h_int, w_int = int(b), int(t), int(c), int(h), int(w)
+            x = x.permute(0, 2, 1, 3, 4).reshape(b_int * t_int, c_int, h_int, w_int)
             memory_occupy = x.numel() * x.element_size() / 1024**3
             can_run_one_pass = True
             if isinstance(norm_layer, nn.GroupNorm) and memory_occupy > get_norm_limit():
@@ -434,7 +435,7 @@ def causal_norm_wrapper(norm_layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
                     debug=getattr(norm_layer, 'debug', None),
                     operation_name="GroupNorm.direct"
                 )
-            x = x.reshape(b, t, c, h, w).permute(0, 2, 1, 3, 4).contiguous()
+            x = x.reshape(b_int, t_int, c_int, h_int, w_int).permute(0, 2, 1, 3, 4).contiguous()
             if channel_last_memory_format is not None:
                 x = x.contiguous(memory_format=channel_last_memory_format)
             return x
