@@ -1060,6 +1060,7 @@ def _process_frames_core(
     )
     
     # Phase 3: Decode
+    torch.cuda.empty_cache()
     ctx = decode_all_batches(
         runner, ctx=ctx, debug=debug, progress_callback=None,
         cache_model=cache_vae

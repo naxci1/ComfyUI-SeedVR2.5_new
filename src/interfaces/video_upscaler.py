@@ -494,6 +494,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             )
 
             # Phase 3: Decode
+            torch.cuda.empty_cache()
             ctx = decode_all_batches(
                 runner,
                 ctx=ctx,

@@ -212,6 +212,9 @@ class VideoDiffusionInfer():
         """VAE decode with configured dtype - converts latents to samples with optional tiling"""
         samples = []
         if len(latents) > 0:
+            # Free any cached VRAM from Phase 2 before decoding
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             # Use VAE model's current device
             # This ensures consistency with where the VAE model is loaded
             try:
