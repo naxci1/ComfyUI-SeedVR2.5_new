@@ -843,21 +843,74 @@ class VideoAutoencoderKL(nn.Module):
 
     def slicing_decode(self, z: torch.Tensor) -> torch.Tensor:
         sp_size = get_sequence_parallel_world_size()
-        if self.use_slicing and (z.shape[2] - 1) > self.slicing_latent_min_size * sp_size:
-            z_slices = z[:, :, 1:].split(split_size=self.slicing_latent_min_size * sp_size, dim=2)
-            decoded_slices = [
-                self._decode(
-                    torch.cat((z[:, :, :1], z_slices[0]), dim=2),
-                    memory_state=MemoryState.INITIALIZING,
-                )
-            ]
-            for z_idx in range(1, len(z_slices)):
-                decoded_slices.append(
-                    self._decode(z_slices[z_idx], memory_state=MemoryState.ACTIVE)
-                )
-            return torch.cat(decoded_slices, dim=2)
-        else:
+        if not self.use_slicing:
             return self._decode(z, memory_state=MemoryState.DISABLED)
+
+        split_size = self._adaptive_decode_split_size(z, sp_size)
+        if (z.shape[2] - 1) <= split_size:
+            return self._decode(z, memory_state=MemoryState.DISABLED)
+
+        z_slices = z[:, :, 1:].split(split_size=split_size, dim=2)
+        first_decoded = self._decode(
+            torch.cat((z[:, :, :1], z_slices[0]), dim=2),
+            memory_state=MemoryState.INITIALIZING,
+        )
+
+        estimated_total_t = max(
+            first_decoded.shape[2],
+            1 + (z.shape[2] - 1) * self.temporal_downsample_factor,
+        )
+        out_shape = (
+            first_decoded.shape[0],
+            first_decoded.shape[1],
+            estimated_total_t,
+            first_decoded.shape[3],
+            first_decoded.shape[4],
+        )
+        decoded = torch.empty(
+            out_shape,
+            dtype=first_decoded.dtype,
+            device=first_decoded.device,
+            memory_format=torch.channels_last_3d if first_decoded.ndim == 5 else torch.contiguous_format,
+        )
+
+        cursor = first_decoded.shape[2]
+        decoded[:, :, :cursor] = first_decoded
+        for z_idx in range(1, len(z_slices)):
+            decoded_slice = self._decode(z_slices[z_idx], memory_state=MemoryState.ACTIVE)
+            next_cursor = cursor + decoded_slice.shape[2]
+            if next_cursor > decoded.shape[2]:
+                grown = torch.empty(
+                    (
+                        decoded.shape[0],
+                        decoded.shape[1],
+                        next_cursor,
+                        decoded.shape[3],
+                        decoded.shape[4],
+                    ),
+                    dtype=decoded.dtype,
+                    device=decoded.device,
+                    memory_format=torch.channels_last_3d if decoded.ndim == 5 else torch.contiguous_format,
+                )
+                grown[:, :, :cursor] = decoded[:, :, :cursor]
+                decoded = grown
+            decoded[:, :, cursor:next_cursor] = decoded_slice
+            cursor = next_cursor
+        return decoded[:, :, :cursor]
+
+    def _adaptive_decode_split_size(self, z: torch.Tensor, sp_size: int) -> int:
+        base_split_size = self.slicing_latent_min_size * sp_size
+        remaining_t = max(1, z.shape[2] - 1)
+        if not (z.is_cuda and torch.cuda.is_available()):
+            return min(base_split_size, remaining_t)
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info(device=z.device)
+            bytes_per_frame = max(1, z[:, :, :1].numel() * z.element_size())
+            estimated_decode_bytes_per_frame = bytes_per_frame * max(8, self.temporal_downsample_factor * 2)
+            adaptive_t = max(1, int((free_bytes * 0.7) // estimated_decode_bytes_per_frame))
+            return max(base_split_size, min(remaining_t, adaptive_t))
+        except Exception:
+            return min(base_split_size, remaining_t)
 
     def forward(self, x: torch.FloatTensor) -> CausalAutoencoderOutput:
         with torch.no_grad() if self.freeze_encoder else nullcontext():

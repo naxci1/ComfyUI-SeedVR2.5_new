@@ -18,7 +18,6 @@ from typing import List, Optional, Union
 import torch
 import torch.nn.functional as F
 from diffusers.models.normalization import RMSNorm
-from einops import rearrange
 from torch import Tensor, nn
 from torch.nn import Conv3d
 
@@ -228,7 +227,30 @@ class InflatedCausalConv3d(Conv3d):
             and get_sequence_parallel_group() is None
         ):
             return self.basic_forward(input, memory_state)
+        if (
+            torch.is_tensor(input)
+            and get_sequence_parallel_group() is None
+            and memory_state == MemoryState.DISABLED
+        ):
+            return self._single_tensor_slicing_forward(input, memory_state)
         return self.slicing_forward(input, memory_state)
+
+    def _single_tensor_slicing_forward(
+        self,
+        input: Tensor,
+        memory_state: MemoryState = MemoryState.UNSET,
+    ) -> Tensor:
+        cache_size = self.kernel_size[0] - self.stride[0]
+        cache = cache_send_recv(
+            [input], cache_size=cache_size, memory=self.memory, times=self.temporal_padding * 2
+        )
+
+        padding = tuple(x for x in reversed(self.padding) for _ in range(2))
+        return self.memory_limit_conv(
+            input,
+            padding=padding,
+            prev_cache=cache,
+        )
 
     def basic_forward(self, input: Tensor, memory_state: MemoryState = MemoryState.UNSET):
         mem_size = self.stride[0] - self.kernel_size[0]
@@ -356,25 +378,46 @@ def init_causal_conv3d(
 
 
 def causal_norm_wrapper(norm_layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    is_cuda_tensor = x.is_cuda and torch.cuda.is_available()
+    if x.ndim == 5 and x.is_contiguous(memory_format=torch.channels_last_3d):
+        channel_last_memory_format = torch.channels_last_3d
+    elif x.ndim == 4 and x.is_contiguous(memory_format=torch.channels_last):
+        channel_last_memory_format = torch.channels_last
+    else:
+        channel_last_memory_format = None
+
     if isinstance(norm_layer, (nn.LayerNorm, RMSNorm)):
         if x.ndim == 4:
-            x = rearrange(x, "b c h w -> b h w c")
+            x = x.permute(0, 2, 3, 1).contiguous()
             x = norm_layer(x)
-            x = rearrange(x, "b h w c -> b c h w")
+            x = x.permute(0, 3, 1, 2).contiguous()
+            if channel_last_memory_format is not None:
+                x = x.contiguous(memory_format=channel_last_memory_format)
             return x
         if x.ndim == 5:
-            x = rearrange(x, "b c t h w -> b t h w c")
+            x = x.permute(0, 2, 3, 4, 1).contiguous()
             x = norm_layer(x)
-            x = rearrange(x, "b t h w c -> b c t h w")
+            x = x.permute(0, 4, 1, 2, 3).contiguous()
+            if channel_last_memory_format is not None:
+                x = x.contiguous(memory_format=channel_last_memory_format)
             return x
     if isinstance(norm_layer, (nn.GroupNorm, nn.BatchNorm2d, nn.SyncBatchNorm)):
         if x.ndim <= 4:
             return norm_layer(x)
         if x.ndim == 5:
-            t = x.size(2)
-            x = rearrange(x, "b c t h w -> (b t) c h w")
+            b, c, t, h, w = x.shape
+            x = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
             memory_occupy = x.numel() * x.element_size() / 1024**3
+            can_run_one_pass = True
             if isinstance(norm_layer, nn.GroupNorm) and memory_occupy > get_norm_limit():
+                can_run_one_pass = False
+                if is_cuda_tensor:
+                    try:
+                        free_memory, _ = torch.cuda.mem_get_info(device=x.device)
+                        can_run_one_pass = free_memory >= int(x.numel() * x.element_size() * 2.0)
+                    except Exception:
+                        can_run_one_pass = False
+            if isinstance(norm_layer, nn.GroupNorm) and not can_run_one_pass:
                 num_chunks = min(4 if x.element_size() == 2 else 2, norm_layer.num_groups)
                 assert norm_layer.num_groups % num_chunks == 0
                 num_groups_per_chunk = norm_layer.num_groups // num_chunks
@@ -408,7 +451,9 @@ def causal_norm_wrapper(norm_layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
                     debug=getattr(norm_layer, 'debug', None),
                     operation_name="GroupNorm.direct"
                 )
-            x = rearrange(x, "(b t) c h w -> b c t h w", t=t)
+            x = x.reshape(b, t, c, h, w).permute(0, 2, 1, 3, 4).contiguous()
+            if channel_last_memory_format is not None:
+                x = x.contiguous(memory_format=channel_last_memory_format)
             return x
     raise NotImplementedError
 
