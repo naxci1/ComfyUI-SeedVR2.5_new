@@ -862,9 +862,7 @@ def decode_all_batches(
     total_frames = ctx.get('total_frames', 0)
     C = 4 if ctx.get('is_rgba', False) else 3
     
-    # Pre-allocate final_video at the START of decode phase (before any batch processing)
-    # This ensures we only need memory for final_video + 1 batch, not final_video + all batch_samples
-    # MPS: keep on device (unified memory, no benefit to CPU offload)
+    # Determine accumulation device for decoded frames (JIT — no upfront allocation)
     if ctx['tensor_offload_device'] is not None:
         target_device = ctx['tensor_offload_device']
     elif ctx['vae_device'].type == 'mps':
@@ -872,11 +870,12 @@ def decode_all_batches(
     else:
         target_device = 'cpu'
     channels_str = "RGBA" if C == 4 else "RGB"
-    required_gb = (total_frames * true_h * true_w * C * 2) / (1024**3)
-    debug.log(f"Pre-allocating output tensor: {total_frames} frames, {true_w}x{true_h}px, {channels_str} ({required_gb:.2f}GB)", 
+    debug.log(f"Decoding {total_frames} frames ({true_w}x{true_h}px, {channels_str}) — JIT allocation", 
               category="setup", force=True)
-    
-    ctx['final_video'] = torch.empty((total_frames, true_h, true_w, C), dtype=ctx['compute_dtype'], device=target_device)
+
+    # JIT frame accumulation: allocate as each batch is decoded, not upfront
+    batch_frames_list = []
+    prev_overlap_tail = None  # tail of previous batch kept for temporal blending
     
     # Track batch write positions for Phase 4 processing
     # Each entry: (write_start, write_end, batch_idx, ori_length)
@@ -976,45 +975,54 @@ def decode_all_batches(
                 write_end = current_write_idx + batch_frames
             else:
                 # Subsequent batches with overlap: blend overlapping region
-                if temporal_overlap < batch_frames and current_write_idx >= temporal_overlap:
-                    # Blend overlapping region in-place on final_video
-                    prev_tail = ctx['final_video'][current_write_idx - temporal_overlap:current_write_idx]
+                if temporal_overlap < batch_frames and current_write_idx >= temporal_overlap and prev_overlap_tail is not None:
+                    # Blend overlapping region using the stored tail of the previous batch
                     cur_head = sample[:temporal_overlap]
                     
                     # Move to same device for blending if needed
-                    if prev_tail.device != cur_head.device:
-                        cur_head = cur_head.to(prev_tail.device)
+                    if prev_overlap_tail.device != cur_head.device:
+                        cur_head = cur_head.to(prev_overlap_tail.device)
                     
-                    blended = blend_overlapping_frames(prev_tail, cur_head, temporal_overlap)
-                    ctx['final_video'][current_write_idx - temporal_overlap:current_write_idx] = blended
+                    blended = blend_overlapping_frames(prev_overlap_tail, cur_head, temporal_overlap)
+                    # Replace the tail of the last accumulated batch with the blended frames
+                    if batch_frames_list:
+                        last = batch_frames_list[-1]
+                        batch_frames_list[-1] = torch.cat(
+                            [last[:-temporal_overlap], blended.to(last.device)], dim=0
+                        )
+                        del last
                     
                     debug.log(f"Blended {temporal_overlap} overlapping frames at positions {current_write_idx - temporal_overlap}-{current_write_idx}", 
                              category="video", indent_level=1)
                     
-                    # Write only non-overlapping part
+                    # Keep only non-overlapping part of current sample
                     sample = sample[temporal_overlap:]
                     batch_frames = sample.shape[0]
-                    del prev_tail, cur_head, blended
+                    del cur_head, blended
+                    prev_overlap_tail = None
                 
                 write_start = current_write_idx
                 write_end = current_write_idx + batch_frames
             
-            # Move sample to target device and write directly to final_video
+            # Move sample to accumulation device
             sample = manage_tensor(
                 tensor=sample,
                 target_device=target_device,
                 tensor_name=f"sample_{decode_idx+1}",
                 dtype=ctx['compute_dtype'],
                 debug=debug,
-                reason="writing to final_video",
+                reason="accumulating decoded batch",
                 indent_level=1
             )
             
-            # Write to final_video - for RGBA, write only RGB channels (VAE outputs 3 channels)
-            if ctx.get('is_rgba', False):
-                ctx['final_video'][write_start:write_end, :, :, :3] = sample
+            # Store tail for next batch's temporal blending (before appending)
+            if temporal_overlap > 0 and batch_frames > temporal_overlap:
+                prev_overlap_tail = sample[-temporal_overlap:].detach()
             else:
-                ctx['final_video'][write_start:write_end] = sample
+                prev_overlap_tail = None
+            
+            # JIT: append decoded batch (always 3-channel; RGBA expansion happens after loop)
+            batch_frames_list.append(sample)
             
             # Store batch info for Phase 4 processing
             ctx['decode_batch_info'].append((write_start, write_end, decode_idx, ori_length))
@@ -1035,6 +1043,22 @@ def decode_all_batches(
                                 1, "Phase 3: Decoding")
             
             decode_idx += 1
+        
+        # Assemble final_video from JIT-collected batches
+        if batch_frames_list:
+            rgb_frames = torch.cat(batch_frames_list, dim=0)
+            del batch_frames_list
+            if C == 4:  # RGBA: create 4-channel tensor and fill RGB channels
+                ctx['final_video'] = torch.zeros(
+                    (rgb_frames.shape[0], rgb_frames.shape[1], rgb_frames.shape[2], 4),
+                    dtype=ctx['compute_dtype'], device=rgb_frames.device
+                )
+                ctx['final_video'][:, :, :, :3] = rgb_frames
+                del rgb_frames
+            else:
+                ctx['final_video'] = rgb_frames
+        else:
+            ctx['final_video'] = torch.empty((0, 0, 0, 0), dtype=ctx['compute_dtype'])
         
         # Store padding stats for Phase 4 final summary
         ctx['total_padding_removed'] = total_padding_removed
