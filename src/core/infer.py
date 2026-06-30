@@ -139,6 +139,7 @@ class VideoDiffusionInfer():
         use_sample = self.config.vae.get("use_sample", True)
         latents = []
         if len(samples) > 0:
+            self.debug.log(f"[FP8-TEST] vae_encode entered", category="info", indent_level=0)
             # Use VAE model's current device
             # This ensures consistency with where the VAE model is loaded
             try:
@@ -157,6 +158,7 @@ class VideoDiffusionInfer():
                 shift = torch.tensor(shift, device=device, dtype=dtype)
 
             vae_is_fp8 = self._vae_is_fp8()
+            self.debug.log(f"[FP8-TEST] _vae_is_fp8 returned: {vae_is_fp8}", category="info", indent_level=0)
             # Detect non-norm VAE dtype once (not per-batch)
             vae_dtype = dtype
             try:
@@ -181,7 +183,7 @@ class VideoDiffusionInfer():
                 if vae_is_fp8:
                     # FP8 VAE: skip autocast so Conv3d weights stay in FP8 during compute
                     try:
-                        print(f"[FP8 DEBUG] encoder: FP8 compute active")
+                        self.debug.log(f"[FP8-TEST] FP8 compute path active", category="info", indent_level=1)
                         if use_sample:
                             latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
                                                     tile_overlap=self.encode_tile_overlap).latent
@@ -189,7 +191,7 @@ class VideoDiffusionInfer():
                             latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
                                                 tile_overlap=self.encode_tile_overlap).posterior.mode().squeeze(2)
                     except Exception as _fp8_err:
-                        print(f"[WARNING] FP8 compute failed: {_fp8_err}, falling back to BF16")
+                        self.debug.log(f"[FP8-TEST] FP8 FAILED, using BF16 fallback", category="warning", indent_level=1)
                         self._fp8_compute_failed = True
                         vae_is_fp8 = False
                         with torch.autocast(device.type, sample.dtype, enabled=True):
@@ -254,6 +256,7 @@ class VideoDiffusionInfer():
         """VAE decode with configured dtype - converts latents to samples with optional tiling"""
         samples = []
         if len(latents) > 0:
+            self.debug.log(f"[FP8-TEST] vae_decode entered", category="info", indent_level=0)
             # Use VAE model's current device
             # This ensures consistency with where the VAE model is loaded
             try:
@@ -272,6 +275,7 @@ class VideoDiffusionInfer():
                 shift = torch.tensor(shift, device=device, dtype=dtype)
 
             vae_is_fp8 = self._vae_is_fp8()
+            self.debug.log(f"[FP8-TEST] _vae_is_fp8 returned: {vae_is_fp8}", category="info", indent_level=0)
             # Detect non-norm VAE dtype once (not per-batch)
             vae_dtype = dtype
             try:
@@ -298,14 +302,14 @@ class VideoDiffusionInfer():
                 if vae_is_fp8:
                     # FP8 VAE: skip autocast so Conv3d weights stay in FP8 during compute
                     try:
-                        print(f"[FP8 DEBUG] decoder: FP8 compute active")
+                        self.debug.log(f"[FP8-TEST] FP8 compute path active", category="info", indent_level=1)
                         sample = self.vae.decode(
                             latent,
                             tiled=self.decode_tiled, tile_size=self.decode_tile_size,
                             tile_overlap=self.decode_tile_overlap
                         ).sample
                     except Exception as _fp8_err:
-                        print(f"[WARNING] FP8 compute failed: {_fp8_err}, falling back to BF16")
+                        self.debug.log(f"[FP8-TEST] FP8 FAILED, using BF16 fallback", category="warning", indent_level=1)
                         self._fp8_compute_failed = True
                         vae_is_fp8 = False
                         with torch.autocast(device.type, latent.dtype, enabled=True):
