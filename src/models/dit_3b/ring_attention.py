@@ -52,7 +52,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .compatibility import (
+from ...optimization.compatibility import (
     call_sage_attn_3_varlen,
     call_sage_attn_2_varlen,
     call_flash_attn_3_varlen,
