@@ -136,6 +136,12 @@ class VideoDiffusionInfer():
             if isinstance(shift, ListConfig):
                 shift = torch.tensor(shift, device=device, dtype=dtype)
 
+            # Detect VAE model dtype once (not per-batch)
+            try:
+                vae_dtype = next(self.vae.parameters()).dtype
+            except StopIteration:
+                vae_dtype = dtype  # Fallback
+
             # Group samples of the same shape to batches if enabled.
             if self.config.vae.grouping:
                 batches, indices = na.pack(samples)
@@ -146,12 +152,6 @@ class VideoDiffusionInfer():
             for sample in batches:
                 if hasattr(self.vae, "preprocess"):
                     sample = self.vae.preprocess(sample)
-
-                # Detect VAE model dtype
-                try:
-                    vae_dtype = next(self.vae.parameters()).dtype
-                except StopIteration:
-                    vae_dtype = dtype  # Fallback
 
                 # Use autocast if VAE dtype differs from input dtype
                 # Skip autocast on MPS (only supports bf16, unified memory = no benefit)
@@ -196,6 +196,10 @@ class VideoDiffusionInfer():
             
             self.debug.log(f"Latents shape: {latents[0].shape}", category="info", indent_level=1)
 
+            # Free VRAM before DiT sampling
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+
         return latents
     
 
@@ -221,6 +225,12 @@ class VideoDiffusionInfer():
             if isinstance(shift, ListConfig):
                 shift = torch.tensor(shift, device=device, dtype=dtype)
 
+            # Detect VAE model dtype once (not per-batch)
+            try:
+                vae_dtype = next(self.vae.parameters()).dtype
+            except StopIteration:
+                vae_dtype = dtype  # Fallback
+
             # Group samples of the same shape to batches if enabled.
             if self.config.vae.grouping:
                 latents, indices = na.pack(latents)
@@ -233,12 +243,6 @@ class VideoDiffusionInfer():
                 latent = latent / scale + shift
                 latent = optimized_channels_to_second(latent)
                 latent = latent.squeeze(2)
-
-                # Detect VAE model dtype
-                try:
-                    vae_dtype = next(self.vae.parameters()).dtype
-                except StopIteration:
-                    vae_dtype = dtype  # Fallback
 
                 # Use autocast if VAE dtype differs from latent dtype
                 # Skip autocast on MPS (only supports bf16, unified memory = no benefit)
@@ -384,12 +388,4 @@ class VideoDiffusionInfer():
 
         latents = na.unflatten(latents, latents_shapes)
 
-        # Clean up temporary tensors
-        del latents_cond
-        del latents_shapes
-        del text_pos_embeds
-        del text_neg_embeds
-        del text_pos_shapes
-        del text_neg_shapes
-            
         return latents

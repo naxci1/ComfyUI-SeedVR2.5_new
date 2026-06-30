@@ -583,6 +583,10 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
     if override_dtype is not None:
         state = _convert_state_dtype(state, override_dtype, model_type, debug)
     
+    # FP8 VAE: keep Conv3d weights as fp8, cast GroupNorm weights to bf16
+    if not checkpoint_path.endswith('.gguf') and _is_fp8_vae_checkpoint(checkpoint_path, state):
+        state = _prepare_fp8_vae_state(state, debug)
+    
     # Log weight statistics
     _log_weight_stats(state, used_meta, model_type, debug)
     
@@ -602,8 +606,77 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
     return model
 
 
-def _convert_state_dtype(state: Dict[str, torch.Tensor], target_dtype: torch.dtype, 
-                        model_type: str, debug: Optional['Debug'] = None) -> Dict[str, torch.Tensor]:
+def _is_fp8_vae_checkpoint(checkpoint_path: str, state: Dict[str, torch.Tensor]) -> bool:
+    """Detect if this is an FP8 VAE checkpoint by filename or weight dtype."""
+    import os
+    basename = os.path.basename(checkpoint_path).lower()
+    if 'fp8' in basename and 'vae' in basename:
+        return True
+    # Also detect by weight dtype in state dict
+    fp8_dtypes = set()
+    if hasattr(torch, 'float8_e4m3fn'):
+        fp8_dtypes.add(torch.float8_e4m3fn)
+    if hasattr(torch, 'float8_e5m2'):
+        fp8_dtypes.add(torch.float8_e5m2)
+    if fp8_dtypes:
+        fp8_count = sum(1 for v in state.values() if torch.is_tensor(v) and v.dtype in fp8_dtypes)
+        return fp8_count > len(state) // 2
+    return False
+
+
+def _prepare_fp8_vae_state(state: Dict[str, torch.Tensor], 
+                            debug: Optional['Debug'] = None) -> Dict[str, torch.Tensor]:
+    """
+    Prepare FP8 VAE state dict for loading.
+    
+    Conv3d weights are kept as fp8 for Blackwell cuDNN acceleration.
+    GroupNorm weights/biases are cast to bf16 since GroupNorm cannot run in fp8.
+    Falls back to full bf16 on any error.
+    """
+    try:
+        if debug:
+            debug.log("FP8 VAE: keeping Conv3d weights as fp8, casting GroupNorm to bf16",
+                     category="vae", force=True)
+        # GroupNorm weight/bias keys end with norm patterns
+        _NORM_SUFFIXES = ('.norm', '.norm1', '.norm2', '.conv_norm_out',
+                          'group_norm', 'groupnorm', 'group norm')
+        _NORM_PARAMS = ('weight', 'bias')
+        
+        for key in list(state.keys()):
+            tensor = state[key]
+            if not torch.is_tensor(tensor) or not tensor.is_floating_point():
+                continue
+            # Cast GroupNorm parameters to bf16
+            key_lower = key.lower()
+            is_norm_param = (
+                any(suf in key_lower for suf in _NORM_SUFFIXES)
+                and key_lower.split('.')[-1] in _NORM_PARAMS
+            )
+            # Also detect by tensor shape: GroupNorm weight/bias are 1-D
+            if is_norm_param or (tensor.ndim == 1 and tensor.numel() < 8192):
+                fp8_dtypes = set()
+                if hasattr(torch, 'float8_e4m3fn'):
+                    fp8_dtypes.add(torch.float8_e4m3fn)
+                if hasattr(torch, 'float8_e5m2'):
+                    fp8_dtypes.add(torch.float8_e5m2)
+                if tensor.dtype in fp8_dtypes:
+                    state[key] = tensor.to(torch.bfloat16)
+        return state
+    except Exception as e:
+        if debug:
+            debug.log(
+                f"FP8 VAE load warning: {e} — falling back to bf16 for all weights",
+                level="WARNING", category="vae", force=True
+            )
+        # Full bf16 fallback
+        for key in list(state.keys()):
+            tensor = state[key]
+            if torch.is_tensor(tensor) and tensor.is_floating_point():
+                state[key] = tensor.to(torch.bfloat16)
+        return state
+
+
+
     """Convert floating point tensors in state dict to target dtype."""
     debug.log(f"Converting {model_type} weights to {target_dtype} during loading", category="precision")
     debug.start_timer(f"{model_type.lower()}_dtype_convert")

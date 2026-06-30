@@ -74,6 +74,8 @@ class InflatedCausalConv3d(Conv3d):
         self.memory_device = memory_device
         self.padding = (0, *self.padding[1:])  # Remove temporal pad to keep causal.
         self.memory_limit = float("inf")
+        # Cache workaround flag at init time to avoid module attribute lookup per forward call
+        self._use_nvidia_conv3d_workaround = NVIDIA_CONV3D_MEMORY_BUG_WORKAROUND
 
     def set_memory_limit(self, value: float):
         self.memory_limit = value
@@ -91,7 +93,7 @@ class InflatedCausalConv3d(Conv3d):
         Workaround: Call torch.cudnn_convolution directly to bypass buggy layer.
         Status is logged at startup in compatibility.py.
         """
-        if (NVIDIA_CONV3D_MEMORY_BUG_WORKAROUND and 
+        if (self._use_nvidia_conv3d_workaround and 
             weight.dtype in (torch.float16, torch.bfloat16) and 
             hasattr(torch.backends.cudnn, 'is_available') and
             torch.backends.cudnn.is_available() and
@@ -127,11 +129,13 @@ class InflatedCausalConv3d(Conv3d):
             return super().forward(x)
 
         # Compute tensor shape after concat & padding.
-        shape = torch.tensor(x.size())
+        shape = list(x.size())
         if prev_cache is not None:
             shape[split_dim - 1] += prev_cache.size(split_dim - 1)
-        shape[-3:] += torch.tensor(padding).view(3, 2).sum(-1).flip(0)
-        memory_occupy = shape.prod() * x.element_size() / 1024**3  # GiB
+        padding_adds = torch.tensor(padding).view(3, 2).sum(-1).flip(0).tolist()
+        for k, add in enumerate(padding_adds):
+            shape[-(3 - k)] += add
+        memory_occupy = math.prod(shape) * x.element_size() / 1024**3  # GiB
         if memory_occupy < self.memory_limit or split_dim == x.ndim:
             x_concat = x
             if prev_cache is not None:
@@ -244,7 +248,7 @@ class InflatedCausalConv3d(Conv3d):
         ):
             self.memory = memory
             if self.memory_device == "cpu" and self.memory is not None:
-                self.memory = self.memory.to("cpu")
+                self.memory = self.memory.to("cpu", non_blocking=True)
         return super().forward(input)
 
     def slicing_forward(
@@ -275,7 +279,7 @@ class InflatedCausalConv3d(Conv3d):
             if cache_size <= input[-1].size(2):
                 self.memory = input[-1][:, :, -cache_size:].detach().contiguous()
                 if self.memory_device == "cpu" and self.memory is not None:
-                    self.memory = self.memory.to("cpu")
+                    self.memory = self.memory.to("cpu", non_blocking=True)
 
         padding = tuple(x for x in reversed(self.padding) for _ in range(2))
         for i in range(len(input)):
@@ -432,9 +436,11 @@ def extend_head(tensor: Tensor, times: int = 2, memory: Optional[Tensor] = None)
     if times == 0:
         return tensor
     else:
-        tile_repeat = [1] * tensor.ndim
-        tile_repeat[2] = times
-        return torch.cat(tensors=(torch.tile(tensor[:, :, :1], tile_repeat), tensor), dim=2)
+        # expand_shape: same as tensor except dim-2 has `times` frames (zero-copy view)
+        expand_shape = list(tensor.shape)
+        expand_shape[2] = times
+        first_frame = tensor[:, :, :1].expand(expand_shape)
+        return torch.cat((first_frame, tensor), dim=2)
 
 
 def inflate_weight(weight_2d: torch.Tensor, weight_3d: torch.Tensor, inflation_mode: str):

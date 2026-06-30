@@ -167,31 +167,36 @@ class Upsample3D(nn.Module):
 
         if self.slicing:
             split_size = hidden_states.size(2) // 2
-            hidden_states = list(
+            hs_list = list(
                 hidden_states.split([split_size, hidden_states.size(2) - split_size], dim=2)
             )
+            for i in range(len(hs_list)):
+                hs_list[i] = self.upscale_conv(hs_list[i])
+                hs_list[i] = rearrange(
+                    hs_list[i],
+                    "b (x y z c) f h w -> b c (f z) (h x) (w y)",
+                    x=self.spatial_ratio,
+                    y=self.spatial_ratio,
+                    z=self.temporal_ratio,
+                )
+            # [Overridden] For causal temporal conv
+            if self.temporal_up and memory_state != MemoryState.ACTIVE:
+                hs_list[0] = remove_head(hs_list[0])
+            hs_list = self.conv(hs_list, memory_state=memory_state)
+            return torch.cat(hs_list, dim=2)
         else:
-            hidden_states = [hidden_states]
-
-        for i in range(len(hidden_states)):
-            hidden_states[i] = self.upscale_conv(hidden_states[i])
-            hidden_states[i] = rearrange(
-                hidden_states[i],
+            # Fast path: no list wrapping overhead
+            hidden_states = self.upscale_conv(hidden_states)
+            hidden_states = rearrange(
+                hidden_states,
                 "b (x y z c) f h w -> b c (f z) (h x) (w y)",
                 x=self.spatial_ratio,
                 y=self.spatial_ratio,
                 z=self.temporal_ratio,
             )
-
-        # [Overridden] For causal temporal conv
-        if self.temporal_up and memory_state != MemoryState.ACTIVE:
-            hidden_states[0] = remove_head(hidden_states[0])
-
-        if self.slicing:
-            hidden_states = self.conv(hidden_states, memory_state=memory_state)
-            return torch.cat(hidden_states, dim=2)
-        else:
-            return self.conv(hidden_states[0], memory_state=memory_state)
+            if self.temporal_up and memory_state != MemoryState.ACTIVE:
+                hidden_states = remove_head(hidden_states)
+            return self.conv(hidden_states, memory_state=memory_state)
 
 
 class Downsample3D(nn.Module):
@@ -689,13 +694,8 @@ class Decoder3D(nn.Module):
         sample = self.mid_block(sample, memory_state=memory_state)
 
         # up
-        for up_block, sac in zip(self.up_blocks, self.gradient_checkpointing):
-            sample = gradient_checkpointing(
-                up_block,
-                sample,
-                memory_state=memory_state,
-                enabled=self.training and sac,
-            )
+        for up_block in self.up_blocks:
+            sample = up_block(sample, memory_state=memory_state)
 
         # post-process
         sample = causal_norm_wrapper(self.conv_norm_out, sample)
