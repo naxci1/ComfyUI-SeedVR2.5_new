@@ -718,7 +718,6 @@ def _probe_bfloat16_support() -> bool:
     try:
         a = torch.randn(8, 8, dtype=torch.bfloat16, device='cuda:0')
         _ = torch.matmul(a, a)
-        del a
         return True
     except RuntimeError as e:
         if "CUBLAS_STATUS_NOT_SUPPORTED" in str(e):
@@ -828,7 +827,7 @@ class CompatibleDiT(torch.nn.Module):
                 if hasattr(module, 'rope') and hasattr(module.rope, 'freqs'):
                     if module.rope.freqs.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
                         if module.rope.freqs.device.type == "mps":
-                            module.rope.freqs.data = module.rope.freqs.to("cpu").to(target_dtype).to("mps")
+                            module.rope.freqs.data = module.rope.freqs.to("cpu", non_blocking=True).to(target_dtype).to("mps")
                         else:
                             module.rope.freqs.data = module.rope.freqs.to(target_dtype)
                         converted += 1
@@ -850,10 +849,9 @@ class CompatibleDiT(torch.nn.Module):
                 original_dtype = param.dtype
             if param.dtype != target_dtype:
                 if param.device.type == "mps":
-                    temp_cpu = param.data.to("cpu")
+                    temp_cpu = param.data.to("cpu", non_blocking=True)
                     temp_converted = temp_cpu.to(target_dtype)
                     param.data = temp_converted.to("mps")
-                    del temp_cpu, temp_converted
                 else:
                     param.data = param.data.to(target_dtype)
                 converted_count += 1
@@ -865,10 +863,9 @@ class CompatibleDiT(torch.nn.Module):
                 continue
             if buffer.dtype != target_dtype:
                 if buffer.device.type == "mps":
-                    temp_cpu = buffer.data.to("cpu")
+                    temp_cpu = buffer.data.to("cpu", non_blocking=True)
                     temp_converted = temp_cpu.to(target_dtype)
                     buffer.data = temp_converted.to("mps")
-                    del temp_cpu, temp_converted
                 else:
                     buffer.data = buffer.data.to(target_dtype)
                 converted_count += 1
