@@ -679,14 +679,24 @@ def _prepare_fp8_vae_state(state: Dict[str, torch.Tensor],
 
 def _convert_state_dtype(state: Dict[str, torch.Tensor], target_dtype: torch.dtype,
                          model_type: str, debug: Optional['Debug'] = None) -> Dict[str, torch.Tensor]:
-    """Convert floating point tensors in state dict to target dtype."""
+    """Convert floating point tensors in state dict to target dtype, preserving FP8 tensors."""
     debug.log(f"Converting {model_type} weights to {target_dtype} during loading", category="precision")
     debug.start_timer(f"{model_type.lower()}_dtype_convert")
-    
+
+    fp8_types = tuple(
+        getattr(torch, n) for n in ('float8_e4m3fn', 'float8_e5m2')
+        if hasattr(torch, n)
+    )
+
     for key in state:
-        if torch.is_tensor(state[key]) and state[key].is_floating_point():
-            state[key] = state[key].to(target_dtype)
-    
+        value = state[key]
+        if torch.is_tensor(value) and value.is_floating_point():
+            # Preserve FP8 tensors — do NOT convert them to bf16/fp16.
+            if fp8_types and value.dtype in fp8_types:
+                continue
+            if value.dtype != target_dtype:
+                state[key] = value.to(target_dtype)
+
     debug.end_timer(f"{model_type.lower()}_dtype_convert", f"{model_type} weights converted to {target_dtype}")
     return state
 
