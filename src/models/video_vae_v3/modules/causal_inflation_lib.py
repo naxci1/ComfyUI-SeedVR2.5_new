@@ -374,20 +374,23 @@ def init_causal_conv3d(
 def causal_norm_wrapper(norm_layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
     if isinstance(norm_layer, (nn.LayerNorm, RMSNorm)):
         if x.ndim == 4:
-            b, c, h, w = int(x.shape[0]), int(x.shape[1]), int(x.shape[2]), int(x.shape[3])
+            target_shape = tuple(int(dim) for dim in x.shape)
+            b, c, h, w = target_shape
             x = x.contiguous(memory_format=torch.channels_last).reshape(b, h, w, c)
             x = norm_layer(x)
-            return x.reshape(b, c, h, w)
+            return x.reshape(target_shape)
         if x.ndim == 5:
-            b, c, t, h, w = int(x.shape[0]), int(x.shape[1]), int(x.shape[2]), int(x.shape[3]), int(x.shape[4])
+            target_shape = tuple(int(dim) for dim in x.shape)
+            b, c, t, h, w = target_shape
             x = x.contiguous(memory_format=torch.channels_last_3d).reshape(b, t, h, w, c)
             x = norm_layer(x)
-            return x.reshape(b, c, t, h, w)
+            return x.reshape(target_shape)
     if isinstance(norm_layer, (nn.GroupNorm, nn.BatchNorm2d, nn.SyncBatchNorm)):
         if x.ndim <= 4:
             return norm_layer(x)
         if x.ndim == 5:
-            b, c, t, h, w = int(x.shape[0]), int(x.shape[1]), int(x.shape[2]), int(x.shape[3]), int(x.shape[4])
+            target_shape = tuple(int(dim) for dim in x.shape)
+            b, c, t, h, w = target_shape
             x = x.contiguous(memory_format=torch.channels_last_3d).reshape(b * t, c, h, w)
             memory_occupy = x.numel() * x.element_size() / 1024**3
             if isinstance(norm_layer, nn.GroupNorm) and memory_occupy > get_norm_limit():
@@ -424,7 +427,7 @@ def causal_norm_wrapper(norm_layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
                     debug=getattr(norm_layer, 'debug', None),
                     operation_name="GroupNorm.direct"
                 )
-            return x.reshape(b, c, t, h, w)
+            return x.reshape(target_shape)
     raise NotImplementedError
 
 

@@ -1443,6 +1443,8 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                         weight_w[-ov_w:] = 1 - ramp_cache['w'][:ov_w]
 
                 # Separable application (no 2D mask to save memory)
+                eff_h_lat = int(eff_h_lat)
+                eff_w_lat = int(eff_w_lat)
                 weight_h_5d = weight_h.view(1, 1, 1, eff_h_lat, 1)
                 weight_w_5d = weight_w.view(1, 1, 1, 1, eff_w_lat)
                 encoded_tile.mul_(weight_h_5d).mul_(weight_w_5d)
@@ -1605,6 +1607,8 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                         weight_w[-ov_w_out:] = 1 - ramp_cache['w'][:ov_w_out]
 
                 # Separable application (no 2D mask to save memory)
+                h_out = int(h_out)
+                w_out = int(w_out)
                 weight_h_5d = weight_h.view(1, 1, 1, h_out, 1)
                 weight_w_5d = weight_w.view(1, 1, 1, 1, w_out)
                 decoded_tile.mul_(weight_h_5d).mul_(weight_w_5d)
