@@ -124,15 +124,17 @@ class InflatedCausalConv3d(Conv3d):
         shape[-1] += padding[0] + padding[1]
         memory_occupy = math.prod(shape) * x.element_size() / 1024**3  # GiB
         if memory_occupy < self.memory_limit or split_dim == x.ndim:
-            x_concat = x
+            # Merge prev_cache into x and immediately release the original references so
+            # CUDA can free them before the padding + conv allocations below.
             if prev_cache is not None:
-                x_concat = torch.cat([prev_cache, x], dim=split_dim - 1)
-            
+                x = torch.cat([prev_cache, x], dim=split_dim - 1)
+                prev_cache = None  # release the ghost reference
+
             def pad_and_forward():
-                padded = safe_pad_operation(x_concat, padding, mode='constant', value=0.0)
+                padded = safe_pad_operation(x, padding, mode='constant', value=0.0)
                 with ignore_padding(self):
                     return Conv3d.forward(self, padded)
-            
+
             return retry_on_oom(
                 pad_and_forward,
                 debug=getattr(self, 'debug', None),
@@ -235,7 +237,9 @@ class InflatedCausalConv3d(Conv3d):
         ):
             self.memory = memory
             if self.memory_device == "cpu" and self.memory is not None:
-                self.memory = self.memory.to("cpu", non_blocking=True)
+                # Use blocking transfer so the VRAM source is freed immediately
+                # rather than holding it alive until the async DMA completes.
+                self.memory = self.memory.to("cpu", non_blocking=False)
         return super().forward(input)
 
     def _slicing_forward_tensor(
@@ -260,7 +264,9 @@ class InflatedCausalConv3d(Conv3d):
             if cache_size <= input.size(2):
                 self.memory = input[:, :, -cache_size:].detach().contiguous()
                 if self.memory_device == "cpu" and self.memory is not None:
-                    self.memory = self.memory.to("cpu", non_blocking=True)
+                    # Use blocking transfer so the VRAM source is freed immediately
+                    # rather than holding it alive until the async DMA completes.
+                    self.memory = self.memory.to("cpu", non_blocking=False)
 
         padding = tuple(x for x in reversed(self.padding) for _ in range(2))
         return self.memory_limit_conv(
@@ -295,7 +301,9 @@ class InflatedCausalConv3d(Conv3d):
             if cache_size <= input[-1].size(2):
                 self.memory = input[-1][:, :, -cache_size:].detach().contiguous()
                 if self.memory_device == "cpu" and self.memory is not None:
-                    self.memory = self.memory.to("cpu", non_blocking=True)
+                    # Use blocking transfer so the VRAM source is freed immediately
+                    # rather than holding it alive until the async DMA completes.
+                    self.memory = self.memory.to("cpu", non_blocking=False)
 
         padding = tuple(x for x in reversed(self.padding) for _ in range(2))
         for i in range(len(input)):
@@ -310,7 +318,10 @@ class InflatedCausalConv3d(Conv3d):
                     input[i] = torch.cat([cache, input[i]], dim=2)
                     cache = None
                 assert cache_size <= input[i].size(2), f"{cache_size} > {input[i].size(2)}"
-                next_cache = input[i][:, :, -cache_size:]
+                # Use .detach().contiguous() to make a physical copy rather than a view.
+                # A bare slice keeps the entire pre-conv input[i] tensor alive in VRAM
+                # across the conv call and the next loop iteration (ghost tensor).
+                next_cache = input[i][:, :, -cache_size:].detach().contiguous()
 
             # Conv forward for this input slice.
             input[i] = self.memory_limit_conv(

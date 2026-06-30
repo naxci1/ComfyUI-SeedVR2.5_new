@@ -387,7 +387,8 @@ def retry_on_oom(func, *args, debug=None, operation_name="operation", **kwargs):
         clear_memory(debug=debug, deep=True, force=True, timer_name=operation_name)
         # Let memory settle
         time.sleep(0.5)
-        debug.log_memory_state("After memory clearing", show_tensors=False, detailed_tensors=False)
+        if debug:
+            debug.log_memory_state("After memory clearing", show_tensors=False, detailed_tensors=False)
         
         # Single retry
         try:
