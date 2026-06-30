@@ -14,15 +14,17 @@
 
 from enum import Enum
 from typing import Optional
-import numpy as np
 import torch
 from diffusers.models.normalization import RMSNorm
-from einops import rearrange
 from torch import Tensor, nn
 
 from ....common.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def _expand_temporal_head(tensor: Tensor, times: int) -> Tensor:
+    return tensor[:, :, :1].expand(*tensor.shape[:2], times, *tensor.shape[3:])
 
 
 class MemoryState(Enum):
@@ -41,24 +43,23 @@ class MemoryState(Enum):
 def causal_norm_wrapper(norm_layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
     if isinstance(norm_layer, (nn.LayerNorm, RMSNorm)):
         if x.ndim == 4:
-            x = rearrange(x, "b c h w -> b h w c")
+            b, c, h, w = x.shape
+            x = x.contiguous(memory_format=torch.channels_last).reshape(b, h, w, c)
             x = norm_layer(x)
-            x = rearrange(x, "b h w c -> b c h w")
-            return x
+            return x.reshape(b, c, h, w)
         if x.ndim == 5:
-            x = rearrange(x, "b c t h w -> b t h w c")
+            b, c, t, h, w = x.shape
+            x = x.contiguous(memory_format=torch.channels_last_3d).reshape(b, t, h, w, c)
             x = norm_layer(x)
-            x = rearrange(x, "b t h w c -> b c t h w")
-            return x
+            return x.reshape(b, c, t, h, w)
     if isinstance(norm_layer, (nn.GroupNorm, nn.BatchNorm2d, nn.SyncBatchNorm)):
         if x.ndim <= 4:
             return norm_layer(x)
         if x.ndim == 5:
-            t = x.size(2)
-            x = rearrange(x, "b c t h w -> (b t) c h w")
+            b, c, t, h, w = x.shape
+            x = x.contiguous(memory_format=torch.channels_last_3d).reshape(b * t, c, h, w)
             x = norm_layer(x)
-            x = rearrange(x, "(b t) c h w -> b c t h w", t=t)
-            return x
+            return x.reshape(b, c, t, h, w)
     raise NotImplementedError
 
 
@@ -85,9 +86,7 @@ def extend_head(
     if memory is not None:
         return torch.cat((memory.to(tensor), tensor), dim=2)
     else:
-        tile_repeat = np.ones(tensor.ndim).astype(int)
-        tile_repeat[2] = times
-        return torch.cat(tensors=(torch.tile(tensor[:, :, :1], list(tile_repeat)), tensor), dim=2)
+        return torch.cat(tensors=(_expand_temporal_head(tensor, times), tensor), dim=2)
 
 
 def inflate_weight(weight_2d: torch.Tensor, weight_3d: torch.Tensor, inflation_mode: str):

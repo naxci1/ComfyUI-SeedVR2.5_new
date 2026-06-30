@@ -65,7 +65,7 @@ class InflatedCausalConv3d(Conv3d):
         ):
             self.memory = memory
             if self.memory_device == "cpu" and self.memory is not None:
-                self.memory = self.memory.to("cpu")
+                self.memory = self.memory.to("cpu", non_blocking=True)
         return super().forward(input)
 
     def _load_from_state_dict(

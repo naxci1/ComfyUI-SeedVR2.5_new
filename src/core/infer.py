@@ -18,7 +18,7 @@ from einops import rearrange
 from omegaconf import DictConfig, ListConfig
 from torch import Tensor
 from ..common.diffusion import (
-    classifier_free_guidance_dispatcher,
+    classifier_free_guidance,
     create_sampler_from_config,
     create_sampling_timesteps_from_config,
     create_schedule_from_config,
@@ -111,6 +111,44 @@ class VideoDiffusionInfer():
         if hasattr(self, 'debug'):
             self.sampler.debug = self.debug
 
+    def _configure_vae_runtime(self):
+        dtype = getattr(torch, self.config.vae.dtype)
+        try:
+            vae_param = next(self.vae.parameters())
+            device = vae_param.device
+            vae_dtype = vae_param.dtype
+        except StopIteration:
+            device = get_device()
+            vae_dtype = dtype
+
+        signature = (id(self.vae), device, vae_dtype, dtype)
+        if getattr(self, "_vae_runtime_signature", None) == signature:
+            return self._vae_runtime
+
+        scale = self.config.vae.scaling_factor
+        shift = self.config.vae.get("shifting_factor", 0.0)
+
+        if isinstance(scale, ListConfig):
+            scale = torch.as_tensor(scale, device=device, dtype=dtype)
+        if isinstance(shift, ListConfig):
+            shift = torch.as_tensor(shift, device=device, dtype=dtype)
+
+        self._vae_runtime_signature = signature
+        self._vae_runtime = {
+            "device": device,
+            "dtype": dtype,
+            "vae_dtype": vae_dtype,
+            "scale": scale,
+            "shift": shift,
+        }
+        return self._vae_runtime
+
+    @staticmethod
+    def _concat_cfg_inputs(pos, neg):
+        if isinstance(pos, list):
+            return [torch.cat([pos_item, neg_item], dim=0) for pos_item, neg_item in zip(pos, neg)]
+        return torch.cat([pos, neg], dim=0)
+
     # -------------------------------- Helper ------------------------------- #
 
     @torch.no_grad()
@@ -119,22 +157,12 @@ class VideoDiffusionInfer():
         use_sample = self.config.vae.get("use_sample", True)
         latents = []
         if len(samples) > 0:
-            # Use VAE model's current device
-            # This ensures consistency with where the VAE model is loaded
-            try:
-                device = next(self.vae.parameters()).device
-            except StopIteration:
-                # Fallback if VAE has no parameters (shouldn't happen)
-                device = get_device()
-            
-            dtype = getattr(torch, self.config.vae.dtype)
-            scale = self.config.vae.scaling_factor
-            shift = self.config.vae.get("shifting_factor", 0.0)
-
-            if isinstance(scale, ListConfig):
-                scale = torch.tensor(scale, device=device, dtype=dtype)
-            if isinstance(shift, ListConfig):
-                shift = torch.tensor(shift, device=device, dtype=dtype)
+            vae_runtime = self._configure_vae_runtime()
+            device = vae_runtime["device"]
+            dtype = vae_runtime["dtype"]
+            vae_dtype = vae_runtime["vae_dtype"]
+            scale = vae_runtime["scale"]
+            shift = vae_runtime["shift"]
 
             # Group samples of the same shape to batches if enabled.
             if self.config.vae.grouping:
@@ -146,12 +174,6 @@ class VideoDiffusionInfer():
             for sample in batches:
                 if hasattr(self.vae, "preprocess"):
                     sample = self.vae.preprocess(sample)
-
-                # Detect VAE model dtype
-                try:
-                    vae_dtype = next(self.vae.parameters()).dtype
-                except StopIteration:
-                    vae_dtype = dtype  # Fallback
 
                 # Use autocast if VAE dtype differs from input dtype
                 # Skip autocast on MPS (only supports bf16, unified memory = no benefit)
@@ -210,22 +232,12 @@ class VideoDiffusionInfer():
         """
         samples = []
         if len(latents) > 0:
-            # Use VAE model's current device
-            # This ensures consistency with where the VAE model is loaded
-            try:
-                device = next(self.vae.parameters()).device
-            except StopIteration:
-                # Fallback if VAE has no parameters (shouldn't happen)
-                device = get_device()
-            
-            dtype = getattr(torch, self.config.vae.dtype)
-            scale = self.config.vae.scaling_factor
-            shift = self.config.vae.get("shifting_factor", 0.0)
-
-            if isinstance(scale, ListConfig):
-                scale = torch.tensor(scale, device=device, dtype=dtype)
-            if isinstance(shift, ListConfig):
-                shift = torch.tensor(shift, device=device, dtype=dtype)
+            vae_runtime = self._configure_vae_runtime()
+            device = vae_runtime["device"]
+            dtype = vae_runtime["dtype"]
+            vae_dtype = vae_runtime["vae_dtype"]
+            scale = vae_runtime["scale"]
+            shift = vae_runtime["shift"]
 
             # Group samples of the same shape to batches if enabled.
             if self.config.vae.grouping:
@@ -239,12 +251,6 @@ class VideoDiffusionInfer():
                 latent = latent / scale + shift
                 latent = optimized_channels_to_second(latent)
                 latent = latent.squeeze(2)
-
-                # Detect VAE model dtype
-                try:
-                    vae_dtype = next(self.vae.parameters()).dtype
-                except StopIteration:
-                    vae_dtype = dtype  # Fallback
 
                 use_temporal_chunks = (
                     latent.ndim == 5
@@ -296,14 +302,13 @@ class VideoDiffusionInfer():
         latent: torch.Tensor,
     ):
         """Decode the full latent tensor in a single pass."""
-        with torch.inference_mode():
-            with torch.cuda.amp.autocast(dtype=torch.float16):
-                return self.vae.decode(
-                    latent,
-                    tiled=self.decode_tiled,
-                    tile_size=self.decode_tile_size,
-                    tile_overlap=self.decode_tile_overlap,
-                )
+        with torch.autocast(latent.device.type, dtype=torch.float16, enabled=(latent.device.type == "cuda")):
+            return self.vae.decode(
+                latent,
+                tiled=self.decode_tiled,
+                tile_size=self.decode_tile_size,
+                tile_overlap=self.decode_tile_overlap,
+            )
 
 
     def timestep_transform(self, timesteps: Tensor, latents_shapes: Tensor):
@@ -382,42 +387,50 @@ class VideoDiffusionInfer():
         # Flatten.
         latents, latents_shapes = na.flatten(noises)
         latents_cond, _ = na.flatten(conditions)
-        
-        latents = self.sampler.sample(
-            x=latents,
-            f=lambda args: classifier_free_guidance_dispatcher(
-                pos=lambda: self.dit(
-                    vid=torch.cat([args.x_t, latents_cond], dim=-1),
+
+        cfg_partial = self.config.diffusion.cfg.get("partial", 1)
+        cfg_rescale = self.config.diffusion.cfg.rescale
+        sampler_steps = len(self.sampler.timesteps)
+        cfg_text_embeds = self._concat_cfg_inputs(text_pos_embeds, text_neg_embeds)
+        cfg_text_shapes = self._concat_cfg_inputs(text_pos_shapes, text_neg_shapes)
+        cfg_latents_shapes = torch.cat([latents_shapes, latents_shapes], dim=0)
+
+        def diffusion_step(args):
+            scale = (
+                cfg_scale
+                if (args.i + 1) / sampler_steps <= cfg_partial
+                else 1.0
+            )
+            timestep = args.t.repeat(batch_size)
+            model_input = torch.cat([args.x_t, latents_cond], dim=-1)
+            if scale == 1.0:
+                return self.dit(
+                    vid=model_input,
                     txt=text_pos_embeds,
                     vid_shape=latents_shapes,
                     txt_shape=text_pos_shapes,
-                    timestep=args.t.repeat(batch_size),
-                ).vid_sample,
-                neg=lambda: self.dit(
-                    vid=torch.cat([args.x_t, latents_cond], dim=-1),
-                    txt=text_neg_embeds,
-                    vid_shape=latents_shapes,
-                    txt_shape=text_neg_shapes,
-                    timestep=args.t.repeat(batch_size),
-                ).vid_sample,
-                scale=(
-                    cfg_scale
-                    if (args.i + 1) / len(self.sampler.timesteps)
-                    <= self.config.diffusion.cfg.get("partial", 1)
-                    else 1.0
-                ),
-                rescale=self.config.diffusion.cfg.rescale,
-            ),
+                    timestep=timestep,
+                ).vid_sample
+
+            cfg_output = self.dit(
+                vid=torch.cat([model_input, model_input], dim=0),
+                txt=cfg_text_embeds,
+                vid_shape=cfg_latents_shapes,
+                txt_shape=cfg_text_shapes,
+                timestep=timestep.repeat(2),
+            ).vid_sample
+            pos, neg = torch.chunk(cfg_output, 2, dim=0)
+            return classifier_free_guidance(
+                pos=pos,
+                neg=neg,
+                scale=scale,
+                rescale=cfg_rescale,
+            )
+
+        latents = self.sampler.sample(
+            x=latents,
+            f=diffusion_step,
         )
 
         latents = na.unflatten(latents, latents_shapes)
-
-        # Clean up temporary tensors
-        del latents_cond
-        del latents_shapes
-        del text_pos_embeds
-        del text_neg_embeds
-        del text_pos_shapes
-        del text_neg_shapes
-            
         return latents

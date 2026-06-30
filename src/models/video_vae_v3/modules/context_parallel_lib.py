@@ -60,8 +60,6 @@ def cache_send_recv(tensor: List[Tensor], cache_size, times, memory=None):
     if memory is not None:
         recv_buffer = memory.to(tensor[0])
     elif times > 0:
-        tile_repeat = [1] * tensor[0].ndim
-        tile_repeat[2] = times
-        recv_buffer = torch.tile(tensor[0][:, :, :1], tile_repeat)
-    
+        recv_buffer = tensor[0][:, :, :1].expand(*tensor[0].shape[:2], times, *tensor[0].shape[3:])
+
     return recv_buffer

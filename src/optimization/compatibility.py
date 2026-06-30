@@ -640,6 +640,37 @@ def _check_conv3d_memory_bug():
 NVIDIA_CONV3D_MEMORY_BUG_WORKAROUND = _check_conv3d_memory_bug()
 
 
+class Conv3dForwardStrategy:
+    __slots__ = ("direct_cudnn_enabled",)
+
+    def __init__(self, direct_cudnn_enabled: bool):
+        self.direct_cudnn_enabled = direct_cudnn_enabled
+
+    def forward(self, module, input, weight, bias):
+        if not self.direct_cudnn_enabled or weight.dtype not in (torch.float16, torch.bfloat16):
+            return None
+        try:
+            out = torch.cudnn_convolution(
+                input,
+                weight,
+                module.padding,
+                module.stride,
+                module.dilation,
+                module.groups,
+                benchmark=False,
+                deterministic=False,
+                allow_tf32=True,
+            )
+            if bias is not None:
+                out += bias.reshape((1, -1) + (1,) * (out.ndim - 2))
+            return out
+        except RuntimeError:
+            return None
+
+
+NVIDIA_CONV3D_FORWARD_STRATEGY = Conv3dForwardStrategy(NVIDIA_CONV3D_MEMORY_BUG_WORKAROUND)
+
+
 # Log all optimization status once globally (cross-process) using environment variable
 if not os.environ.get("SEEDVR2_OPTIMIZATIONS_LOGGED"):
     os.environ["SEEDVR2_OPTIMIZATIONS_LOGGED"] = "1"
